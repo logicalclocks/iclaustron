@@ -52,6 +52,7 @@ cargo xtask check
 ## License
 
 MIT, see [LICENSE](LICENSE). New code is copyright Hopsworks and/or its affiliates. The
-C code under `legacy-c/` is copyright iClaustron AB, keeps its original
-GPLv2 notices, and is not part of any build or release. Rust files that
-are translations of that C code name both holders.
+C code under `legacy-c/` is copyright Hopsworks AB, to which iClaustron AB
+moved its copyright, keeps its original GPLv2 notices, and is not part of
+any build or release. Rust files that are translations of that C code
+carry both copyright lines, the C code's years and the translation's.

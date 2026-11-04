@@ -2,10 +2,11 @@
 
 ## Facts
 
-- The iClaustron C code (`legacy-c/`) is GPLv2, copyright iClaustron AB,
-  authored by Mikael Ronström (AUTHORS). iClaustron AB keeps that
-  copyright. The copyright holder can relicense a derivative work; the GPL
-  is a grant to others, not a restriction on the owner.
+- The iClaustron C code (`legacy-c/`) is GPLv2, authored by Mikael
+  Ronström (AUTHORS). Its copyright moved from iClaustron AB to
+  Hopsworks AB (2026-11-04), and its file headers name Hopsworks AB. The
+  copyright holder can relicense a derivative work; the GPL is a grant
+  to others, not a restriction on the owner.
 - The new Rust code, the C header and the C++ wrapper are copyright
   Hopsworks and/or its affiliates, MIT licensed.
 - RonDB / MySQL NDB Cluster is GPLv2 with the Universal FOSS Exception,
@@ -83,7 +84,8 @@ we used RonDB's names for signals and blocks as interface vocabulary.
   language and are used as they are. "RonDB" and "NDB" name what we
   interoperate with.
 - `legacy-c/` is iClaustron's old code, reference only, and is not
-  changed.
+  changed, but for its copyright headers, which name Hopsworks AB since
+  the copyright moved there (2026-11-04).
 
 ## Character sets and collations
 
@@ -135,14 +137,15 @@ Every new source file starts with:
 ```
 
 A Rust file that is a translation of a C file (mode 1:1 in chapter 03)
-is a derivative of iClaustron AB's work and carries both holders:
+is a derivative of the iClaustron C code and carries both copyright
+lines, the C code's years and the translation's:
 
 ```
-// Copyright (c) 2007-2015 iClaustron AB.
+// Copyright (c) 2007-2015 Hopsworks AB.
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 ```
 
-Both are MIT; the two-line form only records who holds what. No per-file
+Both are MIT; the two-line form only records the years of each. No per-file
 GPL boilerplate, no "based on iClaustron file X" notes in the files (that
 belongs in the crate `MODULE.md`, which is documentation).

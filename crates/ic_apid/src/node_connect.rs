@@ -1,4 +1,4 @@
-// Copyright (c) 2007-2015 iClaustron AB.
+// Copyright (c) 2007-2015 Hopsworks AB.
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 

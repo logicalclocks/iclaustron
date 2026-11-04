@@ -1,4 +1,4 @@
-/* Copyright (C) 2007, 2014 iClaustron AB
+/* Copyright (C) 2007, 2014 Hopsworks AB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -99,7 +99,7 @@ ic_hashtable_iterator_advance(IC_HASHTABLE_ITR *itr)
 
 /*
  * Copyright (c) 2002, 2004, Christopher Clark
- * Copyright (c) 2007-2011 iClaustron AB
+ * Copyright (c) 2007-2011 Hopsworks AB
  * All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without

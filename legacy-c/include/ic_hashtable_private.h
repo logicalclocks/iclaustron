@@ -1,4 +1,4 @@
-/* Copyright (C) 2007-2013 iClaustron AB
+/* Copyright (C) 2007-2013 Hopsworks AB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -64,7 +64,7 @@ indexFor(unsigned int tablelength, unsigned int hashvalue)
 
 /*
  * Copyright (c) 2002, Christopher Clark
- * Copyright 2007, iClaustron AB
+ * Copyright 2007, Hopsworks AB
  * All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without

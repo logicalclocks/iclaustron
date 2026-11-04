@@ -9,7 +9,9 @@ server and replication server, with their autotools and CMake build files.
 It is **reference material only**:
 
 - it is not built by the Rust workspace and not part of any release;
-- it keeps its original file headers and copyright (GPLv2, iClaustron AB);
+- it keeps its original file headers and license (GPLv2); its copyright
+  moved from iClaustron AB to Hopsworks AB (2026-11-04), whom the
+  headers now name;
   the Rust code at the repository root is copyright Hopsworks and/or its affiliates, MIT
   licensed;
 - the parts that are translated are listed, file by file, in

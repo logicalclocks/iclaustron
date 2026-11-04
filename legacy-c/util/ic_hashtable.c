@@ -1,4 +1,4 @@
-/* Copyright (C) 2007, 2015 iClaustron AB
+/* Copyright (C) 2007, 2015 Hopsworks AB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -396,7 +396,7 @@ ic_hashtable_destroy(IC_HASHTABLE *h, gboolean initial)
 
 /*
  * Copyright (c) 2002, Christopher Clark
- * Copyright (c) 2007-2012 iClaustron AB
+ * Copyright (c) 2007-2012 Hopsworks AB
  * All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without
