@@ -331,7 +331,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
   <text x="34" y="134" class="t-head">User thread · ApidConnection</text>
   <text x="34" y="154" class="t-mono">block 0x8000+1 · inbox · queries</text>
 
-  <text x="34" y="196" class="t-small">… up to 256 user threads, each its own block</text>
+  <text x="34" y="196" class="t-small">… up to 4711 user threads, each its own block</text>
 
   <rect x="360" y="36" width="250" height="62" rx="4" class="box"/>
   <text x="374" y="60" class="t-head">NodeShared · one per data node</text>
@@ -395,7 +395,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 <table>
   <thead><tr><th>Thread</th><th class="num">How many</th><th>What it does</th><th>What it touches</th></tr></thead>
   <tbody>
-    <tr><td>User thread</td><td class="num">1 – 256</td><td>Defines queries, packs requests, sends, polls its inbox, decodes replies into rows, runs callbacks.</td><td>Its own <code>ApidConnection</code>, with no lock. A node's send buffer, under that node's mutex, held only to append.</td></tr>
+    <tr><td>User thread</td><td class="num">1 – 4711</td><td>Defines queries, packs requests, sends, polls its inbox, decodes replies into rows, runs callbacks.</td><td>Its own <code>ApidConnection</code>, with no lock. A node's send buffer, under that node's mutex, held only to append.</td></tr>
     <tr><td>Receive thread</td><td class="num">1 – #nodes</td><td>Reads its nodes' sockets into receive pages, splits signals, unpacks <code>BUNDLE</code>, routes by block number. Executes signals about the link itself: <code>HEARTBEAT_CONF</code>, <code>NODE_LOST_REP</code>, <code>NODE_LOST_DONE_REP</code>, <code>TABLE_CHANGED_REP</code>.</td><td>The sockets of its own nodes. Each inbox's mutex, taken once per round. The published node state, of which it is the only writer.</td></tr>
     <tr><td>Send pool</td><td class="num">1</td><td>Writes what was queued while another thread was writing to the node, and ends adaptive-send waits at their deadline.</td><td>Node send buffers.</td></tr>
     <tr><td>Heartbeat</td><td class="num">1</td><td>Sends <code>HEARTBEAT_REQ</code> to every node that is up. It asks a node's receive thread to drop a link whose heartbeats stopped.</td><td>Reads node state through atomics and never writes it.</td></tr>
@@ -428,7 +428,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
   </div>
   <div class="panel">
     <h4>Mutex levels, checked in debug builds</h4>
-    <p>Dictionary (1), global (2), a thread's inbox (3), page pool (5), a node's send buffer (6). Locks are taken in rising order only. Levels 4 and 7 are empty because the C's receive-state and heartbeat mutexes are gone.</p>
+    <p>A table's AUTO_INCREMENT range (1), the counters' connection (2), dictionary (3), global (4), a thread's inbox (5), page pool (7), a node's send buffer (8), the send pool's queue (10), a completion slot (11). Locks are taken in rising order only. Levels 6 and 9 are empty because the C's receive-state and heartbeat mutexes are gone.</p>
   </div>
 </div>
 
@@ -440,7 +440,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
   <tbody>
     <tr><td>Mac, 1 user thread, depth 4</td><td class="num">2.6 M</td><td class="num">545 ns</td><td>The user thread itself: about 350 ns of user time per read.</td></tr>
     <tr><td>Mac, 4 user threads, batch 300</td><td class="num">5.8 M</td><td class="num">495 ns</td><td>Cores shared with the data nodes' threads.</td></tr>
-    <tr><td>Mac, 8 user threads, batch 300</td><td class="num">7.0 – 8.9 M</td><td class="num">512 – 565 ns</td><td>One data node coordinator thread at 96%. The data node's coordinator proxy chooses the coordinator thread for each record, and with this configuration spreads them 2 : 1 : 0 over three coordinator threads.</td></tr>
+    <tr><td>Mac, 8 user threads, batch 300</td><td class="num">7.4 – 8.9 M</td><td class="num">512 – 565 ns</td><td>One data node coordinator thread at 96%. The data node's coordinator proxy chooses the coordinator thread for each record, and with this configuration spreads them 2 : 1 : 0 over three coordinator threads.</td></tr>
     <tr><td>Linux (32 CPUs), 8 user threads, 2 receive threads</td><td class="num">up to 7.1 M</td><td class="num">—</td><td>The data node's receive thread.</td></tr>
   </tbody>
 </table>
@@ -460,7 +460,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
   </div></li>
   <li><span class="n">3</span><div>
     <h4>More user threads <span class="status built">Built</span></h4>
-    <p>Phase 7 raised the user-thread limit from 256 to 4711, which widened the block-number space and the thread table. The limit of four management servers in a connect string stays. It matters for the synchronous model's first form (section 4), where every application thread holds its own connection.</p>
+    <p>Phase 7 raised the user-thread limit from 256 to 4711, which widened the block-number space and the thread table. A connect string takes any number of management servers (chapter 06, phase 7). It matters for the synchronous model's first form (section 4), where every application thread holds its own connection.</p>
   </div></li>
   <li><span class="n">4</span><div>
     <h4>Wake-up helpers and more send threads <span class="status planned">Planned</span></h4>
@@ -514,9 +514,9 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 </div>
 
 <h3 id="data-ids">How a reply finds its transaction</h3>
-<p>Each request carries <strong>a number we choose</strong>, and the data node sends it back in every reply about that transaction. We choose it to be the transaction's <strong>place in our own table</strong>, so finding the transaction is one array index: no search, no hash, no lock.</p>
+<p>The request that allocates a coordinator record carries <strong>a number we choose</strong>, and the data node sends it back in every reply about the transaction that uses the record. We choose it to be the transaction's <strong>place in our own table</strong>, so finding the transaction is one array index: no search, no hash, no lock.</p>
 <div class="flow" role="list" aria-label="How a reply finds its transaction">
-  <div class="stage" role="listitem"><p class="tag">1 · We send</p><p class="what"><code>KEY_OP_REQ</code></p><p class="how">carries our number: place 3</p></div>
+  <div class="stage" role="listitem"><p class="tag">1 · We send, once</p><p class="what"><code>COORD_ALLOC_REQ</code></p><p class="how">carries our number: place 3</p></div>
   <span class="arrow" aria-hidden="true">→</span>
   <div class="stage node" role="listitem"><p class="tag">2 · Data node</p><p class="what">Keeps it</p><p class="how">with its own record of the transaction</p></div>
   <span class="arrow" aria-hidden="true">→</span>
@@ -527,7 +527,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 <div class="two">
   <div class="panel">
     <h4>Rows work the same way</h4>
-    <p>A row (<code>ROW_DATA_REP</code>) and a single operation's refusal (<code>KEY_OP_REF</code>) come from the node that read the row. They carry the query's id instead, and find the query the same way.</p>
+    <p>Each <code>KEY_OP_REQ</code> carries the coordinator's pointer for the record and the query's id. A row (<code>ROW_DATA_REP</code>) and a single operation's refusal (<code>KEY_OP_REF</code>) come from the node that read the row. They carry the query's id instead, and find the query the same way.</p>
   </div>
   <div class="panel">
     <h4>Late replies are caught</h4>
@@ -536,7 +536,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 </div>
 <p>The block number in the signal header (0x8000 + thread id) is what picks the user thread in the first place. Within that thread, the details are as follows.</p>
 
-<p><strong>Our pointer for a coordinator record</strong> (<code>client_ptr</code>, echoed by <code>KEY_OP_CONF</code>, <code>COMMIT_CONF</code>, <code>ROLLBACK_CONF</code>):</p>
+<p><strong>Our pointer for a coordinator record</strong> (<code>client_ptr</code>, sent in <code>COORD_ALLOC_REQ</code>, echoed by <code>KEY_OP_CONF</code>, <code>COMMIT_CONF</code>, <code>ROLLBACK_CONF</code>):</p>
 <div class="layout-wrap">
   <div class="layout" aria-label="Bit layout of the coordinator record pointer">
     <div class="hi" style="grid-column: span 1">1</div>
@@ -552,11 +552,12 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
   <div class="layout" aria-label="Bit layout of the transaction id">
     <div class="hi" style="grid-column: span 6">block (12)</div>
     <div class="lo" style="grid-column: span 6">node id (12)</div>
-    <div style="grid-column: span 4">0 (8)</div>
-    <div style="grid-column: span 16">per-connection counter (32)</div>
+    <div style="grid-column: span 1; background: linear-gradient(90deg, var(--wire-soft) 50%, var(--accent-soft) 50%)" title="bit 39: bit 12 of the node id; bit 38: bit 12 of the block"></div>
+    <div style="grid-column: span 19">count (38)</div>
   </div>
-  <div class="bits"><span>bit 63</span><span>bits 51 · 39 · 31</span><span>bit 0</span></div>
+  <div class="bits"><span>bit 63</span><span>bits 51 · 39 · 37 · 31</span><span>bit 0</span></div>
 </div>
+<p>Bit 39 holds bit 12 of the node id and bit 38 bit 12 of the block, so that threads 4096 apart, and nodes 4096 apart, make different ids. The count takes all 38 bits below them (the author, 2026-10-23) and goes round within them; a thread's slot keeps it for the next connection there, so its block number makes the same id again only after 2<sup>38</sup> transactions.</p>
 
 <div class="table-wrap">
 <table>
@@ -575,7 +576,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 <ol class="steps">
   <li><span class="n">a</span><div>
     <h4>Define</h4>
-    <p><code>read_key</code> or <code>write_key</code> hashes the key when the transaction has no coordinator yet, picks the node and takes a free coordinator record for it (allocating one only if none is free). It then packs <code>KEY_OP_REQ</code> with its key and attribute info straight into that node's <code>staged</code> buffer. The query remembers where its request lies (<code>Staged { node_id, generation, at, len }</code>).</p>
+    <p><code>start_transaction</code> picks the node from the hint (<code>hint_for_key</code> hashes a key into one) and takes a free coordinator record for it (allocating one only if none is free). <code>read_key</code> or <code>write_key</code> then packs <code>KEY_OP_REQ</code> with its key and attribute info straight into the <code>staged</code> buffer of the transaction's node. The query remembers where its request lies (<code>Staged { node_id, generation, at, len }</code>).</p>
   </div></li>
   <li><span class="n">b</span><div>
     <h4>Send</h4>
@@ -642,7 +643,7 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 
 <h3 id="data-memory">Memory rules</h3>
 <ul>
-  <li><strong>No allocation per transaction or per signal once warm.</strong> Query lists of closed transactions are kept (up to 8192 spare), coordinator records are reused through free lists, send buffers are swapped rather than reallocated, and signal pages keep their largest size.</li>
+  <li><strong>No allocation per transaction or per signal once warm.</strong> Query lists of closed transactions are kept (up to 8192 spare), coordinator records are reused through free lists, send buffers are swapped rather than reallocated, and signal pages keep their largest size. The exception is the synchronous helpers <code>key_op::read_committed</code> and <code>write_key</code>, which allocate new vectors for the key, the attribute info and the replies on every call.</li>
   <li><strong>Inline buffers spill; they never refuse.</strong> A <code>KEY_OP_CONF</code> with more than 16 operations goes on into a vector beside the inline array, and node lists hold eight inline. A protocol limit read from the data node's code is not a guarantee.</li>
   <li><strong>No <code>unsafe</code> on the row path.</strong> Queries own their rows, so the library never holds a pointer into the application's memory between send and completion. The C binding copies or maps the caller's rows onto them.</li>
 </ul>
@@ -657,8 +658,9 @@ footer { max-width: 1180px; margin: 64px auto 0; border-top: 1px solid var(--rul
 <pre><code><span class="c">// once</span>
 let q = conn.create_query(&amp;table, &amp;key_rec, &amp;attr_rec)?;
 <span class="c">// per batch: define many, send once per node</span>
-let t = conn.start_transaction(hint, &amp;table)?;
-conn.read_key(q, t, &amp;ReadKeyArgs { callback: Some(on_row), user_ref, .. })?;
+let t = conn.start_transaction(hint, Some(&amp;table))?;
+let args = ReadKeyArgs { callback: Some(on_row), user_ref, ..ReadKeyArgs::default() };
+conn.read_key(q, t, &amp;args)?;
 <span class="c">// … more read_key / write_key, on this and other transactions</span>
 conn.commit_transaction(t)?;
 conn.send_queries(false)?;
@@ -753,47 +755,81 @@ for (;;) {
 <h3 id="async-wait">Why both inputs must share one wait point</h3>
 <p>A thread that sleeps can sleep on only one thing. If replies arrive on a condition variable and requests on a channel, the executor must either poll one while sleeping on the other, which adds latency or spins, or run a second thread that forwards one into the other, which adds a wake-up to every request. The inbox already has what is needed: a mutex, a condition and a flag saying the owner is asleep. Adding a second list lets either producer wake the executor with the rule that exists today, <em>wake only if waiting, after releasing the lock</em>:</p>
 <pre><code>struct Inbox {
-    pages:    Vec&lt;SignalPage&gt;,   <span class="c">// from receive threads (today)</span>
-    spare:    Vec&lt;SignalPage&gt;,
-    requests: Vec&lt;Request&gt;,      <span class="c">// from application threads (new)</span>
-    waiting:  bool,              <span class="c">// the executor sleeps on `cond`</span>
-    closed:   bool,
+    pages:          Vec&lt;SignalPage&gt;,  <span class="c">// from receive threads</span>
+    spare:          Vec&lt;SignalPage&gt;,
+    waiting:        bool,             <span class="c">// the executor sleeps on `cond`</span>
+    closed:         bool,
+    requests:       Vec&lt;Work&gt;,        <span class="c">// from application threads</span>
+    request_limit:  usize,
+    wants_requests: bool,             <span class="c">// asleep, and willing to take one</span>
+    nudges:         Vec&lt;u32&gt;,         <span class="c">// from scan readers</span>
+    <span class="c">// … and who waits for room, and whether requests are still taken</span>
 }
 
 <span class="c">// application side, any thread; a Submitter is a cloneable handle on the inbox</span>
-fn submit(&amp;self, r: Request) -&gt; Result&lt;(), Busy&gt; {
-    let wake = {
-        let mut ib = self.inbox.lock();
-        if ib.requests.len() &gt;= self.limit { return Err(Busy); }
-        ib.requests.push(r);
-        std::mem::take(&amp;mut ib.waiting)
-    };
-    if wake { self.cond.signal(); }
+fn submit(&amp;self, work: Work, wait: bool) -&gt; Result&lt;(), (Work, IcError)&gt; {
+    let mut inbox = self.inbox.lock();
+    while inbox.requests.len() &gt;= inbox.request_limit {
+        if !wait {
+            return Err((work, IcError::new(err::IC_ERROR_EXECUTOR_BUSY)));
+        }
+        inbox = self.room.wait(inbox);   <span class="c">// until the executor takes some</span>
+    }
+    inbox.requests.push(work);
+    let wake = inbox.waiting &amp;&amp; inbox.wants_requests;
+    if wake {
+        inbox.waiting = false;
+        inbox.wants_requests = false;
+    }
+    drop(inbox);                         <span class="c">// unlock, and only then wake</span>
+    if wake {
+        self.cond.signal();
+    }
     Ok(())
 }</code></pre>
-<p>The receive thread's post and <code>submit</code> are the same shape: append under a short lock, then wake the executor only if it was asleep. <code>exchange</code>, which already swaps emptied pages for posted ones, would also swap the request vector with an empty one, so the executor takes everything in one lock.</p>
+<p>The receive thread's post and <code>submit</code> are the same shape: append under a short lock, then wake the executor only if it was asleep. <code>exchange_with_requests</code> swaps emptied pages for posted ones and takes the requests and the nudges in the same lock, so the executor takes everything at once.</p>
 
 <h3 id="async-loop">The executor's loop</h3>
 <pre><code>loop {
-    <span class="c">// 1. one lock: posted pages out, emptied pages back, requests out.</span>
-    <span class="c">//    Sleeps only if nothing is posted, no request waits,</span>
-    <span class="c">//    and nothing held back needs sending.</span>
-    let got = inbox.exchange(wait, &amp;mut pages, &amp;mut requests);
-
-    <span class="c">// 2. replies first: they complete operations and free records</span>
-    for signal in pages { conn.receive_view(&amp;signal); }
+    <span class="c">// 1 and 2. one lock: posted pages out, emptied pages back, nudges</span>
+    <span class="c">//    out, and requests only while none wait here: a request left in</span>
+    <span class="c">//    the inbox keeps its place, and the inbox's bound keeps holding</span>
+    <span class="c">//    its callers back. Then the replies, which complete operations</span>
+    <span class="c">//    and free records. Sleeps only if nothing is posted and</span>
+    <span class="c">//    nothing waits here that there is room to admit.</span>
+    if self.waiting.is_empty() {
+        self.conn.poll_with_requests(wait_ms, Some(&amp;mut self.taken),
+                                     Some(&amp;mut self.nudges));
+        for work in self.taken.drain(..) {
+            match work {
+                Work::Scan(scan) =&gt; self.scan_queue.push_back(scan),
+                other =&gt; self.waiting.push_back(other),
+            }
+        }
+    } else {
+        self.conn.poll_with_requests(wait_ms, None, Some(&amp;mut self.nudges));
+    }
 
     <span class="c">// 3. completions go back to their application threads</span>
-    while let Some(done) = conn.next_completed() { done.deliver(); }
+    self.take_completions();             <span class="c">// slot and wake, or callback</span>
+    self.take_scan_batches();            <span class="c">// batches moved to their readers</span>
+    self.take_nudges();                  <span class="c">// batches handed back, closes asked for</span>
+    self.finish_scans();                 <span class="c">// readers told how their runs ended</span>
 
-    <span class="c">// 4. admit new work while the pipeline has room</span>
-    while conn.in_flight() &lt; limit {
-        let Some(r) = requests.pop_front() else { break };
-        r.define_on(&amp;mut conn);   <span class="c">// start, read_key/write_key, commit</span>
+    <span class="c">// 4. admit new work while the pipeline has room; none once stopping</span>
+    let mut admitted = 0;
+    if stopping {
+        self.refuse_waiting();
+        self.stop_scans();
+    } else {
+        admitted = self.admit_waiting(); <span class="c">// start, read_key/write_key, commit</span>
+        self.admit_scans();              <span class="c">// scans, while fewer than the limit run</span>
     }
 
     <span class="c">// 5. everything admitted this pass: one write per node</span>
-    conn.send_queries(false)?;
+    if admitted &gt; 0 {
+        let _ = self.conn.send_queries(false);
+    }
 }</code></pre>
 <p>Replies are handled before requests are admitted. That frees coordinator records and pipeline room first, and a completion is delivered as early as possible. All requests admitted in one pass share one socket write per node, so the per-batch costs in chapter 12's model (a write, a read and a round per node) are spread over every application thread that submitted in that interval. Under load, batching comes on its own. Under light load a request goes out alone, as it should.</p>
 
@@ -805,7 +841,7 @@ fn submit(&amp;self, r: Request) -&gt; Result&lt;(), Busy&gt; {
   </div>
   <div class="panel">
     <h4>Delivering the result</h4>
-    <p>Each request carries its completion: a slot plus a wake-up for a blocking caller, a callback run on the executor, or, in a Rust async layer, a <code>Waker</code>. The result is copied out of the query's attribute row into the slot, so the query is free for the next request at once.</p>
+    <p>Each request carries its completion: a slot plus a wake-up for a blocking caller, a callback run on the executor, or, in a Rust async layer, a <code>Waker</code>. A read's row is copied out of the query's attribute row into the request's operation, so the query is free for the next request at once. When the transaction ends, the whole request goes in the slot, or to the callback.</p>
   </div>
   <div class="panel">
     <h4>Failure and timeouts</h4>
@@ -831,16 +867,19 @@ fn submit(&amp;self, r: Request) -&gt; Result&lt;(), Busy&gt; {
   <div class="panel">
     <h4>A · Each thread owns a connection <span class="status built">Built</span></h4>
     <p>The application thread is a user thread. A synchronous call is define, send, then wait for that one reply. <code>flush(ms, force)</code> and <code>call</code>/<code>wait_for</code> already do this, and other requests the thread has in flight are served while it waits.</p>
-<pre><code>let t = conn.start_transaction(hint, &amp;table)?;
+<pre><code>let t = conn.start_transaction(hint, Some(&amp;table))?;
 conn.read_key(q, t, &amp;args)?;
 conn.commit_transaction(t)?;
-conn.flush(1000, true)?;      <span class="c">// returns when done</span>
-let row = conn.query(q).attr_row();</code></pre>
+while !conn.transaction(t).map_or(true, |tr| tr.is_done()) {
+    conn.flush(1000, true)?;  <span class="c">// send, then wait for replies</span>
+}
+let row = conn.query(q).expect("made above").attr_row();</code></pre>
     <p>In C:</p>
 <pre><code>ic_apid_conn_start_transaction(conn, hint, table, &amp;t);
 ic_apid_conn_read_key(conn, q, t, &amp;args);
 ic_apid_conn_commit_transaction(conn, t);
-ic_apid_conn_flush(conn, 1000, true, NULL);  <span class="c">/* returns when done */</span>
+while (!ic_apid_transaction_is_done(conn, t))
+    ic_apid_conn_flush(conn, 1000, true, NULL);  <span class="c">/* send, then wait for replies */</span>
 row = ic_apid_query_attr_row(conn, q, &amp;len);</code></pre>
     <ul>
       <li>Nothing between the caller and the socket: the lowest latency for one operation.</li>
@@ -852,10 +891,12 @@ row = ic_apid_query_attr_row(conn, q, &amp;len);</code></pre>
     <h4>B · A blocking façade over executors <span class="status built">Built</span></h4>
     <p>The application thread holds only a <code>Submitter</code>. A synchronous call submits a request to an executor (section 3) and sleeps on its submitter's completion slot until the executor delivers the result.</p>
 <pre><code>let mut request = Request::with_op(KeyOp::read(&amp;shape, ReadKind::Committed));
+request.ops_mut()[0].key_row_mut().copy_from_slice(&amp;key);
 submitter.execute(&amp;mut request)?;   <span class="c">// submit + wait</span>
 let row = request.ops()[0].attr_row();</code></pre>
     <p>In C:</p>
 <pre><code>ic_request_add_read(request, shape, IC_READ_KIND_COMMITTED, &amp;op);
+memcpy(ic_request_key_row(request, op, &amp;len), key, key_len);
 ic_apid_submitter_execute(submitter, request);  <span class="c">/* submit + wait */</span>
 row = ic_request_attr_row(request, op, &amp;len);</code></pre>
     <ul>
@@ -876,7 +917,7 @@ row = ic_request_attr_row(request, op, &amp;len);</code></pre>
     <tr><td>Batching</td><td>Within one caller's transaction</td><td>Across callers, automatic</td><td>Chosen by the application</td></tr>
     <tr><td>Latency at light load</td><td>Lowest</td><td>+1 hand-off each way</td><td>Lowest</td></tr>
     <tr><td>CPU per operation at load</td><td>Highest: per-batch costs on every call; 18 µs measured, 64 threads</td><td>A wake-up per call, the batch costs shared; 10 µs measured, 64 callers</td><td>Lowest, about 500 ns client CPU</td></tr>
-    <tr><td>Reads a second, measured</td><td>198 000, 64 threads</td><td>268 000, 64 callers, one executor</td><td>2 million on one thread, 6 million on eight</td></tr>
+    <tr><td>Reads a second, measured</td><td>198 000, 64 threads</td><td>268 000, 64 callers, one executor</td><td>2.6 million on one thread at depth 4, 7.4 – 8.9 million on eight at depth 2 (Mac, section 1)</td></tr>
     <tr><td>Fits</td><td>Tools, tests, low-rate services</td><td>Servers with a thread per request</td><td>Benchmarks, data loaders, REST/gRPC servers built for it</td></tr>
   </tbody>
 </table>

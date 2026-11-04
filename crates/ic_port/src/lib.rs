@@ -26,6 +26,7 @@
 //! - [`debug`]: the `DEBUG_ENTRY`/`DEBUG_PRINT` tracing facility.
 //! - [`sync`]: mutex and condition variable with lock ordering levels.
 //! - [`file`]: file helpers.
+//! - [`fuzz`]: the fuzz runner the decoders' `fuzz_` tests use.
 //! - [`socket`]: socket helpers below `ic_comm`.
 //! - [`daemon`]: daemonising, pid files, signal handlers.
 //! - [`options`]: table driven command line parsing.
@@ -36,6 +37,7 @@ pub mod debug;
 pub mod endian;
 pub mod err;
 pub mod file;
+pub mod fuzz;
 pub mod ndb_err;
 pub mod options;
 pub mod oserr;

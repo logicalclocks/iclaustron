@@ -47,6 +47,10 @@ pub const IC_MAX_LINE_LEN: usize = 512;
 /// Size the read buffer grows to before a line is refused.
 const IC_MAX_BUFFERED: usize = 64 * 1024;
 
+/// The most [`LineReader::read_exact`] reserves before the bytes it
+/// reads have arrived.
+const IC_MAX_EXACT_RESERVE: usize = 64 * 1024;
+
 /// Reads whole lines from a connection, keeping whatever arrived past
 /// the end of the current line for the next call.
 pub struct LineReader {
@@ -231,7 +235,12 @@ impl LineReader {
     conn: &Connection,
     len: usize,
   ) -> Result<Vec<u8>, IcError> {
-    let mut out: Vec<u8> = Vec::with_capacity(len);
+    // The length is the peer's word, up to 4 GiB from a content-length:
+    // reserving it all at once would let a broken or hostile server make
+    // us take that much before it sends a byte. The vector grows as the
+    // bytes arrive instead.
+    let reserve = std::cmp::min(len, IC_MAX_EXACT_RESERVE);
+    let mut out: Vec<u8> = Vec::with_capacity(reserve);
     /* Whatever is already buffered comes first. */
     let buffered = self.buf.len() - self.start;
     let take = std::cmp::min(buffered, len);

@@ -4927,7 +4927,11 @@ fn scan_row_by_row_beside_another_scan() {
   while !conn.scan_done(second) {
     conn.poll(100);
     while let Some(batch) = conn.get_next_scan_batch() {
-      assert_eq!(batch.scan(), second, "the first's batches were its own");
+      assert_eq!(
+        conn.batch_scan(batch),
+        Some(second),
+        "the first's batches were its own"
+      );
       while conn.next_scan_row(batch).expect("a row") {
         ids.push(t.get(conn.scan_row(second), "id").parse().expect("an id"));
       }
@@ -10869,6 +10873,29 @@ fn records_held_by(apiref: u32) -> Option<u64> {
   Some(out.trim().parse::<u64>().expect("a count"))
 }
 
+/// Print every column of what the coordinators list for the block
+/// reference `apiref`, for a test that finds a record still held.
+fn print_records_of(apiref: u32) {
+  let columns = mysql("SHOW COLUMNS FROM ndbinfo.`ndb$transactions_full`");
+  let rows = mysql(&format!(
+    "SELECT * FROM ndbinfo.`ndb$transactions_full` WHERE apiref = {}",
+    apiref
+  ));
+  let (columns, rows) = match (columns, rows) {
+    (Some(columns), Some(rows)) => (columns, rows),
+    _ => return,
+  };
+  let mut names: Vec<&str> = Vec::new();
+  for line in columns.lines() {
+    if let Some(name) = line.split('\t').next() {
+      names.push(name);
+    }
+  }
+  println!("listed for apiref {:#x}:", apiref);
+  println!("{}", names.join("\t"));
+  println!("{}", rows);
+}
+
 #[test]
 fn scan_a_connection_freed_while_a_record_is_asked_for_gives_it_back() {
   let cluster = match cluster() {
@@ -10887,6 +10914,28 @@ fn scan_a_connection_freed_while_a_record_is_asked_for_gives_it_back() {
   while round < 4 {
     let mut conn = cluster.global.create_connection().expect("connection");
     let apiref = conn.block_ref();
+    // Nothing is listed for this block reference before the connection
+    // asks for anything: the data nodes' failure handling cleans up an
+    // earlier API node's records before its node id can be ours. Seen
+    // 2026-11-04, a record at data node 1 (state 7, no operations) still
+    // named node 228's block 0x8000, from an earlier test's API node
+    // given the same node id.
+    let before = match records_held_by(apiref) {
+      Some(before) => before,
+      None => return,
+    };
+    if before > 0 {
+      print_records_of(apiref);
+    }
+    assert_eq!(
+      before,
+      0,
+      "round {}: listed for node {} block {:#x} before the connection \
+       asked for anything; the data nodes' failure handling left it",
+      round,
+      apiref & 0xFFFF,
+      apiref >> 16
+    );
     let t = bind(&mut conn, "scan");
     let scan = conn.create_scan(&t.def, &t.rec).expect("create the scan");
     conn.start_scan(scan, &ScanArgs::default()).expect("start");
@@ -10915,6 +10964,9 @@ fn scan_a_connection_freed_while_a_record_is_asked_for_gives_it_back() {
         break;
       }
       let waited = time::millis_elapsed(start, time::gethrtime());
+      if waited >= 2_000 {
+        print_records_of(apiref);
+      }
       assert!(waited < 2_000, "round {}: {} record(s) held", round, held);
       std::thread::sleep(std::time::Duration::from_millis(50));
     }

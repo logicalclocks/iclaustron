@@ -78,6 +78,12 @@
 | Signal and block names (was Q11) | the names of chapter 06 §6.1 stand: applied on 2026-10-09 and unchanged since, through the author's two reviews (chapter 06 §11.1, §11.2). A change the author makes later is one more rename, which, like the first, leaves the wire as it was |
 | Writes through a unique index (was Q12) | as recommended, since phase 6.5 (chapter 06 §6.5, item 8): an update through an index whose attribute record holds an indexed column is refused with `IC_ERROR_INDEXED_COLUMN_UPDATE`, since the row is found by those columns, and an insert or a write through an index with `IC_ERROR_NOT_SUPPORTED`; the integration test `uk_refusals_before_sending` checks all three |
 
+## Decided (2026-10-23)
+
+| Topic | Decision |
+|---|---|
+| Stale ids | a stale id is never followed: ids are 64 bits, a 24-bit slot index and a 40-bit generation, and a slot whose generation would wrap is retired; each scan batch has an id of its own, so one handed back names nothing. The C ABI changed with it (`IC_QUERY_ID`, `IC_TRANS_ID`, `IC_SCAN_ID` to `uint64_t`, `IC_NO_TRANS` 0, `ic_apid_scan_batch_scan(conn, batch)`), and programs built against the earlier header are to be built again; the wire is unchanged (chapter 04, "Ids") |
+
 ## Still open
 
 The recommendation is the default and the plan proceeds on it unless

@@ -407,6 +407,11 @@ impl ScanConf {
       num_batches: 0,
       more: Vec::new(),
     };
+    // Every entry takes three words at least: a count the entries cannot
+    // hold is refused before room is made for it.
+    if count > entries.len() / 3 {
+      return Err(bad);
+    }
     if count > IC_SCAN_CONF_INLINE_ENTRIES {
       conf.more.reserve_exact(count);
     }
@@ -821,6 +826,20 @@ mod tests {
     assert_eq!(out, [2, 0, 0, 0, 0, (0xFFF3 << 16) | 4, 0b110]);
     column_section_into(&[], &[1, 2, 3], &[4], &mut out);
     assert_eq!(out, [0, 3, 0, 0, 1, 1, 2, 3, 4]);
+  }
+
+  #[test]
+  fn a_count_the_entries_cannot_hold_is_refused_before_room_is_made() {
+    // Half the counter's range of entries, and none there: refused at
+    // once, without reserving room for them.
+    let data = [0x8000_0002, 0x7FFF_FFFF, 0x10, 0x20];
+    assert!(ScanConf::decode(&data, None, false).is_err());
+    assert!(ScanConf::decode(&data, None, true).is_err());
+    let one = [0x8000_0002, 1, 0x10, 0x20, 0x38, 7];
+    assert!(
+      ScanConf::decode(&one, None, false).is_err(),
+      "one entry short"
+    );
   }
 
   #[test]

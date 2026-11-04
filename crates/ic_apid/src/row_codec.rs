@@ -817,4 +817,56 @@ mod tests {
     let e = unpack_row(&rec, &words, &mut row).expect_err("refused");
     assert_eq!(e.code, err::IC_ERROR_VALUE_TOO_LONG);
   }
+
+  /// The words as the packed row of a read of every column of the
+  /// module's table, put into a row its record lays out.
+  fn unpack_into_row(input: &[u8]) {
+    let mut words: Vec<u32> = Vec::new();
+    ic_port::fuzz::words_of(input, &mut words);
+    let t = table();
+    let rec = Record::default_for(&t, None).expect("record");
+    let mut row = vec![0u8; rec.row_size() as usize];
+    let _ = unpack_row(&rec, &words, &mut row);
+  }
+
+  /// A packed row as a data node answers a read: the header, the mask,
+  /// then the values.
+  fn packed_row(mask: u32, values: &[u8]) -> Vec<u8> {
+    let mut words = vec![(0xFFF3 << 16) | 4, mask];
+    words.extend_from_slice(&padded(values));
+    ic_port::fuzz::bytes_of(&words)
+  }
+
+  #[test]
+  #[ignore = "a fuzz run: cargo xtask fuzz"]
+  fn fuzz_unpack_row() {
+    // Every column, big NULL, as the test above.
+    let mut big_null: Vec<u8> = 7u32.to_ne_bytes().to_vec();
+    big_null.extend_from_slice(&[2, b'h', b'i', 0xF6]);
+    big_null.extend_from_slice(&0b10_0000_0101u32.to_ne_bytes());
+    big_null.extend_from_slice(&42u32.to_ne_bytes());
+    // Every column, none NULL: big on the word after t, b's bits on
+    // the next, n on the word after the one they touched.
+    let mut all: Vec<u8> = 7u32.to_ne_bytes().to_vec();
+    all.extend_from_slice(&[2, b'h', b'i', 0xF6]);
+    all.extend_from_slice(&5u64.to_ne_bytes());
+    all.extend_from_slice(&0b11_1111_1111u32.to_ne_bytes());
+    all.extend_from_slice(&42u32.to_ne_bytes());
+    // Every nullable column NULL, and the longest name.
+    let mut nulls: Vec<u8> = 7u32.to_ne_bytes().to_vec();
+    nulls.push(20);
+    nulls.extend_from_slice(&[b'x'; 20]);
+    nulls.extend_from_slice(&[0, 0, 0]);
+    nulls.extend_from_slice(&42u32.to_ne_bytes());
+    // id and n only, the columns between them not read.
+    let mut two: Vec<u8> = 7u32.to_ne_bytes().to_vec();
+    two.extend_from_slice(&42u32.to_ne_bytes());
+    let seeds = [
+      packed_row(0b1_0111_0111, &big_null),
+      packed_row(0b1_0101_0111, &all),
+      packed_row(0b1_1111_1111, &nulls),
+      packed_row(0b10_0001, &two),
+    ];
+    ic_port::fuzz::run("unpack_row", &seeds, unpack_into_row);
+  }
 }

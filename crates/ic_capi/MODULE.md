@@ -26,8 +26,9 @@ The C code had no counterpart: its header was the API itself, with the
   that a callback is handed the very connection it runs on. A table or
   index handle holds the description with its names as C strings,
   made once at bind.
-- Queries and transactions cross as their `u32` ids; a stale id finds
-  nothing, since an id carries its slot's generation.
+- Queries, transactions and scans cross as their 64-bit ids; a stale
+  id finds nothing, ever, since an id carries its slot's generation
+  and a slot is retired before that wraps.
 - Every entry is wrapped in `catch_unwind`; a panic in a call on a
   connection marks it unusable (`ApidConnection::set_unusable`), and
   every later call on it but the free returns `IC_ERROR_INTERNAL_PANIC`.
@@ -40,8 +41,10 @@ The C code had no counterpart: its header was the API itself, with the
   request owns its operations' rows, and its handle stays the same box
   while `ic_apid_submitter_execute` moves the request to the executor
   and back, so the row pointers C holds stay valid across runs.
-- A scan crosses as its `u32` id, and a batch as a `u64`: the scan's id
-  high, its receiver's low (`ScanBatchId::as_u64`). A scan's C callback
+- A scan crosses as its 64-bit id, and a batch as the 64-bit id of
+  its own it is given when it is delivered (`ScanBatchId::as_u64`);
+  which scan a batch is of, the connection says
+  (`ic_apid_scan_batch_scan`). A scan's C callback
   goes through a trampoline of its own, the C function in the scan's
   binding word. A scan shape and a reader are boxes of `Arc<ScanShape>`
   and `ScanReader`; the reader's row pointer stays valid until it is

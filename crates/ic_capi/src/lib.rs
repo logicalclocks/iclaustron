@@ -10,9 +10,9 @@
 //!
 //! - Handles are opaque pointers to the Rust objects themselves: an
 //!   `IC_APID_CONNECTION*` is the `ApidConnection`, so that a callback
-//!   can be handed the connection it runs on. Queries and transactions
-//!   are `uint32_t` ids within their connection; an id that names
-//!   nothing is refused, never followed.
+//!   can be handed the connection it runs on. Queries, transactions,
+//!   scans and scan batches are 64-bit ids within their connection,
+//!   never 0; an id whose object is gone is refused, never followed.
 //! - A function that can fail returns `int`: 0, or the error code. What
 //!   it makes it gives through an out pointer.
 //! - Every entry catches a panic and returns `IC_ERROR_INTERNAL_PANIC`;
@@ -174,8 +174,8 @@ pub const IC_SCAN_DONE: u32 = 4;
 /// The id names no scan.
 pub const IC_SCAN_UNKNOWN: u32 = 0xFFFF_FFFF;
 
-/// No transaction, in `IC_SCAN_ARGS`.
-pub const IC_NO_TRANS: u32 = 0xFFFF_FFFF;
+/// No transaction, in `IC_SCAN_ARGS`: 0, which no id ever is.
+pub const IC_NO_TRANS: u64 = 0;
 /// No partition: every partition is scanned, in `IC_SCAN_ARGS`.
 pub const IC_NO_PARTITION: u32 = 0xFFFF_FFFF;
 
@@ -257,6 +257,8 @@ pub const IC_ERROR_TOO_MANY_USER_THREADS: i32 = 7139;
 pub const IC_ERROR_LINK_LOST: i32 = 7135;
 /// No data node is connected and started. Temporary.
 pub const IC_ERROR_NO_STARTED_DATA_NODE: i32 = 7142;
+/// The data node a hint names is not started. Temporary.
+pub const IC_ERROR_NODE_NOT_READY: i32 = 7136;
 /// A wait for the cluster ran out. Temporary.
 pub const IC_ERROR_TIMEOUT: i32 = 7128;
 /// No table by that name in that database.
@@ -425,17 +427,21 @@ pub type IcProgramValue = u32;
 /// A condition's id in its program builder (`IC_PROGRAM_COND`).
 pub type IcProgramCond = u32;
 
-/// A query's id in its connection (`IC_QUERY_ID`).
-pub type IcQueryId = u32;
+/// A query's id in its connection (`IC_QUERY_ID`); never 0, and never
+/// followed once the query is freed.
+pub type IcQueryId = u64;
 
-/// A transaction's id in its connection (`IC_TRANS_ID`).
-pub type IcTransId = u32;
+/// A transaction's id in its connection (`IC_TRANS_ID`); never 0, and
+/// never followed once the transaction is closed.
+pub type IcTransId = u64;
 
-/// A scan's id in its connection (`IC_SCAN_ID`).
-pub type IcScanId = u32;
+/// A scan's id in its connection (`IC_SCAN_ID`); never 0, and never
+/// followed once the scan is freed.
+pub type IcScanId = u64;
 
-/// A batch of a scan's rows (`IC_SCAN_BATCH_ID`): the scan's id in the
-/// high half and its receiver's in the low.
+/// A batch of a scan's rows (`IC_SCAN_BATCH_ID`), by an id of its own:
+/// once the batch is handed back, or its run has ended, it names
+/// nothing.
 pub type IcScanBatchId = u64;
 
 /// What is called when a batch of a scan is complete
@@ -592,7 +598,7 @@ pub struct IcExecutorOptions {
   /// Requests out at most, each a transaction holding a record at its
   /// coordinator; 400 by default.
   pub in_flight: u32,
-  /// Requests waiting at most before a submit is refused or waits;
+  /// Requests waiting at most before a submit waits for room;
   /// 4 000 by default.
   pub queue: u32,
   /// Scans run at once at most; 64 by default. Added after 0.1: a
@@ -670,7 +676,8 @@ pub struct IcScanArgs {
   /// this long after it was started, in milliseconds; 0 for no limit.
   pub timeout_ms: u32,
   /// For a committed read through an executor: let a receiver go on as
-  /// soon as its batch has moved to the reader.
+  /// soon as its batch has moved to the reader, while the reader holds
+  /// fewer than two of its batches; else once one is handed back.
   pub read_ahead: bool,
   /// Called with each batch as it completes, or NULL for the ready
   /// list: an `IC_SCAN_CALLBACK`.
@@ -999,7 +1006,7 @@ fn trampoline(conn: &mut ApidConnection, query: QueryId, user_ref: usize) {
   // SAFETY: the handle is the connection the poll runs on; the callback
   // may call back into the library with it, which reborrows it from
   // this pointer while `conn` waits.
-  unsafe { callback(handle, query.as_u32(), user_ref as *mut c_void) };
+  unsafe { callback(handle, query.as_u64(), user_ref as *mut c_void) };
 }
 
 fn hint_to_c(hint: TransactionHint) -> IcTransactionHint {
@@ -2194,7 +2201,7 @@ pub unsafe extern "C" fn ic_apid_query_create(
   match unsafe { on_conn(conn, |c| c.create_query(&table.def, key, attr)) } {
     Ok(Ok(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { query.write(id.as_u32()) };
+      unsafe { query.write(id.as_u64()) };
       0
     }
     Ok(Err(e)) => e.code,
@@ -2237,7 +2244,7 @@ pub unsafe extern "C" fn ic_apid_query_create_unique(
   } {
     Ok(Ok(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { query.write(id.as_u32()) };
+      unsafe { query.write(id.as_u64()) };
       0
     }
     Ok(Err(e)) => e.code,
@@ -2260,7 +2267,7 @@ pub unsafe extern "C" fn ic_apid_query_free(
   query: IcQueryId,
 ) -> i32 {
   // SAFETY: the caller's promise.
-  unsafe { conn_code(conn, |c| c.free_query(QueryId::from_u32(query))) }
+  unsafe { conn_code(conn, |c| c.free_query(QueryId::from_u64(query))) }
 }
 
 /// The query's key row and its length: filled by the application before
@@ -2279,7 +2286,7 @@ pub unsafe extern "C" fn ic_apid_query_key_row(
 ) -> *mut u8 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query_mut(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
       Some(q) => {
         let row = q.key_row_mut();
         (row.as_mut_ptr(), row.len())
@@ -2311,7 +2318,7 @@ pub unsafe extern "C" fn ic_apid_query_attr_row(
 ) -> *mut u8 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query_mut(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
       Some(q) => {
         let row = q.attr_row_mut();
         (row.as_mut_ptr(), row.len())
@@ -2339,7 +2346,7 @@ pub unsafe extern "C" fn ic_apid_query_state(
 ) -> u32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query(QueryId::from_u64(query)) {
       Some(q) => query_state_to_c(q.state()),
       None => IC_QUERY_UNKNOWN,
     })
@@ -2361,7 +2368,7 @@ pub unsafe extern "C" fn ic_apid_query_error(
 ) -> i32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query(QueryId::from_u64(query)) {
       Some(q) => match q.error() {
         Some(e) => e.code,
         None => 0,
@@ -2388,7 +2395,7 @@ pub unsafe extern "C" fn ic_apid_query_error_data(
 ) -> u32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query(QueryId::from_u64(query)) {
       Some(q) => q.error_data(),
       None => 0,
     })
@@ -2408,7 +2415,7 @@ pub unsafe extern "C" fn ic_apid_query_user_ref(
 ) -> *mut c_void {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query(QueryId::from_u64(query)) {
       Some(q) => q.user_ref(),
       None => 0,
     })
@@ -2537,8 +2544,8 @@ pub unsafe extern "C" fn ic_apid_conn_read_key(
   unsafe {
     conn_code(conn, |c| {
       c.read_key(
-        QueryId::from_u32(query),
-        TransId::from_u32(trans),
+        QueryId::from_u64(query),
+        TransId::from_u64(trans),
         &rust_args,
       )
     })
@@ -2600,8 +2607,8 @@ pub unsafe extern "C" fn ic_apid_conn_write_key(
   unsafe {
     conn_code(conn, |c| {
       c.write_key(
-        QueryId::from_u32(query),
-        TransId::from_u32(trans),
+        QueryId::from_u64(query),
+        TransId::from_u64(trans),
         &rust_args,
       )
     })
@@ -2627,7 +2634,7 @@ pub unsafe extern "C" fn ic_apid_conn_get_next_executed_query(
   match unsafe { on_conn(conn, |c| c.get_next_executed_query()) } {
     Ok(Some(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { query.write(id.as_u32()) };
+      unsafe { query.write(id.as_u64()) };
       true
     }
     _ => false,
@@ -2712,6 +2719,7 @@ pub unsafe extern "C" fn ic_apid_conn_hint_for_unique_key(
 /// needs the table it is over; `def` may be NULL otherwise.
 ///
 /// Errors: `IC_ERROR_NO_STARTED_DATA_NODE` when no data node is started;
+/// `IC_ERROR_NODE_NOT_READY` for an `IC_HINT_NODE` naming a node not started;
 /// `IC_ERROR_LINK_LOST`, `IC_ERROR_TIMEOUT` or the coordinator's refusal, an
 /// NDB code such as 4006, when no coordinator record could be had. It waits for
 /// a round trip to the data node when the connection has no coordinator record
@@ -2743,7 +2751,7 @@ pub unsafe extern "C" fn ic_apid_conn_start_transaction(
   } {
     Ok(Ok(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { trans.write(id.as_u32()) };
+      unsafe { trans.write(id.as_u64()) };
       0
     }
     Ok(Err(e)) => e.code,
@@ -2784,7 +2792,7 @@ pub unsafe extern "C" fn ic_apid_conn_start_transaction_on_index(
   } {
     Ok(Ok(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { trans.write(id.as_u32()) };
+      unsafe { trans.write(id.as_u64()) };
       0
     }
     Ok(Err(e)) => e.code,
@@ -2807,7 +2815,7 @@ pub unsafe extern "C" fn ic_apid_conn_commit_transaction(
   trans: IcTransId,
 ) -> i32 {
   // SAFETY: the caller's promise.
-  unsafe { conn_code(conn, |c| c.commit_transaction(TransId::from_u32(trans))) }
+  unsafe { conn_code(conn, |c| c.commit_transaction(TransId::from_u64(trans))) }
 }
 
 /// Ask for the transaction to roll back; queries not yet sent are
@@ -2826,7 +2834,7 @@ pub unsafe extern "C" fn ic_apid_conn_rollback_transaction(
 ) -> i32 {
   // SAFETY: the caller's promise.
   unsafe {
-    conn_code(conn, |c| c.rollback_transaction(TransId::from_u32(trans)))
+    conn_code(conn, |c| c.rollback_transaction(TransId::from_u64(trans)))
   }
 }
 
@@ -2844,7 +2852,7 @@ pub unsafe extern "C" fn ic_apid_conn_close_transaction(
   trans: IcTransId,
 ) -> i32 {
   // SAFETY: the caller's promise.
-  unsafe { conn_code(conn, |c| c.close_transaction(TransId::from_u32(trans))) }
+  unsafe { conn_code(conn, |c| c.close_transaction(TransId::from_u64(trans))) }
 }
 
 /// Where the transaction is: one of the `IC_COMMIT_STATE_*` values.
@@ -2859,7 +2867,7 @@ pub unsafe extern "C" fn ic_apid_transaction_state(
 ) -> u32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.transaction(TransId::from_u32(trans)) {
+    on_conn(conn, |c| match c.transaction(TransId::from_u64(trans)) {
       Some(t) => commit_state_to_c(t.commit_state()),
       None => IC_COMMIT_STATE_UNKNOWN,
     })
@@ -2881,7 +2889,7 @@ pub unsafe extern "C" fn ic_apid_transaction_is_done(
 ) -> bool {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.transaction(TransId::from_u32(trans)) {
+    on_conn(conn, |c| match c.transaction(TransId::from_u64(trans)) {
       Some(t) => t.is_done(),
       None => true,
     })
@@ -2903,7 +2911,7 @@ pub unsafe extern "C" fn ic_apid_transaction_error(
 ) -> i32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.transaction(TransId::from_u32(trans)) {
+    on_conn(conn, |c| match c.transaction(TransId::from_u64(trans)) {
       Some(t) => match t.error() {
         Some(e) => e.code,
         None => 0,
@@ -2929,7 +2937,7 @@ pub unsafe extern "C" fn ic_apid_transaction_error_data(
 ) -> u32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.transaction(TransId::from_u32(trans)) {
+    on_conn(conn, |c| match c.transaction(TransId::from_u64(trans)) {
       Some(t) => t.error_data(),
       None => 0,
     })
@@ -2949,7 +2957,7 @@ pub unsafe extern "C" fn ic_apid_transaction_gci(
 ) -> u64 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.transaction(TransId::from_u32(trans)) {
+    on_conn(conn, |c| match c.transaction(TransId::from_u64(trans)) {
       Some(t) => t.gci(),
       None => 0,
     })
@@ -3045,11 +3053,14 @@ pub unsafe extern "C" fn ic_apid_conn_flush(
 /// for it: the row goes into `attr_row`, and `found` says whether there
 /// was one.
 ///
-/// Errors: as `ic_apid_conn_start_transaction` and `ic_apid_conn_read_key`;
-/// `IC_ERROR_RECORD_LAYOUT` when a row is shorter than its record's;
-/// `IC_ERROR_KEY_RECORD` for records over different tables; `IC_ERROR_TIMEOUT`
-/// when no answer came in 10 seconds. A row not there is no error: `found` is
-/// false.
+/// Errors: `IC_ERROR_RECORD_LAYOUT` when a row is shorter than its
+/// record's; `IC_ERROR_KEY_RECORD` for records over different tables, or
+/// a key record without the whole primary key;
+/// `IC_ERROR_NO_STARTED_DATA_NODE` when no data node is started; the
+/// coordinator's refusal, an NDB code such as 4006, when no coordinator
+/// record could be had; the read's refusal, as the data node gives it;
+/// `IC_ERROR_TIMEOUT` when no coordinator record came in five seconds, or
+/// no answer in 10. A row not there is no error: `found` is false.
 ///
 /// # Safety
 ///
@@ -3105,7 +3116,13 @@ pub unsafe extern "C" fn ic_apid_conn_read_committed(
 
 /// As `ic_apid_conn_read_committed`, through a unique index.
 ///
-/// Errors: as `ic_apid_conn_read_committed`.
+/// Errors: as `ic_apid_query_create_unique`,
+/// `ic_apid_conn_start_transaction` and `ic_apid_conn_read_key`;
+/// `IC_ERROR_RECORD_LAYOUT` when a row is shorter than its record's; the
+/// read's refusal, as the data node gives it. With no answer it waits
+/// for the reply timeout, six minutes unless `IC_GLOBAL_OPTIONS` says
+/// less, and a second more, and fails with `IC_NDB_ERROR_NO_REPLY`;
+/// `IC_ERROR_TIMEOUT` only if the transaction has not ended even then.
 ///
 /// # Safety
 ///
@@ -3168,9 +3185,9 @@ pub unsafe extern "C" fn ic_apid_conn_read_unique_committed(
 /// `IC_NDB_ERROR_NO_SUCH_ROW` for an update or delete of no row,
 /// `IC_NDB_ERROR_ROW_EXISTS` for an insert of one there,
 /// `IC_NDB_ERROR_UNIQUE_DUPLICATE` when a unique index already holds the value;
-/// and as `ic_apid_conn_write_key`, `ic_apid_conn_start_transaction` and
-/// `ic_apid_conn_read_committed`. `IC_ERROR_NOT_SUPPORTED` for a kind no define
-/// names.
+/// and as `ic_apid_conn_read_committed`, which runs the same way;
+/// `IC_ERROR_DELETE_WITH_BLOBS` for a delete on a table with a blob column.
+/// `IC_ERROR_NOT_SUPPORTED` for a kind no define names.
 ///
 /// # Safety
 ///
@@ -3242,8 +3259,11 @@ fn scan_trampoline(
   batch: ScanBatchId,
   user_ref: usize,
 ) {
-  let binding = match conn.scan(batch.scan()) {
-    Some(scan) => scan.binding(),
+  let binding = match conn.batch_scan(batch) {
+    Some(id) => match conn.scan(id) {
+      Some(scan) => scan.binding(),
+      None => return,
+    },
     None => return,
   };
   if binding == 0 {
@@ -3287,7 +3307,7 @@ unsafe fn scan_args_from_c(args: *const IcScanArgs) -> Result<ScanArgs, i32> {
     ..ScanArgs::default()
   };
   if given.trans != IC_NO_TRANS {
-    rust_args.trans = Some(TransId::from_u32(given.trans));
+    rust_args.trans = Some(TransId::from_u64(given.trans));
   }
   if given.partition != IC_NO_PARTITION {
     rust_args.partition = Some(given.partition);
@@ -3371,7 +3391,7 @@ pub unsafe extern "C" fn ic_apid_scan_create(
   match unsafe { on_conn(conn, |c| c.create_scan(&table.def, rec)) } {
     Ok(Ok(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { scan.write(id.as_u32()) };
+      unsafe { scan.write(id.as_u64()) };
       0
     }
     Ok(Err(e)) => e.code,
@@ -3418,7 +3438,7 @@ pub unsafe extern "C" fn ic_apid_index_scan_create(
   match made {
     Ok(Ok(id)) => {
       // SAFETY: checked non-null above; the caller's promise.
-      unsafe { scan.write(id.as_u32()) };
+      unsafe { scan.write(id.as_u64()) };
       0
     }
     Ok(Err(e)) => e.code,
@@ -3520,7 +3540,7 @@ pub unsafe extern "C" fn ic_apid_conn_add_scan_range(
   // SAFETY: the caller's promise.
   let added = unsafe {
     on_conn(conn, |c| {
-      c.add_scan_range(ScanId::from_u32(scan), &given, low_row, high_row)
+      c.add_scan_range(ScanId::from_u64(scan), &given, low_row, high_row)
     })
   };
   match added {
@@ -3543,7 +3563,7 @@ pub unsafe extern "C" fn ic_apid_scan_range_no(
 ) -> u32 {
   // SAFETY: the caller's promise.
   let found =
-    unsafe { on_conn(conn, |c| c.scan_range_no(ScanId::from_u32(scan))) };
+    unsafe { on_conn(conn, |c| c.scan_range_no(ScanId::from_u64(scan))) };
   found.unwrap_or(0)
 }
 
@@ -3561,7 +3581,7 @@ pub unsafe extern "C" fn ic_apid_scan_free(
   scan: IcScanId,
 ) -> i32 {
   // SAFETY: the caller's promise.
-  unsafe { conn_code(conn, |c| c.free_scan(ScanId::from_u32(scan))) }
+  unsafe { conn_code(conn, |c| c.free_scan(ScanId::from_u64(scan))) }
 }
 
 /// Start a run of the scan, as `args` says (`ic_scan_args_init`). The
@@ -3572,8 +3592,13 @@ pub unsafe extern "C" fn ic_apid_scan_free(
 ///
 /// Errors: `IC_ERROR_SCAN_ACTIVE` while a run is not over;
 /// `IC_ERROR_NOT_SUPPORTED` for an unknown lock, for `read_ahead`, which
-/// is for executors, for a committed read given a transaction, and for
-/// `continuous` with a lock;
+/// is for executors, for a committed read given a transaction, for
+/// `continuous` with a lock, for `ordered` or `descending` on a table
+/// scan, and for an ordered run with a callback or over an index with a
+/// column whose order is not known here; for an ordered run,
+/// `IC_ERROR_KEY_RECORD` when the record its rows are read into lacks a
+/// column of the index, and `IC_ERROR_BAD_RANGE` for range numbers that
+/// do not rise;
 /// `IC_ERROR_TRANSACTION_ACTIVE` for a transaction not started or not
 /// open; `IC_ERROR_INCONSISTENT_DATA` for `args` not filled by
 /// `ic_scan_args_init`.
@@ -3595,7 +3620,7 @@ pub unsafe extern "C" fn ic_apid_conn_start_scan(
   };
   // SAFETY: the caller's promise.
   unsafe {
-    conn_code(conn, |c| c.start_scan(ScanId::from_u32(scan), &rust_args))
+    conn_code(conn, |c| c.start_scan(ScanId::from_u64(scan), &rust_args))
   }
 }
 
@@ -3617,7 +3642,7 @@ pub unsafe extern "C" fn ic_apid_conn_close_scan(
   scan: IcScanId,
 ) -> i32 {
   // SAFETY: the caller's promise.
-  unsafe { conn_code(conn, |c| c.close_scan(ScanId::from_u32(scan))) }
+  unsafe { conn_code(conn, |c| c.close_scan(ScanId::from_u64(scan))) }
 }
 
 /// Where the scan is: one of the `IC_SCAN_*` states, `IC_SCAN_UNKNOWN`
@@ -3633,7 +3658,7 @@ pub unsafe extern "C" fn ic_apid_scan_state(
 ) -> u32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.scan(ScanId::from_u32(scan)) {
+    on_conn(conn, |c| match c.scan(ScanId::from_u64(scan)) {
       Some(s) => scan_state_to_c(s.state()),
       None => IC_SCAN_UNKNOWN,
     })
@@ -3654,7 +3679,7 @@ pub unsafe extern "C" fn ic_apid_scan_is_done(
   scan: IcScanId,
 ) -> bool {
   // SAFETY: the caller's promise.
-  let found = unsafe { on_conn(conn, |c| c.scan_done(ScanId::from_u32(scan))) };
+  let found = unsafe { on_conn(conn, |c| c.scan_done(ScanId::from_u64(scan))) };
   found.unwrap_or(true)
 }
 
@@ -3673,7 +3698,7 @@ pub unsafe extern "C" fn ic_apid_scan_error(
 ) -> i32 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.scan(ScanId::from_u32(scan)) {
+    on_conn(conn, |c| match c.scan(ScanId::from_u64(scan)) {
       Some(s) => match s.error() {
         Some(e) => e.code,
         None => 0,
@@ -3700,7 +3725,7 @@ pub unsafe extern "C" fn ic_apid_scan_rows_read(
 ) -> u64 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.scan(ScanId::from_u32(scan)) {
+    on_conn(conn, |c| match c.scan(ScanId::from_u64(scan)) {
       Some(s) => s.rows_read(),
       None => 0,
     })
@@ -3725,7 +3750,7 @@ pub unsafe extern "C" fn ic_apid_scan_row(
   // SAFETY: the caller's promise.
   let found = unsafe {
     on_conn(conn, |c| {
-      let row = c.scan_row(ScanId::from_u32(scan));
+      let row = c.scan_row(ScanId::from_u64(scan));
       if row.is_empty() {
         return (std::ptr::null(), 0);
       }
@@ -3740,10 +3765,24 @@ pub unsafe extern "C" fn ic_apid_scan_row(
   row
 }
 
-/// The scan a batch is of.
+/// The scan a batch is of, while the batch is with the application; 0
+/// for a batch handed back, of a run that has ended, or never given.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed.
 #[no_mangle]
-pub extern "C" fn ic_scan_batch_scan(batch: IcScanBatchId) -> IcScanId {
-  ScanBatchId::from_u64(batch).scan().as_u32()
+pub unsafe extern "C" fn ic_apid_scan_batch_scan(
+  conn: *mut IcApidConnection,
+  batch: IcScanBatchId,
+) -> IcScanId {
+  // SAFETY: the caller's promise.
+  let found =
+    unsafe { on_conn(conn, |c| c.batch_scan(ScanBatchId::from_u64(batch))) };
+  match found {
+    Ok(Some(id)) => id.as_u64(),
+    _ => 0,
+  }
 }
 
 /// Take the batch completed longest ago, of a scan with no callback,
@@ -3909,7 +3948,7 @@ pub unsafe extern "C" fn ic_apid_conn_next_row(
     return err::IC_ERROR_NULL_POINTER;
   }
   // SAFETY: the caller's promise.
-  let found = unsafe { on_conn(conn, |c| c.next_row(ScanId::from_u32(scan))) };
+  let found = unsafe { on_conn(conn, |c| c.next_row(ScanId::from_u64(scan))) };
   // SAFETY: checked non-null above; the caller's promise.
   unsafe { row_read(found, more) }
 }
@@ -3939,7 +3978,7 @@ pub unsafe extern "C" fn ic_apid_conn_next_row_into(
   let into = unsafe { row_arg_mut(row, len) };
   // SAFETY: the caller's promise.
   let found =
-    unsafe { on_conn(conn, |c| c.next_row_into(ScanId::from_u32(scan), into)) };
+    unsafe { on_conn(conn, |c| c.next_row_into(ScanId::from_u64(scan), into)) };
   // SAFETY: checked non-null above; the caller's promise.
   unsafe { row_read(found, more) }
 }
@@ -3949,7 +3988,8 @@ pub unsafe extern "C" fn ic_apid_conn_next_row_into(
 /// it is, once the run is over with no error. The program reads the
 /// batch with `ic_apid_conn_next_scan_row` and hands it back itself.
 ///
-/// Errors: as `ic_apid_conn_next_row`.
+/// Errors: as `ic_apid_conn_next_row`; `IC_ERROR_NOT_SUPPORTED` for an
+/// ordered run, whose rows `ic_apid_conn_next_row` merges.
 ///
 /// # Safety
 ///
@@ -3967,7 +4007,7 @@ pub unsafe extern "C" fn ic_apid_conn_next_batch(
   }
   // SAFETY: the caller's promise.
   let found =
-    unsafe { on_conn(conn, |c| c.next_batch(ScanId::from_u32(scan))) };
+    unsafe { on_conn(conn, |c| c.next_batch(ScanId::from_u64(scan))) };
   let (code, next) = match found {
     Ok(Ok(next)) => (0, next),
     Ok(Err(e)) => (e.code, None),
@@ -4069,8 +4109,8 @@ unsafe fn take_over(
     Ok(rust_args) => rust_args,
     Err(code) => return code,
   };
-  let query = QueryId::from_u32(query);
-  let scan = ScanId::from_u32(scan);
+  let query = QueryId::from_u64(query);
+  let scan = ScanId::from_u64(scan);
   // SAFETY: the caller's promise.
   unsafe {
     conn_code(conn, |c| match what {
@@ -5374,14 +5414,20 @@ pub unsafe extern "C" fn ic_scan_reader_free(reader: *mut IcScanReader) {
 /// to the executor, waiting for room in a full list, and the rows come
 /// with `ic_scan_reader_next_row`. Each batch is handed back to its
 /// receiver once the reader has read it, whatever the lock, unless a
-/// committed read asks for `read_ahead`.
+/// committed read asks for `read_ahead`: the receiver then goes on as
+/// soon as its batch has moved, while the reader holds fewer than two
+/// of its batches, else once one is handed back.
 ///
 /// Errors: `IC_ERROR_SCAN_ACTIVE` while the reader's last run is not
 /// over; `IC_ERROR_NOT_SUPPORTED` for a transaction or a callback in
 /// `args`, for `read_ahead` or `continuous` with a lock, for the two
-/// together, and on the executor's own thread;
-/// `IC_ERROR_EXECUTOR_STOPPED`; `IC_ERROR_INCONSISTENT_DATA` for `args`
-/// not filled by `ic_scan_args_init`.
+/// together, for `ordered` or `descending` on a table scan, for an
+/// ordered run over an index with a column whose order is not known
+/// here, and on the executor's own thread; for an ordered run,
+/// `IC_ERROR_KEY_RECORD` when the record its rows are read into lacks a
+/// column of the index, and `IC_ERROR_BAD_RANGE` for range numbers that
+/// do not rise; `IC_ERROR_EXECUTOR_STOPPED`; `IC_ERROR_INCONSISTENT_DATA`
+/// for `args` not filled by `ic_scan_args_init`.
 ///
 /// # Safety
 ///
@@ -6138,7 +6184,7 @@ pub unsafe extern "C" fn ic_apid_query_set_program(
   let program = unsafe { program_of(program) };
   // SAFETY: the caller's promise.
   unsafe {
-    conn_code(conn, |c| match c.query_mut(QueryId::from_u32(query)) {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
       Some(q) => q.set_program(program),
       None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     })
@@ -6164,7 +6210,7 @@ pub unsafe extern "C" fn ic_apid_query_set_input(
 ) -> i32 {
   // SAFETY: the caller's promise.
   unsafe {
-    conn_code(conn, |c| match c.query_mut(QueryId::from_u32(query)) {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
       Some(q) => q.set_input(input, value),
       None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     })
@@ -6193,7 +6239,7 @@ pub unsafe extern "C" fn ic_apid_query_set_reads_after(
   let rec = unsafe { record_of(rec) };
   // SAFETY: the caller's promise.
   unsafe {
-    conn_code(conn, |c| match c.query_mut(QueryId::from_u32(query)) {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
       Some(q) => q.set_reads_after(rec),
       None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     })
@@ -6217,7 +6263,7 @@ pub unsafe extern "C" fn ic_apid_query_after_row(
 ) -> *const u8 {
   // SAFETY: the caller's promise.
   let found = unsafe {
-    on_conn(conn, |c| match c.query(QueryId::from_u32(query)) {
+    on_conn(conn, |c| match c.query(QueryId::from_u64(query)) {
       Some(q) if !q.after_row().is_empty() => {
         (q.after_row().as_ptr(), q.after_row().len())
       }
@@ -6255,7 +6301,7 @@ pub unsafe extern "C" fn ic_apid_conn_set_scan_program(
   // SAFETY: the caller's promise.
   unsafe {
     conn_code(conn, |c| {
-      c.set_scan_program(ScanId::from_u32(scan), program)
+      c.set_scan_program(ScanId::from_u64(scan), program)
     })
   }
 }
@@ -6280,7 +6326,7 @@ pub unsafe extern "C" fn ic_apid_conn_set_scan_input(
   // SAFETY: the caller's promise.
   unsafe {
     conn_code(conn, |c| {
-      c.set_scan_input(ScanId::from_u32(scan), input, value)
+      c.set_scan_input(ScanId::from_u64(scan), input, value)
     })
   }
 }
@@ -6778,7 +6824,7 @@ mod tests {
     assert_eq!(IC_ERROR_INTERNAL_PANIC, err::IC_ERROR_INTERNAL_PANIC);
     assert_eq!(IC_ERROR_NULL_POINTER, err::IC_ERROR_NULL_POINTER);
     assert_eq!(IC_ERROR_BAD_TEXT, err::IC_ERROR_BAD_TEXT);
-    let pairs: [(i32, i32); 25] = [
+    let pairs: [(i32, i32); 26] = [
       (
         IC_ERROR_PARSE_CONNECTSTRING,
         err::IC_ERROR_PARSE_CONNECTSTRING,
@@ -6798,6 +6844,7 @@ mod tests {
         IC_ERROR_NO_STARTED_DATA_NODE,
         err::IC_ERROR_NO_STARTED_DATA_NODE,
       ),
+      (IC_ERROR_NODE_NOT_READY, err::IC_ERROR_NODE_NOT_READY),
       (IC_ERROR_TIMEOUT, err::IC_ERROR_TIMEOUT),
       (IC_ERROR_NO_SUCH_TABLE, err::IC_ERROR_NO_SUCH_TABLE),
       (IC_ERROR_NO_SUCH_INDEX, err::IC_ERROR_NO_SUCH_INDEX),
@@ -7095,7 +7142,7 @@ mod tests {
     let rust = crossed.unwrap_or_default();
     assert_eq!(rust.lock, ScanLock::Exclusive);
     assert_eq!(rust.partition, Some(3));
-    assert_eq!(rust.trans, Some(TransId::from_u32(7)));
+    assert_eq!(rust.trans, Some(TransId::from_u64(7)));
     args.lock = 9;
     // SAFETY: as above.
     let refused = unsafe { scan_args_from_c(&args) };
@@ -7215,9 +7262,13 @@ mod tests {
   }
 
   #[test]
-  fn a_batch_names_its_scan() {
-    let batch = ((42u64) << 32) | 0x0080_0001;
-    assert_eq!(ic_scan_batch_scan(batch), 42);
+  fn a_batch_names_no_scan_without_its_connection() {
+    // Which scan a batch is of is its connection's to say: with none,
+    // no scan.
+    // SAFETY: a null handle is refused before anything is followed.
+    let scan =
+      unsafe { ic_apid_scan_batch_scan(std::ptr::null_mut(), 1 << 24) };
+    assert_eq!(scan, 0);
   }
 
   #[test]

@@ -1395,8 +1395,9 @@ count from 0: word 0 is a signal's first.
   transaction id, and nothing more is waited for (the author,
   2026-10-21). Each run takes new receiver ids, whose generation tells
   them from an earlier run's in the same slot
-  (`crates/ic_util/src/ptr_array.rs`), and a run under an id of its own
-  a new transaction id, so no later run takes them in. The same holds
+  (`crates/ic_util/src/ptr_array.rs`; the word sent carries eight bits
+  of it), and a run under an id of its own a new transaction id, so no
+  later run takes them in. The same holds
   for any batch on its way when a stop is sent at once.
 
   Phase 10 sends the stop at once, without waiting for the batches
@@ -3132,7 +3133,7 @@ code points into.
 
 ### 17.12 Links, threads and signals (`ic_apid::apid_conn`, `apid_global`, `handshake`, `heartbeat`, `fragments`, `node_connect`, `node_state`, `rec_thread`, `signal_reader`, `signal_page`, `thread_conn`, `connect_thread`, `adaptive_send`, `send_pool`, `lib`)
 
-- A transaction id holds the low 12 bits of the user thread's block number less 0x8000 in bits 52 to 63 and the low 12 bits of the API node's id in bits 40 to 51; bit 12 of the node id goes in bit 39 and bit 12 of the block index in bit 38; the low 32 bits are a count that wraps without carrying into bit 32. Ours is laid out the same since 2026-10-14 (`apid_conn::transaction_id`), with up to 4 711 user threads.
+- A transaction id holds the low 12 bits of the user thread's block number less 0x8000 in bits 52 to 63 and the low 12 bits of the API node's id in bits 40 to 51; bit 12 of the node id goes in bit 39 and bit 12 of the block index in bit 38; the reference's count is the low 32 bits, and wraps without carrying into bit 32. In 26.10 the 38 bits below bit 38 are free for the count, the rest being the node id and the thread (the author, 2026-10-23). Ours is laid out the same since 2026-10-14 (`apid_conn::transaction_id`), with up to 4 711 user threads, and since 2026-10-23 counts in all 38 bits, wrapping within them, so that a thread's block makes the same id again only after 2^38 transactions.
 - The count of a newly opened block goes on from where the last holder of the same block number left it; a holder stores its count for the block before it lets the block go.
 - The reference API sends a heartbeat every half check interval, or at its own longest registration interval if that is shorter.
 - The check interval in `HEARTBEAT_CONF` (signal 1) is in hundredths of a second, and one shorter than 100 ms is raised to 100 ms.

@@ -14,8 +14,9 @@
 //! - [`bitmap`]: a bitmap of fixed width.
 //! - [`dyn_array`]: a growable byte buffer with positioned reads and
 //!   writes.
-//! - [`ptr_array`]: the object map, turning objects into the 32-bit ids
-//!   that travel in NDB signals and back.
+//! - [`ptr_array`]: the object map, turning objects into ids, never
+//!   followed once stale, and the 32-bit words that travel in NDB
+//!   signals, and back.
 //! - [`connectstring`]: parsing `host:port,host:port` and the NDB
 //!   `nodeid=` and `bind-address=` options.
 //! - [`string`]: the few string helpers with no direct equivalent in the

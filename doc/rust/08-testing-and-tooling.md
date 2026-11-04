@@ -28,11 +28,9 @@ it. A CI job can run the same commands later if wanted.
 - `ic_comm`: loopback socket tests for `Connection` read/write/writev/
   sessions and for each `PollSet` backend; `test/test_comm.c` scenarios.
 - `ic_signals`: encode/decode round-trips for every signal struct;
-  golden-vector tests from captured traffic (below); `cargo fuzz` targets
-  (nightly toolchain, run by the developer when a decoder changes) for
-  `header::decode`, `TableProps` property parsing, `ROW_DATA_REP`
-  attribute parsing and the config-blob decoder. These decoders take
-  bytes from the network, so they are fuzzed from day one.
+  golden-vector tests from captured traffic (below); fuzz tests of
+  every decoder (below, "Fuzzing"), as these take bytes from the
+  network.
 - `ic_apic`: parameter-table invariants (unique ids, unique names), config
   blob v2 decoding from captured blobs, typed config extraction.
 - `ic_apid`: state machines tested without a network: transaction
@@ -127,6 +125,125 @@ languages chosen in Q6 (Python `ctypes`, Java Panama suggested). Each does
 connect → bind table → PK insert/read → commit and is run by
 `cargo xtask test-examples` against the development cluster. Their purpose is to catch ABI mistakes
 (struct layout, ownership, string lifetime), not to be real bindings.
+
+## Fuzzing (`cargo xtask fuzz`)
+
+The decoders of what arrives from the network are fuzzed, those
+listed below, each by a test the developer runs when it changes. The
+fuzzer is our own, `ic_port::fuzz`: it needs nothing beyond std and
+runs on the stable toolchain, like everything else here.
+
+**The runner.** A fuzz test is a plain `#[test]` named `fuzz_<target>`
+and marked `#[ignore]`, so that `cargo test` leaves it out. It hands
+`ic_port::fuzz::run` the target's name, a few seeds made by our own
+encoders, and the target: a plain `fn(&[u8])` that gives one input to
+the decoders. A target of a decoder of words makes the bytes into
+words with `fuzz::words_of`, and its seeds are made from words with
+`fuzz::bytes_of`. The first cases are the seeds as they are; each of
+the rest is a seed changed by one to four mutations, those that find
+what a decoder trusts: bits flipped, bytes changed, a word set to a
+value at an edge (0, 1, all ones, the largest signed) or just past
+one, the input cut short or made longer, a piece repeated, the tail
+of another seed spliced on. Now and then a case is bytes of no seed
+at all.
+
+**The pass rule.** A target throws away what a decoder returns: an
+error is the right answer to bytes that make no sense. A case fails
+when it panics, or when it takes longer than 1 s
+(`IC_FUZZ_CASE_LIMIT_MS`); a case still running after 10 s
+(`IC_FUZZ_HANG_MS`) is caught by a watching thread, which stops the
+process. The `fuzz` build profile of the workspace's `Cargo.toml` is
+the release profile with overflow checks and debug assertions on, so
+that an integer overflow panics instead of wrapping unseen.
+
+**The targets**, by crate:
+
+- `ic_signals` (`src/fuzz_tests.rs`, using only the crate's public
+  interface):
+  - `fuzz_header_decode`: `header::peek_message_len` and
+    `header::decode` on each message of the input in turn, then each
+    section. Seeds from `header::encode`, with and without signal id
+    and checksum, with 0 to 3 sections and up to 25 words of data,
+    several messages back to back, and trains of fragments from
+    `header::encode_train`.
+  - `fuzz_bundle_unpack`: `bundle::unpack` and `unpack_into`, then the
+    words of each part.
+  - `fuzz_property_stream`: a `PropertyReader` read to the end or to
+    the first error. Seeds from `PropertyWriter`: numbers of one and
+    two words, text and bytes of every length the padding treats
+    apart.
+  - `fuzz_table_info`: `parse_table_info` and `parse_hash_map_info`,
+    then what a reader asks of the result, such as each column's
+    `max_byte_size`. Seeds: tables of every sized type, with a key,
+    replicas and a default, and hash maps.
+  - `fuzz_signal_data`: every signal decoder on the same words, which
+    the first word splits into data, section 0 and section 1: the
+    coordinator's records, key operations and their replies, scans
+    and their batches in each form, the dictionary's answers,
+    collations and their weights, heartbeats and node failure. Seeds
+    of the lengths these signals have.
+- `ic_apic` (`conf_blob.rs`): `fuzz_config_blob`, `ConfigBlob::decode`
+  and, from what decodes, `ClusterConfig::from_blob` for the API node
+  of the test blobs. The blob ends with a checksum of its words; in
+  about half the cases the target puts it right first, so that a
+  mutation reaches the parser.
+- `ic_protocol` (`base64.rs`): `fuzz_base64_decode`, `base64::decode`
+  of what `encode` and `encode_no_breaks` make, with blanks and the
+  trailing NUL.
+- `ic_apid`:
+  - `fuzz_signal_stream` (`signal_reader.rs`): the receive path as the
+    receive thread runs it. The stream goes into a `SignalReader` in
+    pieces of sizes the input chooses; each whole signal is decoded, a
+    bundled one taken apart, and consumed, and a signal that does not
+    decode ends the case, as it drops the link. Pages are held as a
+    large signal handed on where it lies holds them, so that the
+    reader goes on in other pages.
+  - `fuzz_unpack_row` (`row_codec.rs`): `unpack_row` of a read's
+    packed row into a row of the module's test table.
+
+**Running.**
+
+```
+cargo xtask fuzz                     every target, 100 000 cases each
+cargo xtask fuzz 1000                every target, 1 000 cases each
+cargo xtask fuzz header_decode       one target
+cargo xtask fuzz signal_data 5000000 one target, a long run
+```
+
+It runs `cargo test --workspace --lib --profile fuzz -- --ignored
+--test-threads=1 --nocapture fuzz_<target>`, the target named with or
+without its `fuzz_`, or every `fuzz_` test. Three variables steer a
+run:
+
+- `IC_FUZZ_ITERS`: cases for each target, 100 000 if not set; a number
+  given to `cargo xtask fuzz` sets it.
+- `IC_FUZZ_SEED`: the run's seed, from the clock if not set, and
+  printed at the start either way.
+- `IC_FUZZ_CASE`: run only this case of the run.
+
+A case is the same on every machine for the same seed and number, so
+a failure names both, and the case runs again alone, under a debugger
+or with a backtrace:
+
+```
+IC_FUZZ_SEED=1234 IC_FUZZ_CASE=5678 RUST_BACKTRACE=1 \
+  cargo xtask fuzz header_decode
+```
+
+A case that kills the process rather than panicking, as an allocation
+larger than memory does, is not named. The cases run in order, so
+halving `IC_FUZZ_ITERS` again and again with the same seed finds it.
+
+**Why not cargo-fuzz.** It needs the nightly toolchain, where
+`rust-toolchain.toml` pins stable, and the crate `libfuzzer-sys`,
+where principle 8 of [chapter 01](01-goals-and-principles.md) allows
+std and `libc` alone. What libFuzzer adds is guidance by coverage.
+Our decoders read inputs of a few hundred words with their fields at
+fixed places, from seeds that are valid already, and blind mutation
+reaches them. A target needs nothing but its input, so a cargo-fuzz
+crate kept outside the workspace could call the same functions later,
+once they are made public for it; today they are private to their
+test modules.
 
 ## Static checks (`cargo xtask check`, run by the developer before a commit)
 

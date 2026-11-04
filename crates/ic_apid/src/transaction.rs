@@ -68,8 +68,11 @@
 //! so that a missed condition aborts the transaction only where the
 //! abort option says (§9.4).
 //!
-//! What is not here yet: placing a unique query by the index's own hash
-//! map, so it goes to a node holding the index.
+//! A unique query is placed by the index's own hash map:
+//! `hint_for_unique_key` gives the partition of the index's own table
+//! that the key is in, and a transaction started on it, with
+//! `index.as_table()`, goes to a node holding that partition (chapter
+//! 05 §6.8).
 
 use std::sync::Arc;
 
@@ -400,6 +403,15 @@ impl ApidConnection {
       return Err(IcError::new(err::IC_ERROR_PTR_ARRAY_INDEX_OUT_OF_BOUND));
     }
     Ok(QueryId(id))
+  }
+
+  /// The query a reply's word names, or an id that names none, which
+  /// every lookup refuses, if no live query has that word.
+  fn query_of_wire(&self, word: u32) -> QueryId {
+    match self.queries.id_of_wire(word) {
+      Some(id) => QueryId(id),
+      None => QueryId(PtrId::NONE),
+    }
   }
 
   /// A query through a unique index (`ic_apid_query_create_unique`),
@@ -812,7 +824,7 @@ impl ApidConnection {
     // buffers; the send sets its place in the batch.
     let request = KeyOpReq {
       coord_ptr: coord.coord_ptr,
-      query_ref: query_id.as_u32(),
+      query_ref: query_id.wire_word(),
       table_id,
       flags_word: flags.flags_word(),
       table_version,
@@ -1268,7 +1280,7 @@ impl ApidConnection {
     let mut api_ptr = conf.client_ptr;
     if api_ptr == key_ops::IC_KEY_OP_CONF_NO_TRANSACTION {
       let first = match conf.operations().first() {
-        Some(op) => QueryId(PtrId::from_u32(op.query_ref)),
+        Some(op) => self.query_of_wire(op.query_ref),
         None => return false,
       };
       api_ptr = match self.queries.get(first.0) {
@@ -1296,7 +1308,7 @@ impl ApidConnection {
       self.end_transaction(tid, CommitState::Committed, None, conf.gci);
     }
     for op in conf.operations() {
-      let qid = QueryId(PtrId::from_u32(op.query_ref));
+      let qid = self.query_of_wire(op.query_ref);
       if let Some(query) = self.queries.get_mut(qid.0) {
         if same_trans(query, conf.trans_id_lo, conf.trans_id_hi) {
           query.execution.confirmed = Some(*op);
@@ -1318,7 +1330,7 @@ impl ApidConnection {
       Ok(front) => front,
       Err(_) => return false,
     };
-    let qid = QueryId(PtrId::from_u32(front.query_ref));
+    let qid = self.query_of_wire(front.query_ref);
     let query = match self.queries.get_mut(qid.0) {
       Some(query) => query,
       None => return false,
@@ -1358,7 +1370,7 @@ impl ApidConnection {
       Ok(refusal) => refusal,
       Err(_) => return false,
     };
-    let qid = QueryId(PtrId::from_u32(refusal.query_ref));
+    let qid = self.query_of_wire(refusal.query_ref);
     let ok = match self.queries.get(qid.0) {
       Some(query) => {
         query.state() == QueryState::Sent
@@ -2246,7 +2258,7 @@ mod tests {
       state: CommitState::Started,
       begun: true,
       defined: Vec::new(),
-      sent: vec![QueryId(PtrId::from_u32(1))],
+      sent: vec![QueryId(PtrId::from_u64(1))],
       ops_sent: 1,
       ops_completed: 0,
       end_wanted: None,
@@ -2292,7 +2304,7 @@ mod tests {
     // Open with every reply in: the application's turn, however long.
     assert!(!trans.waited_too_long(AT + 10 * LIMIT, LIMIT));
     // A query sent and not complete.
-    trans.sent.push(QueryId(PtrId::from_u32(1)));
+    trans.sent.push(QueryId(PtrId::from_u64(1)));
     assert!(!trans.waited_too_long(AT + LIMIT - 1, LIMIT));
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
     // A clock that reads earlier than the send is not a wait.
@@ -2308,7 +2320,7 @@ mod tests {
     trans.state = CommitState::Committed;
     assert!(!trans.waited_too_long(AT + 10 * LIMIT, LIMIT));
     // Ended, with a read's row still to come.
-    trans.sent.push(QueryId(PtrId::from_u32(2)));
+    trans.sent.push(QueryId(PtrId::from_u64(2)));
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
     // Never sent: nothing to wait for.
     let mut idle = sent_at(0);

@@ -5,34 +5,44 @@
 ```
  applications (Rust)            C / C++ / Python / Go / Java / Node / .NET
         │                                    │
-        │                          cpp/iclaustron.hpp (header only)
-        │                                    │
         │                               ic_capi  (C ABI, cdylib + staticlib)
         │                                    │
         └──────────────► ic_apid ◄───────────┘        Data API
                             │
-                       ic_signals                     signal numbers, blocks,
-                            │                          signal codecs
-                         ic_apic                      config: mgm client, blob decode,
-                            │                          typed config for API nodes
-                       ic_protocol                    base64, mgm protocol strings
-                            │
-                         ic_comm                      sockets, poll set, page pool,
-                            │                          line protocol
-                         ic_util                      containers, threadpool, errors,
-                            │                          debug, memory container
-                         ic_port                      OS + replaces glib
+               ┌────────────┴─────────────┐
+            ic_apic                   ic_signals
+               │                          │
+        ┌──────┴───────┐                  │
+     ic_comm      ic_protocol             │
+        │              │                  │
+     ic_util           │                  │
+        │              │                  │
+        └──────────────┴─────► ic_port ◄──┘
+
+ ic_signals   signal numbers, blocks, signal codecs
+ ic_apic      config: mgm client, blob decode, typed config for API nodes
+ ic_protocol  base64, mgm protocol strings
+ ic_comm      sockets, poll set, page pool, line protocol
+ ic_util      containers, threadpool, memory container
+ ic_port      OS + replaces glib, errors, debug
 ```
 
-Each layer only calls the layers below it. `ic_signals` has no
-dependencies and is the only crate the fuzzers link.
+Each layer only calls the layers below it. A line down is a
+dependency, and some crates also use one further down directly:
+`ic_capi` uses `ic_apid`, `ic_signals` and `ic_port`; `ic_apid` uses
+every crate below it; `ic_apic` uses `ic_comm`, `ic_protocol`,
+`ic_util` and `ic_port`; `ic_comm` uses `ic_util` and `ic_port`.
+`ic_signals` and `ic_apic` do not use each other. `ic_signals`
+depends on `ic_port` alone, so that its decoders can be tested and
+fuzzed on their own; the fuzz tests of chapter 08 cover the decoders
+of `ic_signals`, `ic_apic`, `ic_protocol` and `ic_apid`.
 
 ## Runtime objects (Data API)
 
 Names are the C names with `IC_` dropped. Indentation shows ownership.
 
 ```
-ApidGlobal  (one per process; owns config, node table, threads, pools)
+ApidGlobal  (one per cluster; owns config, node table, threads)
  ├─ ApiConfigServer            (from ic_apic: node list, ports, TCP parameters)
  ├─ NodeConnection[node_id]    (socket, send buffer chain, connection state,
  │                              heartbeat state, adaptive-send statistics)
@@ -42,16 +52,16 @@ ApidGlobal  (one per process; owns config, node table, threads, pools)
  ├─ SendThreadPool             (small, shared; absorbs send overflow only)
  ├─ HeartbeatThread            (HEARTBEAT_REQ loop; reads node state, never writes)
  ├─ ThreadConnection[thread]   (per user thread: inbound signal queue + condvar)
- ├─ SockBuf                    (page pool for wire data)
- ├─ DictCache                  (TableDef by name, shared by Arc, versioned;
- │                              built: ic_apid::dict_cache)
- └─ global WhereCondition / ConditionalAssignment pools
+ └─ DictCache                  (TableDef by name, shared by Arc, versioned;
+                                built: ic_apid::dict_cache)
 
 ApidConnection  (one per user thread; created from ApidGlobal)
  ├─ block number = 0x8000 + thread id   (what data nodes address replies to)
- ├─ ObjectMap                  (u32 object id → query / transaction owned by
- │                              this thread; generational, thread-local,
- │                              so late signals are rejected without locks)
+ ├─ ObjectMap                  (64-bit object id → query, transaction or
+ │                              scan of this thread; generational, never
+ │                              followed once stale, thread-local; a
+ │                              32-bit word of it goes in signals, so late
+ │                              signals are rejected without locks)
  ├─ CoordRecord[node_id]       (coordinator records allocated by this thread)
  ├─ transaction id counter
  ├─ bound TableDefs
@@ -63,15 +73,20 @@ Transaction  (from ApidConnection::start_transaction)
  ├─ commit state
  └─ counts: ops sent, ops completed, start/execute/commit flags pending
 
-Record  (from TableDef::create_record; describes a C struct layout)
+Record  (from Record::new or Record::default_for; describes a C struct
+         layout)
  └─ per field: attribute id, byte offset, null bit, length encoding, type
 
-ApidQuery  (from ApidGlobal::create_apid_query; reusable)
- ├─ TableDef, key Record + key row pointer, attribute Record + row pointer,
- │  field mask
- ├─ optional WhereCondition, ConditionalAssignment[]
+ApidQuery  (from ApidConnection::create_query; lives in the connection;
+            reusable)
+ ├─ TableDef, key Record + key row, attribute Record + attribute row;
+ │  the query owns both rows
+ ├─ optional Program and its inputs
  ├─ error object, user_reference, callback
- └─ per-execution state: object id, expected/received lengths
+ └─ per-execution state: transaction, expected/received lengths
+
+Program  (from ProgramBuilder::finish; conditions and assignments,
+          shared by Arc and run by any number of queries and scans)
 ```
 
 ## Threading model
@@ -81,9 +96,12 @@ route; user threads execute.**
 
 - **User thread**: defines queries on its `ApidConnection`, calls `send`
   (or `flush`). `send` appends packed signals to each target node's send
-  chain under that node's mutex and either wakes the node's send thread
-  or, when the adaptive-send decision says so, writes to the socket
-  inline. `poll` waits on the thread's `ThreadConnection` condvar for
+  chain under that node's mutex and then writes the socket itself,
+  outside the mutex. The write is left to the send pool in two cases:
+  another thread is writing, and the pool writes what came meanwhile
+  after it; or the adaptive-send decision holds the signals back for
+  company, and the pool writes what still waits as the wait ends.
+  `poll` waits on the thread's `ThreadConnection` condvar for
   posted signals, then executes them: decodes `KEY_OP_CONF`/`KEY_OP_REF`/
   `ROW_DATA_REP`/`COMMIT_CONF`/..., resolves the object id in its own
   `ObjectMap`, updates query and transaction state, writes row data into
@@ -91,14 +109,16 @@ route; user threads execute.**
   completed queries via `get_next_executed_query`.
 - **Receive threads** (dedicated; count set in `GlobalOptions` at connect
   and fixed for the life of the global, default 1; each owns a poll set
-  over a subset of node sockets): read into `SockBuf` pages,
-  split the byte stream into signal descriptors, unpack `BUNDLE`
+  over a subset of node sockets): read into receive pages of their
+  own, split the byte stream into signal descriptors, unpack `BUNDLE`
   bundles into their sub-signals, look at each signal's receiver block
-  number, map block number to user thread (block − 0x8000), append the
-  descriptor to that thread's queue and signal its condvar. They do
-  nothing else with the signal content, with one deliberate exception
-  below. (The plan had them run the adaptive-send timers too; as built
-  the send pool does that, see there.)
+  number, map block number to user thread (block − 0x8000), and put
+  the signal in that thread's page for the round. Once a round, each
+  thread that got signals has its page posted to its queue, and its
+  condvar is signalled only if it waits. They do nothing else with
+  the signal content, with one deliberate exception below. (The plan
+  had them run the adaptive-send timers too; as built the send pool
+  does that, see there.)
 
   **The exception: a receive thread executes `HEARTBEAT_CONF` and
   `HEARTBEAT_REF` for the nodes it owns**, rather than routing them. This
@@ -259,8 +279,10 @@ Consequences designed in:
 
 - Per-thread `ObjectMap` and per-thread coordinator records mean no shared
   mutable state on the reply path other than the queue.
-- A `SockBuf` page is refcounted; the last user thread to execute a
-  signal on it returns it to the pool (as in the C code).
+- A receive page is refcounted, but no user thread frees it: a user
+  thread only lets go of its hold, and the receive thread's
+  `SignalReader`, which owns the page, reuses it once the count is
+  back to one (in the C the last user thread returns it to the pool).
 - Signals for a thread that has exited (late replies) are dropped by the
   receive thread with a debug log, and counted. The C drops a signal
   addressed to a block it does not route with only a debug print
@@ -431,35 +453,40 @@ Mutex ordering levels (lock lower before higher, never the reverse):
 |---|---|---|
 | 1 | `TableDef`'s AUTO_INCREMENT range | the values a table's range holds, across a refill's round trip (phase 9.2) |
 | 2 | `ApidShared.counter` | the connection the process keeps for the AUTO_INCREMENT counters, for one counter operation |
-| 3 | `ApidGlobal.dict_mutex` | global dictionary cache |
-| 4 | `ApidGlobal.mutex` | thread table, stop flag; start and stop only |
-| 5 | `ThreadConnection.mutex` | one user thread's inbound queue, and an executor's requests |
-| 7 | `SockBuf.mutex` | global page pool (thread-local free lists avoid it) |
-| 8 | `NodeConnection.mutex` | one node's send chain |
-| 10 | `SendPool.mutex` | the send pool's queue of nodes to write for |
-| 11 | `Slot.state` | a completion slot, where an executor leaves a finished request; nothing is locked under it |
+| 3 | `DictCache.state` | global dictionary cache |
+| 4 | `ThreadTable.slots` | the thread table, with each slot's transaction counter; taken as a connection is made or freed, and by a receive thread refreshing its copy after a change |
+| 4 | `ApidShared.identity` | our node id, configuration and management client; taken by a connect thread to dial and to claim a link, and briefly by `ApidGlobal::config` |
+| 5 | `ThreadConnection.inbox` | one user thread's inbound queue, and an executor's requests |
+| 7 | `SockBufPool.inner` | `ic_comm`'s page pool, which the Data API does not use: a receive thread's `SignalReader`, one per node it owns, owns its pages, with no lock |
+| 8 | `NodeShared.sender` | one node's send chain; the node's `pending`, a link a connect thread hands over, and its `state_copy`, the last node state for reporting, are at this level too |
+| 10 | `SendPool.queue` | the send pool's queue of nodes to write for |
+| 11 | `Slot.state` | a completion slot, where an executor leaves a finished request; at this level too, a bind's answer and a scan reader's feed; nothing is locked under any of them |
 
 Levels 6 and 9 are deliberately empty. The C has a receive state mutex
 for moving nodes between receive threads and a heartbeat mutex for the
 heartbeat node list; fixed assignment at connect removes the first and a
 list-free heartbeat thread removes the second. Node state itself is not
 in the table because it has a single writer and is published through
-atomics.
+atomics. Nor is the stop flag: it is an atomic in each thread's
+`ThreadState`. The two mutexes of level 4 are never held together.
 
 Debug builds check the ordering at every lock (`ic_port::sync`).
 
 ## Data flow for a primary key read
 
-1. User: once, `TableDef::create_record(&spec)` for the key struct and the
-   row struct; `ApidGlobal::create_apid_query(table, key_record,
-   attr_record)`. Per call: fill the key struct, `conn.read_key(query,
-   trans, KeyRead, key_row_ptr, attr_row_ptr, mask, cb, user_ref)`.
-2. `read_key`: allocate an object id in the thread's `ObjectMap`; if
-   `trans` has no coordinator node yet, hash the distribution key from the key row
-   (`hash.rs`), pick the node, allocate a coordinator record for this thread on
-   that node if none is cached; build `KEY_OP_REQ` + KEY_DATA_ORD + COLUMN_DATA_ORD into
-   the thread's signal buffer; set start/execute flags as required; move
-   the query to "defined".
+1. User: once, `Record::new(&table, &spec, row_size)` for the key
+   struct and the row struct; `conn.create_query(&table, &key_record,
+   &attr_record)`. Per call: `conn.start_transaction(hint,
+   Some(&table))`, fill the query's key row, `conn.read_key(query_id,
+   trans_id, &args)`, the `ReadKeyArgs` giving the lock, the abort
+   option, `user_ref` and the callback.
+2. `start_transaction` picks the node from the hint (`hint_for_key`
+   hashes the distribution key from a key row, `hash.rs`) and takes a
+   coordinator record for this thread on that node (`coord_record`),
+   allocating one if none is free. `read_key` only packs: it builds
+   `KEY_OP_REQ`, the key and the columns as its sections, into the
+   connection's buffer for `trans.coord.node_id`, and moves the query
+   to "defined". The start/execute flags are set when it is sent.
 3. `send`: append signals to node send chains, set the execute flag on the
    last per node, adaptive-send decision, queries → "sent".
 4. Data node replies with `KEY_OP_CONF` (packed) and `ROW_DATA_REP`.
@@ -485,7 +512,7 @@ for a confirmation that comes only after the loss was looked for, for
 that one read as the confirmation comes. Both run once the poll's
 replies are in, so that a row that has come wins.
 
-## Data flow for a scan (phase 8.3; planned 2026-10-16)
+## Data flow for a scan (phase 8.3; built 2026-10-16)
 
 The protocol is chapter 05 §7; this is how the connection runs it.
 
@@ -522,14 +549,29 @@ The protocol is chapter 05 §7; this is how the connection runs it.
   could come over has gone, and with it the coordinator's record. A
   connection a panic left unusable is not waited on; its block number
   rests instead.
+- **A record gone with its link** (the author, 2026-11-04). The data
+  nodes' failure handling cleans up an API node's records before the
+  link, or the node id, can come back, so a record of a link that has
+  gone is free at the coordinator. Its place in the connection, which
+  is also our pointer for it, takes a later record once nothing here
+  holds it: no transaction, scan or key operation, and no allocate
+  waiting for its answer. A poll does this, against the links as it saw
+  them before taking its inbox. The receive thread posts what a link
+  brought before it says the link is down, and a newer link's
+  generation is published after that, so every signal that could name
+  the place has been taken in first. A copy of the record kept by an
+  ended transaction is told from the later one by its link and release
+  id, and touches nothing of it.
 - **A batch.** A receiver asked for a batch copies each row out of the
   receive page into its batch buffer as the row comes, and counts its
   words, and a key's words too. The batch is complete when its
   `SCAN_CONF` entry has come and as many words as it says, in either
   order, from any node. The batch then goes on the ready list or to the
-  callback, and the receiver waits until the application hands it
-  back. The requests for more of the receivers handed back since the
-  last send go in one `SCAN_MORE_REQ` per scan with the next send.
+  callback, by an id of its own that names nothing once the batch is
+  handed back or its run has ended, and the receiver waits until the
+  application hands it back. The requests for more of the receivers
+  handed back since the last send go in one `SCAN_MORE_REQ` per scan
+  with the next send.
 - **The end.** A receiver whose entry names the null record gives no
   more once its batch is handed back; when none is left the scan is
   done and its record goes back to the pool. A close sends stop at
@@ -570,7 +612,9 @@ The protocol is chapter 05 §7; this is how the connection runs it.
   The executor, served the nudge, hands the batch back to its receiver,
   which then asks for more (the author, 2026-10-16), and puts the
   buffers among the spares. A committed read with `read_ahead` hands a
-  batch back as soon as it has moved.
+  batch back as soon as it has moved, as long as the reader then holds
+  fewer than two of that receiver's batches (`IC_READ_AHEAD_BATCHES`);
+  otherwise the receiver waits until the reader hands one back.
 - **The end** of the run at the executor is written into the feed,
   with its error, and wakes the reader if it waits. A failed run's
   unread batches are dropped; a close drops them at once, and the
@@ -584,13 +628,14 @@ The protocol is chapter 05 §7; this is how the connection runs it.
 1. **The link goes.** The node's socket closes, a send to it fails, or
    it has answered no heartbeat for four check intervals in a row. The
    node's own receive thread publishes the link as down, drops the
-   socket from its poll set, and posts a "link lost" notice to every
-   user thread queue. The connect thread starts dialling again on the
-   usual delay, because at this point nothing says the node failed. If
-   nothing more arrives this is the whole story: the node was up all
-   along, the link comes back, and nobody ever reports a takeover
-   because there was none. A data node does nothing special when it
-   loses an API link.
+   socket from its poll set, and bumps a process-wide link-event
+   counter. Nothing is posted to user threads: each `poll` runs its
+   failure checks when the counter has moved since its last. The
+   connect thread starts dialling again on the usual delay, because at
+   this point nothing says the node failed. If nothing more arrives
+   this is the whole story: the node was up all along, the link comes
+   back, and nobody ever reports a takeover because there was none. A
+   data node does nothing special when it loses an API link.
 2. **The cluster says the node failed.** A data node sends
    `NODE_LOST_REP` naming it, usually a moment after step 1 and
    sometimes before it. Every surviving node sends one and only the
@@ -680,8 +725,10 @@ gone" is step 5 and nothing else.
 
 ## Memory
 
-- Wire data lives in `SockBuf` pages (128-byte descriptors, cache-line
-  aligned, refcounted) exactly as in the C.
+- Wire data lives in receive pages (`Arc`-counted) that a receive
+  thread's `SignalReader` owns, one reader per node, not in `SockBuf`
+  pages as in the C. A page is reused once its count is back to one,
+  so pages are allocated and freed on the receive thread alone.
 - Signal construction uses a per-thread `MemoryContainer` reset after each
   `send`.
 - `ApidQuery`, `Transaction`, `TableDef`, `Record` are `Box`ed objects

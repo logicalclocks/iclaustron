@@ -611,14 +611,14 @@ fn run_thread(
   // This thread's slots in the callback table.
   let first_slot = thread_index * IC_BENCH_MAX_DEPTH as usize;
   let mut slots: Vec<Slot> = Vec::with_capacity(what.depth);
-  let mut slot_of: HashMap<u32, usize> = HashMap::new();
+  let mut slot_of: HashMap<QueryId, usize> = HashMap::new();
   while slots.len() < what.depth {
     let queries = match make_queries(&mut conn, def, rec, what.batch) {
       Ok(queries) => queries,
       Err(e) => return Err(describe("Could not make a query", &e)),
     };
     for id in &queries {
-      slot_of.insert(id.as_u32(), slots.len());
+      slot_of.insert(*id, slots.len());
     }
     slots.push(Slot {
       queries,
@@ -723,7 +723,7 @@ fn run_thread(
           errors += 1;
         }
       }
-      if let Some(slot) = slot_of.get(&id.as_u32()) {
+      if let Some(slot) = slot_of.get(&id) {
         slots[*slot].done += 1;
       }
     }

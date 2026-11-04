@@ -45,11 +45,13 @@
  * never made, is undefined behaviour.
  *
  * Ids. A query (IC_QUERY_ID), a transaction (IC_TRANS_ID) and a scan
- * (IC_SCAN_ID) are named by an id in their connection, and a scan's
- * batch by an IC_SCAN_BATCH_ID. An id that names nothing any more,
- * freed, closed or handed back, is refused with an error or passed
- * over, never followed. A program's values (IC_PROGRAM_VALUE) and
- * conditions (IC_PROGRAM_COND) are ids in their builder.
+ * (IC_SCAN_ID) are named by a 64-bit id in their connection, and each
+ * batch of a scan's by an IC_SCAN_BATCH_ID of its own. No id is ever
+ * 0, and an id that names nothing any more, freed, closed or handed
+ * back, is refused with an error or passed over, never taken for
+ * another: a later query, transaction, scan or batch always has an id
+ * of its own. A program's values (IC_PROGRAM_VALUE) and conditions
+ * (IC_PROGRAM_COND) are ids in their builder.
  *
  * Rows. A query owns its rows: ic_apid_query_key_row() and
  * ic_apid_query_attr_row() give pointers valid until the query is
@@ -357,9 +359,9 @@
 #define IC_SCAN_UNKNOWN 4294967295
 
 /*
- No transaction, in `IC_SCAN_ARGS`.
+ No transaction, in `IC_SCAN_ARGS`: 0, which no id ever is.
  */
-#define IC_NO_TRANS 4294967295
+#define IC_NO_TRANS 0
 
 /*
  No partition: every partition is scanned, in `IC_SCAN_ARGS`.
@@ -535,6 +537,11 @@
  No data node is connected and started. Temporary.
  */
 #define IC_ERROR_NO_STARTED_DATA_NODE 7142
+
+/*
+ The data node a hint names is not started. Temporary.
+ */
+#define IC_ERROR_NODE_NOT_READY 7136
 
 /*
  A wait for the cluster ran out. Temporary.
@@ -936,9 +943,10 @@ typedef struct {
 } IC_FIELD_SPEC;
 
 /*
- A query's id in its connection (`IC_QUERY_ID`).
+ A query's id in its connection (`IC_QUERY_ID`); never 0, and never
+ followed once the query is freed.
  */
-typedef uint32_t IC_QUERY_ID;
+typedef uint64_t IC_QUERY_ID;
 
 /*
  What a read asks for (`IC_READ_KEY_ARGS`).
@@ -999,9 +1007,10 @@ typedef struct {
 } IC_WRITE_KEY_ARGS;
 
 /*
- A transaction's id in its connection (`IC_TRANS_ID`).
+ A transaction's id in its connection (`IC_TRANS_ID`); never 0, and
+ never followed once the transaction is closed.
  */
-typedef uint32_t IC_TRANS_ID;
+typedef uint64_t IC_TRANS_ID;
 
 /*
  Which node should coordinate a transaction
@@ -1019,8 +1028,9 @@ typedef struct {
 } IC_TRANSACTION_HINT;
 
 /*
- A batch of a scan's rows (`IC_SCAN_BATCH_ID`): the scan's id in the
- high half and its receiver's in the low.
+ A batch of a scan's rows (`IC_SCAN_BATCH_ID`), by an id of its own:
+ once the batch is handed back, or its run has ended, it names
+ nothing.
  */
 typedef uint64_t IC_SCAN_BATCH_ID;
 
@@ -1064,7 +1074,8 @@ typedef struct {
   uint32_t timeout_ms;
   /*
    For a committed read through an executor: let a receiver go on as
-   soon as its batch has moved to the reader.
+   soon as its batch has moved to the reader, while the reader holds
+   fewer than two of its batches; else once one is handed back.
    */
   bool read_ahead;
   /*
@@ -1097,9 +1108,10 @@ typedef struct {
 } IC_SCAN_ARGS;
 
 /*
- A scan's id in its connection (`IC_SCAN_ID`).
+ A scan's id in its connection (`IC_SCAN_ID`); never 0, and never
+ followed once the scan is freed.
  */
-typedef uint32_t IC_SCAN_ID;
+typedef uint64_t IC_SCAN_ID;
 
 /*
  One range of a scan of an ordered index (`IC_SCAN_RANGE`), its bounds
@@ -1173,7 +1185,7 @@ typedef struct {
    */
   uint32_t in_flight;
   /*
-   Requests waiting at most before a submit is refused or waits;
+   Requests waiting at most before a submit waits for room;
    4 000 by default.
    */
   uint32_t queue;
@@ -1967,6 +1979,7 @@ IC_TRANSACTION_HINT ic_apid_conn_hint_for_unique_key(IC_APID_CONNECTION *conn,
  needs the table it is over; `def` may be NULL otherwise.
 
  Errors: `IC_ERROR_NO_STARTED_DATA_NODE` when no data node is started;
+ `IC_ERROR_NODE_NOT_READY` for an `IC_HINT_NODE` naming a node not started;
  `IC_ERROR_LINK_LOST`, `IC_ERROR_TIMEOUT` or the coordinator's refusal, an
  NDB code such as 4006, when no coordinator record could be had. It waits for
  a round trip to the data node when the connection has no coordinator record
@@ -2142,11 +2155,14 @@ int32_t ic_apid_conn_flush(IC_APID_CONNECTION *conn,
  for it: the row goes into `attr_row`, and `found` says whether there
  was one.
 
- Errors: as `ic_apid_conn_start_transaction` and `ic_apid_conn_read_key`;
- `IC_ERROR_RECORD_LAYOUT` when a row is shorter than its record's;
- `IC_ERROR_KEY_RECORD` for records over different tables; `IC_ERROR_TIMEOUT`
- when no answer came in 10 seconds. A row not there is no error: `found` is
- false.
+ Errors: `IC_ERROR_RECORD_LAYOUT` when a row is shorter than its
+ record's; `IC_ERROR_KEY_RECORD` for records over different tables, or
+ a key record without the whole primary key;
+ `IC_ERROR_NO_STARTED_DATA_NODE` when no data node is started; the
+ coordinator's refusal, an NDB code such as 4006, when no coordinator
+ record could be had; the read's refusal, as the data node gives it;
+ `IC_ERROR_TIMEOUT` when no coordinator record came in five seconds, or
+ no answer in 10. A row not there is no error: `found` is false.
 
  # Safety
 
@@ -2167,7 +2183,13 @@ int32_t ic_apid_conn_read_committed(IC_APID_CONNECTION *conn,
 /*
  As `ic_apid_conn_read_committed`, through a unique index.
 
- Errors: as `ic_apid_conn_read_committed`.
+ Errors: as `ic_apid_query_create_unique`,
+ `ic_apid_conn_start_transaction` and `ic_apid_conn_read_key`;
+ `IC_ERROR_RECORD_LAYOUT` when a row is shorter than its record's; the
+ read's refusal, as the data node gives it. With no answer it waits
+ for the reply timeout, six minutes unless `IC_GLOBAL_OPTIONS` says
+ less, and a second more, and fails with `IC_NDB_ERROR_NO_REPLY`;
+ `IC_ERROR_TIMEOUT` only if the transaction has not ended even then.
 
  # Safety
 
@@ -2191,9 +2213,9 @@ int32_t ic_apid_conn_read_unique_committed(IC_APID_CONNECTION *conn,
  `IC_NDB_ERROR_NO_SUCH_ROW` for an update or delete of no row,
  `IC_NDB_ERROR_ROW_EXISTS` for an insert of one there,
  `IC_NDB_ERROR_UNIQUE_DUPLICATE` when a unique index already holds the value;
- and as `ic_apid_conn_write_key`, `ic_apid_conn_start_transaction` and
- `ic_apid_conn_read_committed`. `IC_ERROR_NOT_SUPPORTED` for a kind no define
- names.
+ and as `ic_apid_conn_read_committed`, which runs the same way;
+ `IC_ERROR_DELETE_WITH_BLOBS` for a delete on a table with a blob column.
+ `IC_ERROR_NOT_SUPPORTED` for a kind no define names.
 
  # Safety
 
@@ -2342,8 +2364,13 @@ int32_t ic_apid_scan_free(IC_APID_CONNECTION *conn, IC_SCAN_ID scan);
 
  Errors: `IC_ERROR_SCAN_ACTIVE` while a run is not over;
  `IC_ERROR_NOT_SUPPORTED` for an unknown lock, for `read_ahead`, which
- is for executors, for a committed read given a transaction, and for
- `continuous` with a lock;
+ is for executors, for a committed read given a transaction, for
+ `continuous` with a lock, for `ordered` or `descending` on a table
+ scan, and for an ordered run with a callback or over an index with a
+ column whose order is not known here; for an ordered run,
+ `IC_ERROR_KEY_RECORD` when the record its rows are read into lacks a
+ column of the index, and `IC_ERROR_BAD_RANGE` for range numbers that
+ do not rise;
  `IC_ERROR_TRANSACTION_ACTIVE` for a transaction not started or not
  open; `IC_ERROR_INCONSISTENT_DATA` for `args` not filled by
  `ic_scan_args_init`.
@@ -2431,9 +2458,15 @@ const uint8_t *ic_apid_scan_row(IC_APID_CONNECTION *conn,
                                 size_t *len);
 
 /*
- The scan a batch is of.
+ The scan a batch is of, while the batch is with the application; 0
+ for a batch handed back, of a run that has ended, or never given.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed.
  */
-IC_SCAN_ID ic_scan_batch_scan(IC_SCAN_BATCH_ID batch);
+IC_SCAN_ID ic_apid_scan_batch_scan(IC_APID_CONNECTION *conn,
+                                   IC_SCAN_BATCH_ID batch);
 
 /*
  Take the batch completed longest ago, of a scan with no callback,
@@ -2546,7 +2579,8 @@ int32_t ic_apid_conn_next_row_into(IC_APID_CONNECTION *conn,
  it is, once the run is over with no error. The program reads the
  batch with `ic_apid_conn_next_scan_row` and hands it back itself.
 
- Errors: as `ic_apid_conn_next_row`.
+ Errors: as `ic_apid_conn_next_row`; `IC_ERROR_NOT_SUPPORTED` for an
+ ordered run, whose rows `ic_apid_conn_next_row` merges.
 
  # Safety
 
@@ -3130,14 +3164,20 @@ void ic_scan_reader_free(IC_SCAN_READER *reader);
  to the executor, waiting for room in a full list, and the rows come
  with `ic_scan_reader_next_row`. Each batch is handed back to its
  receiver once the reader has read it, whatever the lock, unless a
- committed read asks for `read_ahead`.
+ committed read asks for `read_ahead`: the receiver then goes on as
+ soon as its batch has moved, while the reader holds fewer than two
+ of its batches, else once one is handed back.
 
  Errors: `IC_ERROR_SCAN_ACTIVE` while the reader's last run is not
  over; `IC_ERROR_NOT_SUPPORTED` for a transaction or a callback in
  `args`, for `read_ahead` or `continuous` with a lock, for the two
- together, and on the executor's own thread;
- `IC_ERROR_EXECUTOR_STOPPED`; `IC_ERROR_INCONSISTENT_DATA` for `args`
- not filled by `ic_scan_args_init`.
+ together, for `ordered` or `descending` on a table scan, for an
+ ordered run over an index with a column whose order is not known
+ here, and on the executor's own thread; for an ordered run,
+ `IC_ERROR_KEY_RECORD` when the record its rows are read into lacks a
+ column of the index, and `IC_ERROR_BAD_RANGE` for range numbers that
+ do not rise; `IC_ERROR_EXECUTOR_STOPPED`; `IC_ERROR_INCONSISTENT_DATA`
+ for `args` not filled by `ic_scan_args_init`.
 
  # Safety
 

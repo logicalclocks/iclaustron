@@ -242,9 +242,11 @@ pub struct HeartbeatConf {
 }
 
 impl HeartbeatConf {
-  /// How often the node expects to hear from us, in milliseconds.
+  /// How often the node expects to hear from us, in milliseconds; an
+  /// interval longer than 32 bits of milliseconds hold is taken as the
+  /// longest they do.
   pub fn heartbeat_interval_ms(&self) -> u32 {
-    self.api_heartbeat_interval * 10
+    self.api_heartbeat_interval.saturating_mul(10)
   }
 
   /// Read the answer out of the words of a signal.
@@ -453,6 +455,14 @@ mod tests {
     assert_eq!(words.len(), IC_HEARTBEAT_REQ_LEN);
     assert_eq!(ref_to_node(words[0]), 192);
     assert_eq!(ref_to_block(words[0]), IC_BLOCK_NODE_WATCH);
+  }
+
+  #[test]
+  fn a_heartbeat_interval_too_long_for_32_bits_is_the_longest() {
+    let mut conf = started_node(0, &[]);
+    assert_eq!(conf.heartbeat_interval_ms(), 30_000);
+    conf.api_heartbeat_interval = u32::MAX;
+    assert_eq!(conf.heartbeat_interval_ms(), u32::MAX);
   }
 
   fn started_node(node_group: u32, connected: &[u32]) -> HeartbeatConf {

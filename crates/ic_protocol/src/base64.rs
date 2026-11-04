@@ -263,4 +263,35 @@ mod tests {
     text.push(0);
     assert_eq!(decode(&text).expect("decode"), b"foobar");
   }
+
+  /// The bytes decoded as a management server's base64.
+  fn base64_decode(input: &[u8]) {
+    let _ = decode(input);
+  }
+
+  #[test]
+  #[ignore = "a fuzz run: cargo xtask fuzz"]
+  fn fuzz_base64_decode() {
+    // Bytes of every value, in lines and unbroken; the RFC's short
+    // strings with their padding; blanks; and the trailing NUL.
+    let mut binary: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < 300 {
+      binary.push(((i * 7 + 13) & 0xFF) as u8);
+      i += 1;
+    }
+    let mut with_nul: Vec<u8> = encode(b"foobar").into_bytes();
+    with_nul.push(0);
+    let seeds = [
+      encode(&binary).into_bytes(),
+      encode_no_breaks(&binary).into_bytes(),
+      encode(b"f").into_bytes(),
+      encode_no_breaks(b"fo").into_bytes(),
+      encode_no_breaks(b"foo").into_bytes(),
+      b"Zm9v\r\nYmFy \t\n".to_vec(),
+      with_nul,
+      Vec::new(),
+    ];
+    ic_port::fuzz::run("base64_decode", &seeds, base64_decode);
+  }
 }

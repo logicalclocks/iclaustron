@@ -61,6 +61,7 @@ is replaced here and nowhere else.
 | socket start/stop, `MSG_NOSIGNAL` probe | `socket.rs` | 1:1 | `libc`; `std::net::ToSocketAddrs` for name resolution |
 | `ic_start_process`, `ic_is_process_alive`, `ic_kill_process` | — | Out | only the process controller used them |
 | file I/O helpers | `file.rs` | 1:1 (subset) | `std::fs`; only what `ic_util` still needs (debug output file, pid file) |
+| — | `fuzz.rs` | New | the fuzz runner: seeds mutated into cases, each run on a decoder with no panic and within a time; `cargo xtask fuzz` runs the `fuzz_` tests (chapter 08) |
 | `ic_daemonize`, pid files, umask, signal handlers | `daemon.rs` | 1:1 | `libc::fork/setsid/signal`; the one place with real `unsafe`. Kept because API programs may run as daemons |
 | `ic_byte_order`, `ic_swap_endian_word`, `g_ntohl/g_htonl` | `endian.rs` | 1:1 | `u32::to_be/from_be` for the config blob; signal protocol needs only the byte-order flag |
 | `ic_get_last_error`, `ic_get_strerror` | `oserr.rs` | 1:1 | `std::io::Error::last_os_error()` |
@@ -77,7 +78,7 @@ is replaced here and nowhere else.
 | `ic_debug.c/h` (`DEBUG_ENTRY`/`DEBUG_RETURN_*`, level bits, indent tracking) | `debug.rs` | Redesign | `debug_entry!("name")` returns a guard whose `Drop` does the return print; level bits unchanged; zero cost in release |
 | `ic_mc.c` memory container | `mc.rs` | 1:1 | Arena of chunks; `alloc`, `calloc`, `reset`, `free` semantics unchanged |
 | `ic_dyn_array.c` `IC_DYNAMIC_ARRAY` (+ ordered) | `dyn_array.rs` | 1:1 | growable byte buffer; the spill-to-disk variant is Out (config writer only) |
-| `ic_dyn_array.c` `IC_DYNAMIC_PTR_ARRAY` | `ptr_array.rs` | Redesign | Generational slot map `insert → u32`, `get`, `remove`; the object-reference map, one per user thread |
+| `ic_dyn_array.c` `IC_DYNAMIC_PTR_ARRAY` | `ptr_array.rs` | Redesign | Generational slot map `insert → PtrId` (64 bits, a slot retired before its generation wraps, so a stale id is never followed), `get`, `remove`, and a 32-bit `wire_word` for signals with `id_of_wire` back; the object-reference map, one per user thread |
 | `ic_bitmap.c` | `bitmap.rs` | 1:1 | |
 | `ic_hashtable.c` + `_itr.c` | `hashtable.rs` | Redesign | `std::collections::HashMap` behind the `ic_hashtable_*` names; the third-party copyright disappears |
 | `ic_string.c` `IC_STRING` | `string.rs` | 1:1 (subset) | `IcString`; the directory-layout helpers survive only as `set_config_dir`/`set_data_dir` for debug/pid files |

@@ -40,11 +40,14 @@ The containers and helpers the rest of the library is built from. See
 - **The object map carries generations.** The C `IC_DYNAMIC_PTR_ARRAY`
   returned whatever object occupied a slot, so a reply that arrived after
   its operation was freed would be delivered to the operation that had
-  taken its place. An id is now a 24-bit index plus an 8-bit generation
-  in one 32-bit word, and a stale id fails to match. A valid id is never
-  the word 0, so 0 serves as "no object" the way `IC_NULL_PTR` does. The
-  generation wraps at 256 reuses of one slot, which needs a reply to be
-  outstanding across 256 operations on that slot to alias.
+  taken its place. An id is now a 24-bit index plus a 40-bit
+  generation in 64 bits, and a stale id fails to match; a slot whose
+  generation would wrap is retired, so a stale id is never followed
+  (the author, 2026-10-23). A valid id is never 0, so 0 serves as "no
+  object" the way `IC_NULL_PTR` does. A signal carries a 32-bit word
+  made from the id, the index and eight bits of the generation
+  (`PtrId::wire_word`), found again with `PtrArray::id_of_wire`; a
+  reply is checked against its transaction's id as well.
 - **The dynamic array is one `Vec<u8>`.** The C chained fixed 1 kByte
   buffers so earlier pointers stayed valid; nothing holds pointers into
   it here. Its ordered variant with an index tree existed to spill to

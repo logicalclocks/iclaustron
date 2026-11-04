@@ -4,16 +4,20 @@ A client library for RonDB 26.10 data nodes (an API node speaking the
 NDB protocol) written in C-like Rust, MIT licensed, usable from Rust, C,
 C++ and any language that can call C.
 
-Status: release 0.1 is tagged (`v0.1.0`); phase 8, toward 0.2, is under
-way (`doc/rust/06-phases.md`). Rows are read and written by primary key
+Status: release 0.1 is tagged (`v0.1.0`); phases 8 to 10, toward 0.2
+and 0.3, are built, and phase 11, hardening, is under way
+(`doc/rust/06-phases.md`). Rows are read and written by primary key
 and unique key, in transactions, synchronously or asynchronously with
 callbacks, every row size RonDB allows, with node failures handled;
 threads without a connection of their own run their transactions
 through executors, which send many threads' calls together (phase 8.1).
-Scans come next.
+Tables and ordered indexes are scanned, on a connection or through an
+executor (phases 8 and 10), and the rows a locking scan read can be
+updated or deleted through it; conditions and updates run on the data
+nodes, and AUTO_INCREMENT values are handed out (phase 9).
 
 - **Using it**: the user guide, [`doc/user-guide.md`](doc/user-guide.md),
-  and the same five example programs in Rust and C in
+  and the same eleven example programs in Rust and C in
   [`examples/`](examples/README.md).
 - **The C API**: `include/iclaustron/ic_apid.h`, generated from
   `crates/ic_capi`; `cargo xtask install` installs `libiclaustron` with

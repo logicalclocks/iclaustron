@@ -12,6 +12,9 @@
 //! - `test-integration`: run the ic_apid and ic_capi integration tests
 //!   against the cluster named by IC_TEST_CONNECTSTRING (or the first
 //!   argument); a second argument picks tests by name.
+//! - `fuzz`: run the fuzz tests (chapter 08, "Fuzzing"), every one or
+//!   the target named, for the number of cases given or the default;
+//!   IC_FUZZ_SEED and IC_FUZZ_CASE pass through from the environment.
 //! - `header`: regenerate the C header with cbindgen into target/ and
 //!   diff it against include/iclaustron/ic_apid.h.
 //! - `install`: build the C library in release mode and install it,
@@ -72,6 +75,7 @@ fn main() {
     "check" => run_check(),
     "style" => run_style(),
     "test-integration" => run_test_integration(rest),
+    "fuzz" => run_fuzz(rest),
     "header" => run_header(),
     "install" => run_install(rest),
     "tags" => run_tags(rest),
@@ -89,6 +93,7 @@ fn print_help() {
   println!("  check             fmt --check, clippy, test, style");
   println!("  style             check for forbidden Rust constructs");
   println!("  test-integration  [connectstring] run tests against a cluster");
+  println!("  fuzz [target] [cases] run the fuzz tests, all or one target");
   println!("  header            regenerate and diff the C header");
   println!("  install [prefix]  install libiclaustron (default /usr/local)");
   println!("  tags [--no-legacy] build a vim tags file with Universal Ctags");
@@ -403,6 +408,51 @@ fn run_test_integration(rest: &[String]) -> i32 {
   if rest.len() > 1 {
     args.push(rest[1].as_str());
   }
+  run("cargo", &args)
+}
+
+/// True if `text` is a number of decimal digits.
+fn is_number(text: &str) -> bool {
+  if text.is_empty() {
+    return false;
+  }
+  for c in text.bytes() {
+    if !c.is_ascii_digit() {
+      return false;
+    }
+  }
+  true
+}
+
+/// Run the fuzz tests: `fuzz_<target>` alone when a target is named,
+/// with or without its `fuzz_`, every `fuzz_` test otherwise. A number
+/// is the cases for each, set as IC_FUZZ_ITERS. They are ignored tests,
+/// run one at a time in the `fuzz` profile: optimised, with overflow
+/// checks and debug assertions on, so that an overflow panics instead
+/// of wrapping unseen.
+fn run_fuzz(rest: &[String]) -> i32 {
+  let mut filter: String = "fuzz_".to_string();
+  for arg in rest {
+    if is_number(arg) {
+      std::env::set_var("IC_FUZZ_ITERS", arg);
+    } else if arg.starts_with("fuzz_") {
+      filter = arg.clone();
+    } else {
+      filter = format!("fuzz_{}", arg);
+    }
+  }
+  let args: [&str; 10] = [
+    "test",
+    "--workspace",
+    "--lib",
+    "--profile",
+    "fuzz",
+    "--",
+    "--ignored",
+    "--test-threads=1",
+    "--nocapture",
+    filter.as_str(),
+  ];
   run("cargo", &args)
 }
 

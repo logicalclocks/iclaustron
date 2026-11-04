@@ -82,6 +82,7 @@ use ic_signals::scans::ScanRef;
 use ic_signals::scans::ScanReq;
 use ic_signals::scans::ScanRowKeyRep;
 use ic_signals::table_props::IC_STORAGE_DISK;
+use ic_util::ptr_array::PtrArray;
 use ic_util::ptr_array::PtrId;
 
 use crate::apid_conn::coord_index_of;
@@ -142,51 +143,41 @@ pub(crate) fn fits_below_tag(id: PtrId) -> bool {
 }
 
 /// A scan's id in its connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScanId(pub(crate) PtrId);
 
 impl ScanId {
-  /// The id as a word, for a language binding.
-  pub fn as_u32(&self) -> u32 {
-    self.0.as_u32()
+  /// The id as a 64-bit word, for a language binding.
+  pub fn as_u64(&self) -> u64 {
+    self.0.as_u64()
   }
 
   /// A scan id from its word, as a language binding hands it back.
-  /// Whether it still names a live scan is for the connection to say.
-  pub fn from_u32(word: u32) -> ScanId {
-    ScanId(PtrId::from_u32(word))
+  /// Whether it still names a live scan is for the connection to say;
+  /// one freed never does again.
+  pub fn from_u64(word: u64) -> ScanId {
+    ScanId(PtrId::from_u64(word))
   }
 }
 
-/// A batch a receiver has delivered: the scan, and the receiver's id
-/// in the run that delivered it. A run gives its receivers ids anew, so
-/// a batch of an earlier run is never taken for one of this.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanBatchId {
-  scan: ScanId,
-  receiver: u32,
-}
+/// A batch a receiver has delivered, by an id of its own: it names that
+/// batch alone, so once the batch is handed back, or its run has ended,
+/// it is refused, never taken for the receiver's next batch. Which scan
+/// it is of, the connection says ([`ApidConnection::batch_scan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScanBatchId(pub(crate) PtrId);
 
 impl ScanBatchId {
-  /// The scan the batch is of.
-  pub fn scan(&self) -> ScanId {
-    self.scan
-  }
-
-  /// The batch as one word, for a language binding: the scan's id in
-  /// the high half and the receiver's in the low.
+  /// The batch as one word, for a language binding.
   pub fn as_u64(&self) -> u64 {
-    ((self.scan.as_u32() as u64) << 32) | self.receiver as u64
+    self.0.as_u64()
   }
 
   /// A batch from its word, as a language binding hands it back.
   /// Whether it is still with the application is for the connection to
   /// say.
   pub fn from_u64(word: u64) -> ScanBatchId {
-    ScanBatchId {
-      scan: ScanId::from_u32((word >> 32) as u32),
-      receiver: word as u32,
-    }
+    ScanBatchId(PtrId::from_u64(word))
   }
 }
 
@@ -344,6 +335,10 @@ pub(crate) struct Receiver {
   /// Its id in this run, tagged, as the request and its rows carry it;
   /// 0 outside a run.
   id: u32,
+  /// The id of its batch while the batch is with the application, in
+  /// the connection's `batches`; none for an ordered run's, which
+  /// `next_row` merges.
+  batch: Option<PtrId>,
   /// The coordinator's pointer for it, from its last entry.
   coord_ptr: u32,
   state: ReceiverState,
@@ -1207,7 +1202,7 @@ impl ApidConnection {
         self.scan_receiver_ids = ids;
         return Err(IcError::new(err::IC_ERROR_PTR_ARRAY_INDEX_OUT_OF_BOUND));
       }
-      ids.push(ptr.as_u32() | IC_RECEIVER_TAG);
+      ids.push(ptr.wire_word() | IC_RECEIVER_TAG);
       place += 1;
     }
     let now = ic_port::time::gethrtime();
@@ -1301,9 +1296,9 @@ impl ApidConnection {
   /// Give back receiver ids taken for a run that does not start.
   fn drop_receiver_ids(&mut self, ids: &[u32]) {
     for word in ids {
-      self
-        .receivers
-        .remove(PtrId::from_u32(*word & !IC_RECEIVER_TAG));
+      if let Some(ptr) = self.receivers.id_of_wire(*word & !IC_RECEIVER_TAG) {
+        self.receivers.remove(ptr);
+      }
     }
   }
 
@@ -1437,29 +1432,32 @@ impl ApidConnection {
     None
   }
 
-  /// The place of a batch's receiver, if the batch is with the
-  /// application.
-  fn ready_receiver(&self, batch: ScanBatchId) -> Option<u32> {
-    let ptr = PtrId::from_u32(batch.receiver & !IC_RECEIVER_TAG);
-    let slot = *self.receivers.get(ptr)?;
-    if slot.scan != batch.scan {
-      return None;
-    }
-    let scan = self.scans.get(batch.scan.0)?;
+  /// The scan of a batch and the place of its receiver, if the batch is
+  /// with the application.
+  fn ready_receiver(&self, batch: ScanBatchId) -> Option<(ScanId, u32)> {
+    let slot = *self.batches.get(batch.0)?;
+    let scan = self.scans.get(slot.scan.0)?;
     let receiver = scan.receivers.get(slot.place as usize)?;
-    if receiver.id != batch.receiver || receiver.state != ReceiverState::Ready {
+    if receiver.batch != Some(batch.0) || receiver.state != ReceiverState::Ready
+    {
       return None;
     }
-    Some(slot.place)
+    Some((slot.scan, slot.place))
+  }
+
+  /// The scan a batch is of, while the batch is with the application.
+  pub fn batch_scan(&self, batch: ScanBatchId) -> Option<ScanId> {
+    let (id, _) = self.ready_receiver(batch)?;
+    Some(id)
   }
 
   /// Rows in a batch.
   pub fn scan_batch_rows(&self, batch: ScanBatchId) -> u32 {
-    let place = match self.ready_receiver(batch) {
-      Some(place) => place,
+    let (id, place) = match self.ready_receiver(batch) {
+      Some(found) => found,
       None => return 0,
     };
-    match self.scans.get(batch.scan.0) {
+    match self.scans.get(id.0) {
       Some(scan) => scan.receivers[place as usize].row_ends.len() as u32,
       None => 0,
     }
@@ -1488,11 +1486,11 @@ impl ApidConnection {
     batch: ScanBatchId,
     into: Option<&mut [u8]>,
   ) -> Result<bool, IcError> {
-    let place = match self.ready_receiver(batch) {
-      Some(place) => place,
+    let (id, place) = match self.ready_receiver(batch) {
+      Some(found) => found,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
-    let scan = match self.scans.get_mut(batch.scan.0) {
+    let scan = match self.scans.get_mut(id.0) {
       Some(scan) => scan,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
@@ -1537,8 +1535,8 @@ impl ApidConnection {
     rows: &mut Vec<u32>,
     row_ends: &mut Vec<u32>,
   ) -> Option<(u32, bool)> {
-    let place = self.ready_receiver(batch)?;
-    let scan = self.scans.get_mut(batch.scan.0)?;
+    let (id, place) = self.ready_receiver(batch)?;
+    let scan = self.scans.get_mut(id.0)?;
     let receiver = &mut scan.receivers[place as usize];
     std::mem::swap(&mut receiver.rows, rows);
     std::mem::swap(&mut receiver.row_ends, row_ends);
@@ -1577,23 +1575,35 @@ impl ApidConnection {
     &mut self,
     batch: ScanBatchId,
   ) -> Result<(), IcError> {
-    let ptr = PtrId::from_u32(batch.receiver & !IC_RECEIVER_TAG);
-    let slot = match self.receivers.get(ptr) {
-      Some(slot) if slot.scan == batch.scan => *slot,
-      // Its run has ended, closed or failed: nothing to give back.
-      _ => return Ok(()),
-    };
+    match self.ready_receiver(batch) {
+      Some((id, place)) => self.release_receiver(id, place),
+      // Handed back already, or its run has ended, closed or failed:
+      // nothing to give back.
+      None => Ok(()),
+    }
+  }
+
+  /// Hand back the batch of the receiver at `place`, if it is with the
+  /// application, as [`release_scan_batch`](Self::release_scan_batch)
+  /// says; an ordered run's batches go back this way, by place.
+  fn release_receiver(
+    &mut self,
+    id: ScanId,
+    place: u32,
+  ) -> Result<(), IcError> {
     let mut ask = false;
-    let at = slot.place as usize;
-    let over = match self.scans.get_mut(batch.scan.0) {
+    let at = place as usize;
+    let over = match self.scans.get_mut(id.0) {
       Some(scan) => {
         let closing = scan.state == ScanState::Closing;
-        let receiver = &mut scan.receivers[at];
-        if receiver.id != batch.receiver
-          || receiver.state != ReceiverState::Ready
-        {
+        let receiver = match scan.receivers.get_mut(at) {
+          Some(receiver) => receiver,
+          None => return Ok(()),
+        };
+        if receiver.state != ReceiverState::Ready {
           return Ok(());
         }
+        drop_batch_id(&mut self.batches, receiver);
         receiver.clear_batch();
         let mut named = false;
         if receiver.last || receiver.group_over {
@@ -1619,10 +1629,10 @@ impl ApidConnection {
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
     if ask {
-      self.scans_to_send.push(batch.scan);
+      self.scans_to_send.push(id);
     }
     if over {
-      self.end_run(batch.scan);
+      self.end_run(id);
     }
     Ok(())
   }
@@ -1649,7 +1659,7 @@ impl ApidConnection {
     }
     if let Some(scan) = self.scans.get_mut(id.0) {
       scan.state = ScanState::Closing;
-      hold_batches(scan);
+      hold_batches(scan, &mut self.batches);
     }
     self.close_when_settled(id);
     Ok(())
@@ -1844,27 +1854,18 @@ impl ApidConnection {
     }
     let mut place: usize = 0;
     loop {
-      let batch = match self.scans.get(id.0) {
+      let used_up = match self.scans.get(id.0) {
         Some(scan) => {
           if place >= scan.used as usize {
             return Ok(());
           }
           let receiver = &scan.receivers[place];
-          let used_up =
-            receiver.state == ReceiverState::Ready && !receiver.has_row();
-          if used_up {
-            Some(ScanBatchId {
-              scan: id,
-              receiver: receiver.id,
-            })
-          } else {
-            None
-          }
+          receiver.state == ReceiverState::Ready && !receiver.has_row()
         }
         None => return Ok(()),
       };
-      if let Some(read) = batch {
-        self.release_scan_batch(read)?;
+      if used_up {
+        self.release_receiver(id, place as u32)?;
       }
       place += 1;
     }
@@ -1883,17 +1884,13 @@ impl ApidConnection {
             return Ok(());
           }
           let turn = scan.turns[fragment];
-          let receiver =
-            &scan.receivers[fragment * four as usize + turn as usize];
+          let place = fragment * four as usize + turn as usize;
+          let receiver = &scan.receivers[place];
           let used_up =
             receiver.state == ReceiverState::Ready && !receiver.has_row();
-          let receiver_id = receiver.id;
           if used_up {
             scan.turns[fragment] = (turn + 1) % four;
-            Some(ScanBatchId {
-              scan: id,
-              receiver: receiver_id,
-            })
+            Some(place as u32)
           } else {
             None
           }
@@ -1902,7 +1899,7 @@ impl ApidConnection {
       };
       match batch {
         // The same fragment again: its next batch may be empty.
-        Some(read) => self.release_scan_batch(read)?,
+        Some(place) => self.release_receiver(id, place)?,
         None => fragment += 1,
       }
     }
@@ -2005,12 +2002,15 @@ impl ApidConnection {
     let mut at: usize = 0;
     while at < self.ready_batches.len() {
       let batch = self.ready_batches[at];
-      if batch.scan != id {
-        at += 1;
-        continue;
+      let of = self.ready_receiver(batch);
+      if let Some((scan, _)) = of {
+        if scan != id {
+          at += 1;
+          continue;
+        }
       }
       let _ = self.ready_batches.remove(at);
-      if self.ready_receiver(batch).is_some() {
+      if of.is_some() {
         return Some(batch);
       }
     }
@@ -2201,11 +2201,8 @@ impl ApidConnection {
   /// all done, a receiver handed back asks for more with the next send,
   /// and a closing scan may send its stop.
   pub(crate) fn takeover_settled(&mut self, of: TakeoverOf) {
-    let slot = match self
-      .receivers
-      .get(PtrId::from_u32(of.receiver & !IC_RECEIVER_TAG))
-    {
-      Some(slot) if slot.scan == of.scan => *slot,
+    let slot = match self.receiver_of_wire(of.receiver) {
+      Some(slot) if slot.scan == of.scan => slot,
       // Its run has ended since.
       _ => return,
     };
@@ -2560,6 +2557,13 @@ impl ApidConnection {
     None
   }
 
+  /// The receiver a tagged word, as a request or a row carries it,
+  /// names, if it names one at all.
+  fn receiver_of_wire(&self, word: u32) -> Option<ReceiverSlot> {
+    let ptr = self.receivers.id_of_wire(word & !IC_RECEIVER_TAG)?;
+    self.receivers.get(ptr).copied()
+  }
+
   /// The receiver a tagged id names, if it is of a live run of the
   /// transaction id given.
   fn receiver_named(
@@ -2571,9 +2575,7 @@ impl ApidConnection {
     if word & IC_RECEIVER_TAG == 0 {
       return None;
     }
-    let slot = *self
-      .receivers
-      .get(PtrId::from_u32(word & !IC_RECEIVER_TAG))?;
+    let slot = self.receiver_of_wire(word)?;
     let scan = self.scans.get(slot.scan.0)?;
     let same = scan.trans_id as u32 == lo && (scan.trans_id >> 32) as u32 == hi;
     if !same || !scan.is_running() {
@@ -2734,11 +2736,8 @@ impl ApidConnection {
 
   /// One receiver's entry in a confirmation.
   fn take_entry(&mut self, id: ScanId, batch: &ScanBatch) {
-    let slot = match self
-      .receivers
-      .get(PtrId::from_u32(batch.receiver_id & !IC_RECEIVER_TAG))
-    {
-      Some(slot) if slot.scan == id => *slot,
+    let slot = match self.receiver_of_wire(batch.receiver_id) {
+      Some(slot) if slot.scan == id => slot,
       _ => return,
     };
     match self.scans.get_mut(id.0) {
@@ -2821,20 +2820,34 @@ impl ApidConnection {
   /// A complete batch onto the ready list, or to the scan's callback.
   /// An ordered run's batch goes to neither: `next_row` merges it.
   fn deliver(&mut self, id: ScanId, place: u32) {
-    let (receiver, callback, user_ref) = match self.scans.get(id.0) {
+    let (callback, user_ref) = match self.scans.get(id.0) {
       Some(scan) => {
         if scan.ordered {
           return;
         }
-        (
-          scan.receivers[place as usize].id,
-          scan.callback,
-          scan.user_ref,
-        )
+        (scan.callback, scan.user_ref)
       }
       None => return,
     };
-    let batch = ScanBatchId { scan: id, receiver };
+    let ptr = match self.batches.insert(ReceiverSlot { scan: id, place }) {
+      Ok(ptr) => ptr,
+      Err(e) => {
+        self.fail_run(id, e);
+        return;
+      }
+    };
+    match self.scans.get_mut(id.0) {
+      Some(scan) => {
+        let receiver = &mut scan.receivers[place as usize];
+        drop_batch_id(&mut self.batches, receiver);
+        receiver.batch = Some(ptr);
+      }
+      None => {
+        self.batches.remove(ptr);
+        return;
+      }
+    }
+    let batch = ScanBatchId(ptr);
     match callback {
       Some(callback) => {
         self.in_callback += 1;
@@ -2886,7 +2899,7 @@ impl ApidConnection {
           scan.error = Some(IcError::new(code));
         }
         scan.state = ScanState::Closing;
-        hold_batches(scan);
+        hold_batches(scan, &mut self.batches);
         scan.heard_at = ic_port::time::gethrtime();
         scan.stop_sent
       }
@@ -2987,7 +3000,7 @@ impl ApidConnection {
     if holds {
       if let Some(scan) = self.scans.get_mut(id.0) {
         scan.state = ScanState::Closing;
-        hold_batches(scan);
+        hold_batches(scan, &mut self.batches);
       }
       self.close_when_settled(id);
       return;
@@ -3009,6 +3022,7 @@ impl ApidConnection {
             ids.push(receiver.id);
           }
           receiver.id = 0;
+          drop_batch_id(&mut self.batches, receiver);
           receiver.clear_batch();
           receiver.takeovers = 0;
           receiver.state = ReceiverState::Done;
@@ -3085,7 +3099,7 @@ fn waited_out(heard_at: u64, now: u64) -> bool {
 /// handed back but not yet asked for again, and a continuous scan's
 /// receivers waiting their turn are held at the coordinator until the
 /// stop.
-fn hold_batches(scan: &mut Scan) {
+fn hold_batches(scan: &mut Scan, batches: &mut PtrArray<ReceiverSlot>) {
   let mut place: usize = 0;
   while place < scan.used as usize {
     let receiver = &mut scan.receivers[place];
@@ -3094,6 +3108,7 @@ fn hold_batches(scan: &mut Scan) {
     let waiting = receiver.state == ReceiverState::Ready
       || receiver.state == ReceiverState::Free;
     if waiting || asked_unsent {
+      drop_batch_id(batches, receiver);
       receiver.clear_batch();
       if receiver.last || receiver.group_over {
         receiver.state = ReceiverState::Done;
@@ -3104,6 +3119,17 @@ fn hold_batches(scan: &mut Scan) {
     place += 1;
   }
   scan.queued = false;
+}
+
+/// Let go of the id of the receiver's batch, if it has one: from then on
+/// the id names nothing.
+fn drop_batch_id(
+  batches: &mut PtrArray<ReceiverSlot>,
+  receiver: &mut Receiver,
+) {
+  if let Some(ptr) = receiver.batch.take() {
+    batches.remove(ptr);
+  }
 }
 
 /// The place, in a continuous run, of the receiver two on from `place`
@@ -3163,9 +3189,9 @@ mod tests {
   fn a_query_id_and_a_receiver_id_never_meet() {
     // The object map's ids have their index below bit 24; queries and
     // receivers both stay below bit 23, which marks a receiver.
-    assert!(fits_below_tag(PtrId::from_u32((1 << 24) | 5)));
-    assert!(fits_below_tag(PtrId::from_u32((7 << 24) | 0x7F_FFFF)));
-    assert!(!fits_below_tag(PtrId::from_u32((1 << 24) | 0x80_0000)));
+    assert!(fits_below_tag(PtrId::from_u64((1 << 24) | 5)));
+    assert!(fits_below_tag(PtrId::from_u64((7 << 24) | 0x7F_FFFF)));
+    assert!(!fits_below_tag(PtrId::from_u64((1 << 24) | 0x80_0000)));
     let receiver = (1 << 24) | 5 | IC_RECEIVER_TAG;
     assert_ne!(receiver, (1 << 24) | 5);
     assert_eq!(receiver & !IC_RECEIVER_TAG, (1 << 24) | 5);
@@ -3173,13 +3199,11 @@ mod tests {
 
   #[test]
   fn a_batch_id_crosses_as_one_word_and_back() {
-    let batch = ScanBatchId {
-      scan: ScanId::from_u32((3 << 24) | 17),
-      receiver: (5 << 24) | 2 | IC_RECEIVER_TAG,
-    };
+    let batch = ScanBatchId(PtrId::from_u64((300 << 24) | 17));
     let back = ScanBatchId::from_u64(batch.as_u64());
     assert_eq!(back, batch);
-    assert_eq!(back.scan(), batch.scan());
+    let scan = ScanId(PtrId::from_u64((1 << 40) | 5));
+    assert_eq!(ScanId::from_u64(scan.as_u64()), scan);
   }
 
   #[test]

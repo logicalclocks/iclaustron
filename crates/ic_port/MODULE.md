@@ -18,6 +18,7 @@ services. See `doc/rust/03-module-map.md` for the workspace-wide mapping.
 | `include/ic_debug.h`, `util/ic_debug.c` | `debug.rs` | Redesign | done |
 | `port/ic_port.c` mutex/cond wrappers | `sync.rs` | Redesign | done |
 | `port/ic_port.c` file routines | `file.rs` | 1:1 | done |
+| — | `fuzz.rs` | New | done: the fuzz runner the decoders' `fuzz_` tests use, run by `cargo xtask fuzz` (chapter 08) |
 | `port/ic_port.c` socket routines | `socket.rs` | 1:1 | done |
 | `port/ic_port.c` daemon, pid, signals | `daemon.rs` | 1:1 | done |
 | glib `GOptionEntry`/`GOptionContext` | `options.rs` | New | done |

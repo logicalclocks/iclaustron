@@ -539,6 +539,17 @@ fn c_api_stale_ids_are_refused() {
     let mut len: usize = 9;
     assert!(ic_apid_query_key_row(conn, query, &mut len).is_null());
     assert_eq!(len, 0);
+    // However often its slot is used again, the id stays refused: more
+    // times than eight bits of generation would tell apart.
+    let mut again: u32 = 0;
+    while again < 300 {
+      let mut other: IcQueryId = 0;
+      assert_eq!(ic_apid_query_create(conn, table, rec, rec, &mut other), 0);
+      assert_ne!(other, query, "a new id, use {}", again);
+      assert_eq!(ic_apid_query_state(conn, query), IC_QUERY_UNKNOWN);
+      assert_eq!(ic_apid_query_free(conn, other), 0);
+      again += 1;
+    }
 
     // A transaction with nothing in it ends at once when committed.
     let any = IcTransactionHint {
@@ -810,7 +821,8 @@ unsafe extern "C" fn on_batch(
   // throughout.
   let seen = unsafe { &mut *(user_ref as *mut BatchesSeen) };
   seen.batches += 1;
-  assert_eq!(ic_scan_batch_scan(batch), seen.scan);
+  // SAFETY: the connection the callback runs on.
+  assert_eq!(unsafe { ic_apid_scan_batch_scan(conn, batch) }, seen.scan);
   let mut more = false;
   let mut len: usize = 0;
   // SAFETY: the connection the callback runs on, and its own batch.

@@ -361,7 +361,15 @@ impl ConfigBlob {
     if total_len as usize != words.len() {
       return Err(bad);
     }
-    let num_nodes = num_data_nodes + num_api_nodes + num_mgm_nodes;
+    // Counts that add up past 32 bits are no configuration's.
+    let data_and_api = match num_data_nodes.checked_add(num_api_nodes) {
+      Some(sum) => sum,
+      None => return Err(bad),
+    };
+    let num_nodes = match data_and_api.checked_add(num_mgm_nodes) {
+      Some(sum) => sum,
+      None => return Err(bad),
+    };
     if num_nodes == 0 {
       return Err(IcError::new(err::IC_ERROR_NO_NODES_FOUND));
     }
@@ -785,6 +793,19 @@ mod tests {
   }
 
   #[test]
+  fn node_counts_that_add_up_past_32_bits_are_refused() {
+    let mut b = BlobBuilder::new(u32::MAX, 1, 0, 0);
+    let mut i = 0;
+    while i < 5 {
+      b.typed_section(SectionType::DataNode, &[]);
+      i += 1;
+    }
+    b.typed_section(SectionType::System, &[]);
+    let e = ConfigBlob::decode(&b.finish()).expect_err("refused");
+    assert_eq!(e.code, err::IC_ERROR_INCONSISTENT_DATA);
+  }
+
+  #[test]
   fn strings_of_every_length() {
     // The padding to whole words is where a string decoder goes wrong,
     // so every length up to three words is checked.
@@ -854,5 +875,96 @@ mod tests {
     let mut short = good.clone();
     short.truncate(40);
     assert!(ConfigBlob::decode(&short).is_err());
+  }
+
+  /// The blob of a cluster of one node of each kind, with the link
+  /// between our node and the data node or without it.
+  fn small_blob(num_links: u32) -> Vec<u8> {
+    let mut b = BlobBuilder::new(1, 1, 1, num_links);
+    b.typed_section(SectionType::DataNode, &[]);
+    b.typed_section(SectionType::ApiNode, &[]);
+    b.typed_section(SectionType::MgmNode, &[]);
+    b.typed_section(SectionType::Tcp, &[]);
+    b.typed_section(SectionType::Shm, &[]);
+    b.typed_section(SectionType::System, &[]);
+    b.typed_section(
+      SectionType::DataNode,
+      &[
+        (IC_PARAM_NODE_ID, ConfigValue::Int(1)),
+        (
+          IC_PARAM_NODE_HOST,
+          ConfigValue::Str("localhost".to_string()),
+        ),
+      ],
+    );
+    b.typed_section(
+      SectionType::ApiNode,
+      &[(IC_PARAM_NODE_ID, ConfigValue::Int(68))],
+    );
+    b.typed_section(
+      SectionType::MgmNode,
+      &[(IC_PARAM_NODE_ID, ConfigValue::Int(65))],
+    );
+    if num_links > 0 {
+      b.typed_section(
+        SectionType::Tcp,
+        &[
+          (IC_PARAM_LINK_NODE_1, ConfigValue::Int(1)),
+          (IC_PARAM_LINK_NODE_2, ConfigValue::Int(68)),
+        ],
+      );
+    }
+    b.finish()
+  }
+
+  /// Put the checksum at the end of a blob right for what comes before
+  /// it, so that a changed blob reaches the parser instead of being
+  /// refused for its checksum.
+  fn fix_checksum(bytes: &mut [u8]) {
+    if bytes.len() < 8 || bytes.len() % 4 != 0 {
+      return;
+    }
+    let last = bytes.len() - 4;
+    let mut sum: u32 = 0;
+    let mut i: usize = 0;
+    while i < last {
+      let word = [bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]];
+      sum ^= u32::from_be_bytes(word);
+      i += 4;
+    }
+    bytes[last..].copy_from_slice(&sum.to_be_bytes());
+  }
+
+  /// A blob decoded, its checksum first put right when the last byte's
+  /// lowest bit is set, which is about half the cases; and from what
+  /// decodes, the configuration our API node takes.
+  fn config_blob(input: &[u8]) {
+    let mut bytes: Vec<u8> = input.to_vec();
+    let fix = match input.last() {
+      Some(last) => (*last & 1) == 1,
+      None => false,
+    };
+    if fix {
+      fix_checksum(&mut bytes);
+    }
+    let blob = match ConfigBlob::decode(&bytes) {
+      Ok(blob) => blob,
+      Err(_) => return,
+    };
+    let _ = blob.num_sections();
+    let _ = blob.node(68);
+    let _ = blob.link(68, 1);
+    let _ = blob.nodes_of_type(SectionType::DataNode);
+    if let Ok(config) = crate::data::ClusterConfig::from_blob(blob, 68) {
+      let _ = config.connectable_data_nodes();
+      let _ = config.heartbeat_interval_ms();
+    }
+  }
+
+  #[test]
+  #[ignore = "a fuzz run: cargo xtask fuzz"]
+  fn fuzz_config_blob() {
+    let seeds = [sample_blob(), small_blob(1), small_blob(0)];
+    ic_port::fuzz::run("config_blob", &seeds, config_blob);
   }
 }

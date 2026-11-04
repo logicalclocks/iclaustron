@@ -11,16 +11,22 @@
 //!
 //! - **a connect thread per data node** ([`connect_thread`]) dials its
 //!   node, completes the handshake and the registration, and hands the
-//!   link to the receive thread. It dials again whenever the link is
-//!   lost, unless the cluster has said the node failed and the failure
-//!   has not yet been handled.
-//! - **a receive thread** ([`rec_thread`]) owns the poll set and every
-//!   link's reading half. It routes what arrives to the user thread it
-//!   is for, executes what is about the node it came from, and is the
-//!   one writer of every node's published state.
+//!   link to the receive thread that owns the node. It dials again
+//!   whenever the link is lost, unless the cluster has said the node
+//!   failed and the failure has not yet been handled.
+//! - **receive threads** ([`rec_thread`]), as many as
+//!   [`GlobalOptions::receive_threads`] says (one by default), each
+//!   owning a share of the data nodes, dealt in turn: its own poll set
+//!   and the reading half of its nodes' links. A receive thread routes
+//!   what arrives to the user thread it is for, executes what is about
+//!   the node it came from, and is the one writer of its nodes'
+//!   published state.
 //! - **a heartbeat thread** ([`heartbeat`]) sends `HEARTBEAT_REQ` to every
 //!   connected node and asks for a link to be dropped when its node has
 //!   stopped answering.
+//! - **a send thread** ([`send_pool`]) writes what user threads leave
+//!   behind: signals queued while another thread wrote, and those the
+//!   adaptive send held back for company, once the wait is over.
 //!
 //! User threads take an inbox from [`ApidGlobal::thread_table`], send
 //! with [`ApidGlobal::send`], and wait on their inbox. They never read a

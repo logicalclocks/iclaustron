@@ -52,3 +52,6 @@ pub mod scans;
 pub mod table_change;
 pub mod table_desc;
 pub mod table_props;
+
+#[cfg(test)]
+mod fuzz_tests;

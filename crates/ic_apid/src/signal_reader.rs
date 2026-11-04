@@ -420,7 +420,9 @@ pub fn check_receiver(
 mod tests {
   use super::*;
   use ic_signals::blocks::*;
+  use ic_signals::bundle;
   use ic_signals::header::SignalHeader;
+  use ic_signals::numbers::IC_SIG_KEY_OP_CONF;
 
   fn a_signal(sig_no: u16, data: &[u32]) -> Vec<u32> {
     let header =
@@ -604,5 +606,146 @@ mod tests {
     let message = header::decode(reader.complete_words()).expect("decode");
     assert!(check_receiver(&message, IC_BLOCK_NODE_WATCH).is_ok());
     assert!(check_receiver(&message, api_block_of_thread(0)).is_err());
+  }
+
+  /// Pages held at once, as user threads hold the pages of large
+  /// signals handed to them.
+  const FUZZ_HELD_PAGES: usize = 4;
+
+  /// A stream of bytes from a data node given to a reader in pieces and
+  /// taken out again as the receive thread does it (`route_signals` in
+  /// `rec_thread`): each whole signal decoded, a bundled one taken
+  /// apart, and consumed; a signal that does not decode ends it, as the
+  /// receive thread drops the link. The first eight bytes are not of
+  /// the stream. Each four bits of the first word in turn are the size
+  /// of the next piece as a power of two; each bit of the second in
+  /// turn says whether a signal's page is held, as a large signal
+  /// handed on where it lies holds it.
+  fn signal_stream(input: &[u8]) {
+    if input.len() < 8 {
+      return;
+    }
+    let sizes = u32::from_ne_bytes([input[0], input[1], input[2], input[3]]);
+    let holds = u32::from_ne_bytes([input[4], input[5], input[6], input[7]]);
+    let stream = &input[8..];
+    let mut reader = SignalReader::new();
+    let mut parts: Vec<bundle::BundlePart> = Vec::new();
+    let mut held: Vec<ReceivePage> = Vec::new();
+    let mut pieces: usize = 0;
+    let mut signals: usize = 0;
+    let mut at: usize = 0;
+    while at < stream.len() {
+      let shift = (sizes >> (4 * (pieces % 8))) & 0xF;
+      let size = std::cmp::min(1usize << shift, stream.len() - at);
+      if reader.push_bytes(&stream[at..at + size]).is_err() {
+        return;
+      }
+      at += size;
+      pieces += 1;
+      while reader.has_message() {
+        let len = {
+          let message = match header::decode(reader.complete_words()) {
+            Ok(message) => message,
+            Err(_) => return,
+          };
+          if message.header.receiver_block == IC_BLOCK_BUNDLE {
+            if bundle::unpack_into(message.data, &mut parts).is_ok() {
+              for part in &parts {
+                let data = &message.data[part.start..part.start + part.len];
+                let _ = header::compute_checksum(data);
+              }
+            }
+          } else {
+            let mut i: usize = 0;
+            while i < message.header.num_sections as usize {
+              let _ = header::compute_checksum(message.sections[i]);
+              i += 1;
+            }
+          }
+          message.total_words
+        };
+        if ((holds >> (signals % 32)) & 1) == 1 {
+          held.push(Arc::clone(reader.page()));
+          if held.len() > FUZZ_HELD_PAGES {
+            held.remove(0);
+          }
+        }
+        signals += 1;
+        reader.consume(len);
+      }
+    }
+  }
+
+  /// A signal to a user thread with a signal id, two sections and a
+  /// checksum.
+  fn a_long_signal(section_words: usize) -> Vec<u32> {
+    let mut head =
+      SignalHeader::new(5, IC_BLOCK_LOCAL_OPS, api_block_of_thread(1));
+    head.signal_id = Some(0x5157);
+    let key = [0x11u32, 0x22, 0x33];
+    let row: Vec<u32> = vec![0x44u32; section_words];
+    let mut out: Vec<u32> = Vec::new();
+    header::encode(&head, &[0x20, 0x1234, 0x1], &[&key, &row], true, &mut out)
+      .expect("encode");
+    out
+  }
+
+  /// A bundled signal: a `KEY_OP_CONF` for each of three user threads.
+  fn a_bundle() -> Vec<u32> {
+    let mut data: Vec<u32> = Vec::new();
+    let mut thread: u32 = 0;
+    while thread < 3 {
+      let block = api_block_of_thread(thread) as u32;
+      // The part's header: its block, and its seven words less three.
+      data.push((block << 16) | 4);
+      data.extend_from_slice(&[0x10 + thread, 0, 1, 0x1234, 0x1, 0x20, 3]);
+      thread += 1;
+    }
+    let head = SignalHeader::new(
+      IC_SIG_KEY_OP_CONF,
+      IC_BLOCK_COORDINATOR,
+      IC_BLOCK_BUNDLE,
+    );
+    let mut out: Vec<u32> = Vec::new();
+    header::encode(&head, &data, &[], false, &mut out).expect("encode");
+    out
+  }
+
+  /// A seed for [`signal_stream`]: the two words that steer it, then
+  /// the stream.
+  fn stream_seed(sizes: u32, holds: u32, words: &[u32]) -> Vec<u8> {
+    let mut bytes: Vec<u8> = sizes.to_ne_bytes().to_vec();
+    bytes.extend_from_slice(&holds.to_ne_bytes());
+    bytes.extend_from_slice(&as_bytes(words));
+    bytes
+  }
+
+  #[test]
+  #[ignore = "a fuzz run: cargo xtask fuzz"]
+  fn fuzz_signal_stream() {
+    let mut four: Vec<u32> = Vec::new();
+    let mut i: u32 = 1;
+    while i <= 4 {
+      four.extend_from_slice(&a_signal(i as u16, &[i; 3]));
+      i += 1;
+    }
+    let mut mixed: Vec<u32> = a_signal(1, &[7]);
+    mixed.extend_from_slice(&a_bundle());
+    mixed.extend_from_slice(&a_long_signal(20));
+    mixed.extend_from_slice(&a_signal(2, &[8, 9]));
+    // Large signals, whose pages are held, so that the reader goes on
+    // in other pages and copies what is not yet whole across.
+    let mut large: Vec<u32> = a_long_signal(3000);
+    large.extend_from_slice(&a_long_signal(5000));
+    large.extend_from_slice(&a_signal(3, &[1]));
+    let seeds = [
+      stream_seed(0xFFFF_FFFF, 0, &four),
+      stream_seed(0, 0xFFFF_FFFF, &four),
+      stream_seed(0x3712_5A0F, 0x5555_5555, &mixed),
+      stream_seed(0xEDCB_A987, 0xFFFF_FFFF, &mixed),
+      stream_seed(0x0C0D_0E0F, 0xFFFF_FFFF, &large),
+      stream_seed(0x2468_ACE1, 0x0000_0002, &large),
+    ];
+    ic_port::fuzz::run("signal_stream", &seeds, signal_stream);
   }
 }

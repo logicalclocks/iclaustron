@@ -89,7 +89,8 @@ its `MODULE.md` with the "Rust notes for C readers" section.
 ## Phase 3 — Transport, threads, membership, node failure (4 weeks)
 
 - `ic_signals`: header codec, block references, signal table,
-  `membership.rs`; fuzz target for the header decoder.
+  `membership.rs`; fuzz target for the header decoder (built in phase
+  11, §11.3).
 - `ic_apid`: translate send threads, receive threads (receive + route
   only), heartbeat thread, adaptive send, `global.rs`, `program.rs`,
   `connection.rs` (`poll`/`send`/`flush`). Implement the 4-integer hello
@@ -1355,7 +1356,10 @@ failure.
 - Close at any time, as the reference does: wait for the batches asked
   for, then stop, then wait for the bare end of data. A `SCAN_REF` that
   owes a close gets one; the record is kept until the close is
-  confirmed; rows that come late are dropped by generation.
+  confirmed; rows that come late are dropped by generation. Since
+  2026-10-21 the stop goes at once, the batches asked for not waited
+  for, unless a transaction's pending takeovers hold it back (phase
+  10, "Closing a scan at once").
 - Errors: 296 when a parked scan passes `idle_transaction_limit` (130);
   274 and 266 for locks; 270 when a reading node fails (temporary: the
   scan starts again and rows come again); 4028 when the coordinator's
@@ -2248,6 +2252,80 @@ held, two of them in part:
   the two parameters are still decoded. Tests: a unit test of the
   wait an option gives; the `timeout` group keeps its one-second wait.
   Both pass (2026-10-22).
+
+### 11.4 From the training (2026-10-23)
+
+Writing a training course from the code, against the docs, found where
+the two disagreed; what followed from those places is here too.
+
+- 41 places where a document said other than the code (the training's
+  notes, by module), and nine more found on the way, are corrected in
+  the docs and in comments: the crate layering, the mutex levels, the
+  receive path and its pages, where a coordinator record is taken, who
+  writes a socket, the executor's loop, read-ahead, the errors the C
+  header lists for its calls, and others. The header gains a
+  `#define` for 7136 (`IC_ERROR_NODE_NOT_READY`). Eight threads read
+  7.4 to 8.9 million rows a second on the Mac, as chapter 12 measured
+  (the author, 2026-10-23).
+- A stale id is never followed (the author, 2026-10-23; chapter 04,
+  "Ids"). Ids were 32 bits, an 8-bit generation, so that an id kept
+  across 255 reuses of its slot named whatever held it. They are now
+  64 bits, a 24-bit index and a 40-bit generation, and a slot whose
+  generation would wrap is retired (`ic_util::ptr_array`). Each batch
+  of a scan has an id of its own, so one handed back names nothing;
+  the executor's read-ahead hands back the batch it held by that
+  batch's id. The wire is unchanged: a signal carries a 32-bit word
+  made from an id. The C ABI changed with it: `IC_QUERY_ID`,
+  `IC_TRANS_ID` and `IC_SCAN_ID` are `uint64_t`, `IC_NO_TRANS` is 0,
+  and `ic_scan_batch_scan(batch)` became
+  `ic_apid_scan_batch_scan(conn, batch)`; programs built against the
+  earlier header are to be built again. Tests: unit tests of a stale
+  id over a thousand reuses, of retirement and of the wire word, of
+  read-ahead's held batch; the C API's stale-id test reuses a freed
+  query's slot 300 times.
+- A transaction id counts in 38 bits, all those below the node's and
+  the thread's (the author, 2026-10-23; chapter 05 §17.12), where it
+  counted in 32: a thread's block makes the same id again only after
+  2^38 transactions.
+- The decoders of what arrives from the network are fuzzed (chapter
+  08, "Fuzzing"): `ic_port::fuzz`, a runner with no crate beyond std,
+  and nine `fuzz_` tests over the decoders of `ic_signals`, `ic_apic`,
+  `ic_protocol` and `ic_apid`, run by `cargo xtask fuzz` with overflow
+  checks on. Reading them for it found five inputs a data node or a
+  management server could send that would panic or overflow, now
+  refused: a `SCAN_CONF` count its entries cannot hold, reserved for
+  before; column sizes past 32 bits, and any column larger than the
+  largest row, 18 000 words (chapter 05 §13); a heartbeat interval
+  times ten; node counts in a configuration that add up past 32 bits;
+  and a management server's content length, for which the whole was
+  reserved before a byte came. Each has a unit test. A message longer
+  than the largest a data node sends is still taken, up to the 65 535
+  words its length field holds.
+- `scan_a_connection_freed_while_a_record_is_asked_for_gives_it_back`
+  (§11.3) failed in a whole run and passed alone (2026-11-04): data
+  node 1 listed a record (objid 3047, state 7, no operations, transid
+  count 1 of block index 0) under node 228's block 0x8000 after the API
+  node that used it had gone and node 228 had been handed out again.
+  The data nodes' failure handling is to clean up an API node's records
+  before its node id is used again (the author, 2026-11-04), so this is
+  a RonDB bug to report. The record is the only one of a set of 2 048
+  at instance 1 (objid 1000 to 3047) ever written; the rest are idle in
+  state 7, their fields never set. The test keeps its check, and now
+  also fails, naming the cause, when anything is listed for its block
+  reference before its connection asks for anything.
+- A record gone with its link frees its place in the connection (the
+  author, 2026-11-04; chapter 02, "A record gone with its link"):
+  before, a record lost when its link went kept its place for as long
+  as the connection lived, so the list of records grew with each link
+  lost. A poll now frees the places of records whose link had gone
+  before it took its inbox and that nothing holds; the next record
+  allocated takes one. For that, the receive thread posts what a link
+  brought before it says the link is down, and a node's link
+  generation is read with acquire ordering. Freeing, giving back and
+  losing a record check its link and release id as well as its place.
+  Unit tests: a place taken again, a link gone, when a place is free,
+  free records of a link gone.
+- Tests: to be run, with the fuzz targets.
 
 ## Later — after the first version
 

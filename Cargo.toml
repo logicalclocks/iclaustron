@@ -58,3 +58,11 @@ missing_safety_doc = "deny"       # every unsafe fn documents its contract
 
 [profile.release]
 debug = 1                          # line tables for profiling
+
+# `cargo xtask fuzz` (doc/rust/08-testing-and-tooling.md, "Fuzzing"):
+# release speed, with the checks a fuzzer needs. A plain release build
+# lets an integer overflow wrap unseen; this one panics on it.
+[profile.fuzz]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true

@@ -13,7 +13,7 @@ languages are later (chapter 06, "Later"; Q6).
 | | Rust (`ic_apid`) | C (`ic_capi`) |
 |---|---|---|
 | Object | `ApidConnection` | `IC_APID_CONNECTION*`, opaque |
-| Query, transaction | `QueryId`, `TransId`, in the connection | `IC_QUERY_ID`, `IC_TRANS_ID`, `uint32_t` |
+| Query, transaction | `QueryId`, `TransId`, in the connection | `IC_QUERY_ID`, `IC_TRANS_ID`, `uint64_t` |
 | Method | `conn.read_key(q, t, &args)` | `ic_apid_conn_read_key(conn, q, t, &args)` |
 | Error | `Result<T, IcError>` | `int32_t`, 0 or the error code, and `ic_error_*` |
 | Callback | `fn(&mut ApidConnection, QueryId, usize)` | `void (*)(IC_APID_CONNECTION*, IC_QUERY_ID, void*)` |
@@ -608,15 +608,17 @@ while ((ret = ic_scan_reader_next_row(reader, &more)) == 0 && more) {
 
 **The C ABI**, by the rules below:
 
-- `IC_SCAN_ID` (`uint32_t`) names a scan in its connection, and
-  `IC_SCAN_BATCH_ID` (`uint64_t`) a batch: the scan and its
-  receiver's id in the run.
+- `IC_SCAN_ID` (`uint64_t`) names a scan in its connection, and
+  `IC_SCAN_BATCH_ID` (`uint64_t`) a batch, by an id of its own that
+  names nothing once the batch is handed back or its run has ended
+  (the author, 2026-10-23; "Ids" below).
 - `ic_scan_args_init(&args, sizeof args)` fills an `IC_SCAN_ARGS`:
   `lock` (`IC_SCAN_LOCK_COMMITTED`, `IC_SCAN_LOCK_SHARED`,
   `IC_SCAN_LOCK_EXCLUSIVE`), `trans` (`IC_NO_TRANS` for none),
   `parallelism`, `batch_rows`, `batch_bytes`, `partition`
   (`IC_NO_PARTITION` for none), `timeout_ms`, `read_ahead`,
-  `callback` and `user_ref`.
+  `callback`, `user_ref`, `ordered` and `descending` (for an ordered
+  index, "Index scans"), and `continuous` (phase 10).
 - On a connection: `ic_apid_scan_create(conn, def, rec, &scan)`;
   `ic_apid_scan_free(conn, scan)`;
   `ic_apid_conn_start_scan(conn, scan, &args)`;
@@ -625,8 +627,9 @@ while ((ret = ic_scan_reader_next_row(reader, &more)) == 0 && more) {
   `ic_apid_scan_row(conn, scan, &len)`, the scan's row, valid until
   the scan is freed.
 - Batches: `ic_apid_conn_get_next_scan_batch(conn, &batch)`;
-  `ic_apid_scan_batch_rows(conn, batch)`; `ic_scan_batch_scan(batch)`,
-  the scan a batch is of;
+  `ic_apid_scan_batch_rows(conn, batch)`;
+  `ic_apid_scan_batch_scan(conn, batch)`, the scan a batch is of, 0
+  once it is handed back;
   `ic_apid_conn_next_scan_row(conn, batch, &more)` and
   `_next_scan_row_into(conn, batch, row, len, &more)`;
   `ic_apid_conn_release_scan_batch(conn, batch)`.
@@ -1190,10 +1193,21 @@ node), no events.
   `..._create`, `..._connect` or `..._bind` function and given back to
   a `..._free` function. A table or index handle holds the description
   alive; freeing it does not unbind.
-- **Ids**: a query and a transaction are named by a `uint32_t` within
-  their connection (`IC_QUERY_ID`, `IC_TRANS_ID`), as in Rust. An id
-  that no longer names a live one, freed or closed, is refused with an
-  error, never followed.
+- **Ids** (the author, 2026-10-23): a stale id is never followed. A
+  query, a transaction and a scan are named by a `uint64_t` within
+  their connection (`IC_QUERY_ID`, `IC_TRANS_ID`, `IC_SCAN_ID`), as in
+  Rust, and each batch of a scan's by an `IC_SCAN_BATCH_ID` of its own.
+  An id is a 24-bit slot index and a 40-bit generation that goes up
+  each time the slot is freed; a slot whose generation would wrap is
+  retired rather than used again, so no id ever names a second object,
+  and one that no longer names a live one, freed, closed or handed
+  back, is refused with an error or passed over. No id is 0, which
+  `IC_NO_TRANS` is. The ids were 32 bits until then, an 8-bit
+  generation that let an id kept across 255 reuses of its slot name
+  whatever held it: programs built against that header are to be built
+  again, since `IC_SCAN_ARGS` kept its size and the size rule cannot
+  tell them. What goes on the wire is a 32-bit word made from the id,
+  as before (chapter 05 §7.2).
 - **Rows (Q10, applied 2026-10-14)**: the query owns its rows; C gets
   pointers to them, `ic_apid_query_key_row(conn, q, &len)` and
   `ic_apid_query_attr_row(conn, q, &len)`, valid until the query is
@@ -1432,10 +1446,11 @@ callback and keeps the C function in the query's `binding` word; when
 the query completes, the trampoline calls the C function with the
 connection's handle, the query and the `user_ref`. Inside, the C
 callback may call any `ic_apid_conn_*` and `ic_apid_query_*` function
-on that connection except a poll or flush, which does nothing, and must
-not free the connection. A bind there of a table or index whose
-description is being fetched, when the callback runs inside a bind of
-its own thread, is refused with `IC_ERROR_NOT_SUPPORTED`.
+on that connection, and must not free the connection. A poll inside
+it does nothing, and a flush only sends. A bind there of a table or
+index whose description is being fetched, when the callback runs
+inside a bind of its own thread, is refused with
+`IC_ERROR_NOT_SUPPORTED`.
 
 ### Example, asynchronous
 

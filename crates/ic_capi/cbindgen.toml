@@ -46,11 +46,13 @@ after_includes = """
  * never made, is undefined behaviour.
  *
  * Ids. A query (IC_QUERY_ID), a transaction (IC_TRANS_ID) and a scan
- * (IC_SCAN_ID) are named by an id in their connection, and a scan's
- * batch by an IC_SCAN_BATCH_ID. An id that names nothing any more,
- * freed, closed or handed back, is refused with an error or passed
- * over, never followed. A program's values (IC_PROGRAM_VALUE) and
- * conditions (IC_PROGRAM_COND) are ids in their builder.
+ * (IC_SCAN_ID) are named by a 64-bit id in their connection, and each
+ * batch of a scan's by an IC_SCAN_BATCH_ID of its own. No id is ever
+ * 0, and an id that names nothing any more, freed, closed or handed
+ * back, is refused with an error or passed over, never taken for
+ * another: a later query, transaction, scan or batch always has an id
+ * of its own. A program's values (IC_PROGRAM_VALUE) and conditions
+ * (IC_PROGRAM_COND) are ids in their builder.
  *
  * Rows. A query owns its rows: ic_apid_query_key_row() and
  * ic_apid_query_attr_row() give pointers valid until the query is

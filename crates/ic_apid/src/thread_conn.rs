@@ -487,10 +487,11 @@ struct TableSlots {
   /// Where the next search for a free slot starts: just past the last
   /// one handed out, so that a freed id rests as long as possible.
   next: usize,
-  /// Per slot, the low word of the next transaction id. A connection
-  /// that takes the slot goes on from where the last one left it, so
-  /// that its block number never makes the same id twice.
-  trans_counters: Vec<u32>,
+  /// Per slot, the count of the next transaction id. A connection that
+  /// takes the slot goes on from where the last one left it, so that
+  /// its block number makes the same id again only once the count's 38
+  /// bits have gone round.
+  trans_counters: Vec<u64>,
   /// Per slot, the links, as (node id, generation), over which an
   /// allocate of the connection that left it may still be answered: the
   /// slot is not handed out while any of them stands.
@@ -530,7 +531,7 @@ impl ThreadTable {
   /// A table with every slot free.
   pub fn new() -> ThreadTable {
     let mut slots: Vec<Option<Arc<ThreadConnection>>> = Vec::new();
-    let mut trans_counters: Vec<u32> = Vec::new();
+    let mut trans_counters: Vec<u64> = Vec::new();
     let mut waiting_on: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut i: u32 = 0;
     while i < IC_MAX_THREAD_CONNECTIONS {
@@ -614,8 +615,8 @@ impl ThreadTable {
   }
 
   /// Where a new connection in slot `thread_id` starts its transaction
-  /// ids' low word.
-  pub(crate) fn trans_counter(&self, thread_id: u32) -> u32 {
+  /// ids' count.
+  pub(crate) fn trans_counter(&self, thread_id: u32) -> u64 {
     let table = self.slots.lock();
     match table.trans_counters.get(thread_id as usize) {
       Some(counter) => *counter,
@@ -624,7 +625,7 @@ impl ThreadTable {
   }
 
   /// Keep where a connection leaving slot `thread_id` got to.
-  pub(crate) fn keep_trans_counter(&self, thread_id: u32, counter: u32) {
+  pub(crate) fn keep_trans_counter(&self, thread_id: u32, counter: u64) {
     let mut table = self.slots.lock();
     if let Some(kept) = table.trans_counters.get_mut(thread_id as usize) {
       *kept = counter;

@@ -41,43 +41,49 @@ use crate::program::Program;
 use crate::program::IC_PROGRAM_INPUTS;
 use crate::record::Record;
 
-/// A query's id in its connection, which is also what a data node names
-/// it by in a reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A query's id in its connection. A data node names the query by a
+/// word made from it ([`QueryId::wire_word`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct QueryId(pub(crate) PtrId);
 
 impl QueryId {
   /// The word a request carries and a reply echoes.
-  pub fn as_u32(&self) -> u32 {
-    self.0.as_u32()
+  pub(crate) fn wire_word(&self) -> u32 {
+    self.0.wire_word()
+  }
+
+  /// The id as a 64-bit word, for a language binding.
+  pub fn as_u64(&self) -> u64 {
+    self.0.as_u64()
   }
 
   /// A query id from its word, as a language binding hands it back.
-  /// Whether it still names a live query is for the connection to say.
-  pub fn from_u32(word: u32) -> QueryId {
-    QueryId(PtrId::from_u32(word))
+  /// Whether it still names a live query is for the connection to say;
+  /// one freed never does again.
+  pub fn from_u64(word: u64) -> QueryId {
+    QueryId(PtrId::from_u64(word))
   }
 }
 
 /// A transaction's id in its connection.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct TransId(pub(crate) PtrId);
 
 impl TransId {
-  /// The id as a word, for a language binding.
-  pub fn as_u32(&self) -> u32 {
-    self.0.as_u32()
+  /// The id as a 64-bit word, for a language binding.
+  pub fn as_u64(&self) -> u64 {
+    self.0.as_u64()
   }
 
   /// A transaction id from its word, as a language binding hands it
   /// back. Whether it still names a live transaction is for the
-  /// connection to say.
-  pub fn from_u32(word: u32) -> TransId {
-    TransId(PtrId::from_u32(word))
+  /// connection to say; one closed never does again.
+  pub fn from_u64(word: u64) -> TransId {
+    TransId(PtrId::from_u64(word))
   }
 }
 
-/// What is called when a query completes (`IC_APID_CALLBACK_FUNC`):
+/// What is called when a query completes (`IC_APID_CALLBACK`):
 /// on the thread that polls, from inside the poll, with the connection,
 /// the query's id, and the `user_ref` the query was defined with. The
 /// query is by id since it lives in the connection, which the callback

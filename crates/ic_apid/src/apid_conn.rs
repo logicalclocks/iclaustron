@@ -345,9 +345,10 @@ pub struct CoordRecord {
   pub coord_ptr: u32,
   /// The coordinator block to send to, its instance included.
   pub coord_block: u16,
-  /// Where the connection keeps it, which never changes.
+  /// Where the connection keeps it, which never changes while it lives.
   pub(crate) index: u32,
-  /// A transaction is using it.
+  /// Something holds it: a transaction, a scan or a key operation, or
+  /// its allocate waits for an answer.
   busy: bool,
   /// Its state is unknown, or the coordinator has freed it: never
   /// handed out again.
@@ -361,6 +362,9 @@ pub struct CoordRecord {
   /// Its allocate was given up on before an answer came: a confirmation
   /// that comes later is freed at once (`take_late_allocate`).
   abandoned: bool,
+  /// Gone with its link, and nothing holds it: its place takes the next
+  /// record allocated (`reclaim_places`), and the rest of it is stale.
+  spare: bool,
 }
 
 #[cfg(test)]
@@ -379,27 +383,36 @@ impl CoordRecord {
       freed: false,
       release_id: 1,
       abandoned: false,
+      spare: false,
     }
   }
 }
 
-/// The next release id from `seed`, which it moves on: a 64-bit mix of
-/// a counter, its high half, never zero, which the coordinator takes as
-/// a free without one.
-/// A transaction id, as the reference makes one: the low 12 bits of the
-/// thread's block index in bits 52 to 63 and of the node id in bits 40
-/// to 51, bit 12 of the node id in bit 39 and of the block index in bit
-/// 38, and the count in the low 32 bits. The thirteenth bits keep the
-/// ids of thread 4 096 and up, and of node 4 096 and up, apart from
-/// those of thread and node 0 up. Verify: chapter 05 §17.12.
-fn transaction_id(block_index: u32, node_id: u32, count: u32) -> u64 {
+/// The bits of a transaction id that count the thread's transactions:
+/// the 38 below the node's and the thread's (the author, 2026-10-23).
+/// Verify: chapter 05 §17.12.
+const IC_TRANS_COUNT_MASK: u64 = (1 << 38) - 1;
+
+/// A transaction id: the low 12 bits of the thread's block index in
+/// bits 52 to 63 and of the node id in bits 40 to 51, bit 12 of the
+/// node id in bit 39 and of the block index in bit 38, and the count in
+/// the 38 bits below. The thirteenth bits keep the ids of thread 4 096
+/// and up, and of node 4 096 and up, apart from those of thread and
+/// node 0 up. Verify: chapter 05 §17.12.
+fn transaction_id(block_index: u32, node_id: u32, count: u64) -> u64 {
   let index = block_index as u64;
   let node = node_id as u64;
   ((index & 0xFFF) << 52)
     | ((node & 0xFFF) << 40)
     | (((node >> 12) & 1) << 39)
     | (((index >> 12) & 1) << 38)
-    | count as u64
+    | (count & IC_TRANS_COUNT_MASK)
+}
+
+/// The count after `count`, wrapping within its 38 bits, never into the
+/// node's and the thread's.
+fn trans_count_after(count: u64) -> u64 {
+  (count + 1) & IC_TRANS_COUNT_MASK
 }
 
 /// The fragment id after `id`, skipping 0, which a data node's own
@@ -430,6 +443,9 @@ fn patch_words(
   }
 }
 
+/// The next release id from `seed`, which it moves on: a 64-bit mix of
+/// a counter, its high half, never zero, which the coordinator takes as
+/// a free without one.
 fn release_id_after(seed: &mut u64) -> u32 {
   loop {
     *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -463,6 +479,7 @@ fn take_abandoned(held: &mut CoordRecord, conf: &CoordAllocConf) {
   held.coord_ptr = conf.coord_ptr;
   held.coord_block = blocks::ref_to_block(conf.coord_block_ref);
   held.lost = true;
+  held.busy = false;
 }
 
 /// The links, as (node id, generation), over which a coordinator may
@@ -512,11 +529,76 @@ fn link_stands(shared: &ApidShared, node_id: u32, generation: u32) -> bool {
 /// one; a debug data node stops on it. Verify: chapter 05 §17.10.
 fn mark_freed(held: &mut CoordRecord, rec: &CoordRecord) -> bool {
   // Only a confirmed allocation has the coordinator's block.
-  if held.api_ptr != rec.api_ptr || held.freed || held.coord_block == 0 {
+  if !same_allocation(held, rec) || held.freed || held.coord_block == 0 {
     return false;
   }
   held.freed = true;
   true
+}
+
+/// True if `held`, the record at a place, is the allocation `rec` is a
+/// copy of. A place freed with its link takes a later allocation, of
+/// another link or node, with the same pointer, which a copy kept by an
+/// ended transaction must never touch.
+fn same_allocation(held: &CoordRecord, rec: &CoordRecord) -> bool {
+  !held.spare
+    && held.api_ptr == rec.api_ptr
+    && held.node_id == rec.node_id
+    && held.generation == rec.generation
+    && held.release_id == rec.release_id
+}
+
+/// A node's link as a poll saw it before taking its inbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinkSeen {
+  node_id: u32,
+  generation: u32,
+  connected: bool,
+}
+
+/// True if the link of `generation` to `node_id` had gone when `links`
+/// was taken: a later link had come, or it was down. A node `links` does
+/// not hold is taken as not gone.
+fn link_gone(links: &[LinkSeen], node_id: u32, generation: u32) -> bool {
+  for seen in links {
+    if seen.node_id == node_id {
+      let later = seen.generation > generation;
+      let down = seen.generation == generation && !seen.connected;
+      return later || down;
+    }
+  }
+  false
+}
+
+/// True if the place of `rec` can take a new record: it is lost, held
+/// by nothing (`in_use` says whether a transaction or a scan holds it),
+/// and its link had gone when `links` was taken. The data node freed it
+/// with the link, as its failure handling does before the link can come
+/// back, so nothing can name it any more.
+fn reclaimable(rec: &CoordRecord, in_use: bool, links: &[LinkSeen]) -> bool {
+  if rec.spare || !rec.lost || rec.busy || in_use {
+    return false;
+  }
+  link_gone(links, rec.node_id, rec.generation)
+}
+
+/// Take out of a free list the records whose link had gone when `links`
+/// was taken, as lost: the coordinator freed them with the link.
+fn drop_gone(
+  list: &mut Vec<u32>,
+  records: &mut [CoordRecord],
+  links: &[LinkSeen],
+) {
+  let mut k: usize = 0;
+  while k < list.len() {
+    let rec = &mut records[list[k] as usize];
+    if link_gone(links, rec.node_id, rec.generation) {
+      rec.lost = true;
+      list.remove(k);
+    } else {
+      k += 1;
+    }
+  }
 }
 
 /// A user thread's connection to the cluster.
@@ -542,13 +624,20 @@ pub struct ApidConnection {
   /// The indexes this thread has bound, by `database/table/index`.
   indexes: HashMap<String, Arc<IndexDef>>,
   /// Transaction records allocated at the coordinators, as many per node
-  /// as this thread has had transactions in flight there, at positions
-  /// that never change.
+  /// as this thread has had transactions in flight there. A record keeps
+  /// its position while it lives; once its link has gone and nothing
+  /// holds it, the position takes a new record.
   coord_records: Vec<CoordRecord>,
   /// By node id, the positions of the free ones.
   free_coord: Vec<Vec<u32>>,
-  /// The low word of the next transaction id.
-  trans_counter: u32,
+  /// The positions of records freed with their link that nothing holds,
+  /// for the next records allocated (the author, 2026-11-04).
+  spare_places: Vec<u32>,
+  /// A record may have come free for reuse since the positions were
+  /// last looked at: the next poll looks again.
+  reclaim_due: bool,
+  /// The count of the next transaction id, 38 bits.
+  trans_counter: u64,
   /// The started nodes as of the last transaction start, kept for its
   /// allocation.
   pub(crate) started_scratch: Vec<u32>,
@@ -608,6 +697,10 @@ pub struct ApidConnection {
   /// The receivers of the scans running, by the id their rows name,
   /// tagged with `scan::IC_RECEIVER_TAG` when sent.
   pub(crate) receivers: PtrArray<ReceiverSlot>,
+  /// The batches with the application, by their own ids: a batch's id
+  /// names that batch alone, so one handed back, or of a run that has
+  /// ended, is refused rather than taken for its receiver's next.
+  pub(crate) batches: PtrArray<ReceiverSlot>,
   /// By the place of the record it runs on, each scan in flight: a
   /// `SCAN_CONF` or `SCAN_REF` names our pointer for the record.
   pub(crate) scan_of_record: Vec<Option<ScanId>>,
@@ -721,6 +814,8 @@ impl ApidConnection {
       indexes: HashMap::new(),
       coord_records: Vec::new(),
       free_coord: Vec::new(),
+      spare_places: Vec::new(),
+      reclaim_due: false,
       trans_counter,
       started_scratch: Vec::new(),
       queries: PtrArray::new(),
@@ -745,6 +840,7 @@ impl ApidConnection {
       unusable: false,
       scans: PtrArray::new(),
       receivers: PtrArray::new(),
+      batches: PtrArray::new(),
       scan_of_record: Vec::new(),
       scan_pools: Vec::new(),
       ready_batches: VecDeque::new(),
@@ -1293,6 +1389,13 @@ impl ApidConnection {
     if check_links {
       lost = self.lost_transactions();
     }
+    // The links as they stand before the inbox is taken, for freeing the
+    // places of records gone with theirs: a link seen gone now has posted
+    // every signal it brought, and they are all taken in below.
+    let mut links_seen: Option<Vec<LinkSeen>> = None;
+    if check_links || self.reclaim_due {
+      links_seen = Some(self.links_seen());
+    }
     let mut pages = std::mem::take(&mut self.pages);
     self
       .inbox
@@ -1330,6 +1433,11 @@ impl ApidConnection {
     if reply_check_due(&mut self.next_reply_check, now) {
       self.expire_transactions(now);
       self.expire_scans(now);
+    }
+    // Records gone with their link and let go of are freed for reuse,
+    // once the replies have had their say.
+    if let Some(links) = links_seen {
+      self.reclaim_places(&links);
     }
     // What the replies called for, such as commit acknowledgements,
     // goes with the next send, in the same write as its requests. It is
@@ -1473,7 +1581,7 @@ impl ApidConnection {
   /// Verify: chapter 05 §17.12.
   pub fn next_transaction_id(&mut self) -> u64 {
     let count = self.trans_counter;
-    self.trans_counter = self.trans_counter.wrapping_add(1);
+    self.trans_counter = trans_count_after(count);
     let index = self.block_number() - blocks::IC_FIRST_USER_THREAD_BLOCK;
     transaction_id(index as u32, self.shared.own_node_id(), count)
   }
@@ -1487,13 +1595,116 @@ impl ApidConnection {
     release_id_after(&mut self.release_seed)
   }
 
+  /// A place for a record about to be allocated at `node_id` over the
+  /// link of `generation`, held and lost until the coordinator confirms
+  /// it: one freed with its link, or a new one.
+  fn place_record(&mut self, node_id: u32, generation: u32) -> CoordRecord {
+    let index = match self.spare_places.pop() {
+      Some(index) => index as usize,
+      None => self.coord_records.len(),
+    };
+    let rec = CoordRecord {
+      node_id,
+      generation,
+      api_ptr: coord_ptr_of(index),
+      coord_ptr: 0,
+      coord_block: 0,
+      index: index as u32,
+      busy: true,
+      lost: true,
+      freed: false,
+      release_id: self.next_release_id(),
+      abandoned: false,
+      spare: false,
+    };
+    if index < self.coord_records.len() {
+      self.coord_records[index] = rec;
+    } else {
+      self.coord_records.push(rec);
+    }
+    rec
+  }
+
+  /// The links of the nodes this connection holds records at, as they
+  /// stand now. Each is read as connected or not first: a reader that
+  /// sees a link down, or a newer one, sees every signal it brought
+  /// posted (`rec_thread`'s `tear_down`).
+  fn links_seen(&self) -> Vec<LinkSeen> {
+    let mut links: Vec<LinkSeen> = Vec::new();
+    for rec in &self.coord_records {
+      if rec.spare {
+        continue;
+      }
+      let mut known = false;
+      for seen in &links {
+        if seen.node_id == rec.node_id {
+          known = true;
+          break;
+        }
+      }
+      if known {
+        continue;
+      }
+      let node = match self.shared.node(rec.node_id) {
+        Some(node) => node,
+        None => continue,
+      };
+      let connected = node.published.is_connected();
+      let generation = node.published.generation();
+      links.push(LinkSeen {
+        node_id: rec.node_id,
+        generation,
+        connected,
+      });
+    }
+    links
+  }
+
+  /// True if a transaction or a scan holds the record at `index`.
+  fn place_in_use(&self, index: usize) -> bool {
+    let transaction = matches!(self.active.get(index), Some(Some(_)));
+    let scan = matches!(self.scan_of_record.get(index), Some(Some(_)));
+    transaction || scan
+  }
+
+  /// Free for new records the places of records that nothing holds and
+  /// whose link had gone when `links` was taken, before the inbox was
+  /// (the author, 2026-11-04). The data node freed them with the link,
+  /// its failure handling cleaning up before the link can come back,
+  /// and every signal that link brought has been taken in, so nothing
+  /// can name them any more. Free records of such a link leave their
+  /// lists first.
+  fn reclaim_places(&mut self, links: &[LinkSeen]) {
+    self.reclaim_due = false;
+    for list in &mut self.free_coord {
+      drop_gone(list, &mut self.coord_records, links);
+    }
+    for pool in &mut self.scan_pools {
+      drop_gone(&mut pool.free, &mut self.coord_records, links);
+    }
+    let mut index: usize = 0;
+    while index < self.coord_records.len() {
+      let rec = self.coord_records[index];
+      if reclaimable(&rec, self.place_in_use(index), links) {
+        // A wait given up on leaves no expectation behind.
+        self.expectations.forget(rec.api_ptr);
+        let spare = &mut self.coord_records[index];
+        spare.spare = true;
+        spare.abandoned = false;
+        self.spare_places.push(index as u32);
+      }
+      index += 1;
+    }
+  }
+
   /// A transaction record at `node_id`'s coordinator for a transaction
   /// to use: a free one this thread holds, or a new one allocated. Given
   /// back with [`free_coord_record`](Self::free_coord_record).
   ///
   /// A free record allocated over a link that has since been replaced is
   /// lost, as the coordinator freed it when the link went, and is
-  /// dropped as it comes up. One allocated over the current link while
+  /// dropped as it comes up; its place takes a later record
+  /// (`reclaim_places`). One allocated over the current link while
   /// the link is down is handed out, and the send fails as any send
   /// would. Nothing here looks at more than the record handed out: a
   /// thread with hundreds of transactions in flight starts each in
@@ -1514,27 +1725,16 @@ impl ApidConnection {
         return Ok(*rec);
       }
       rec.lost = true;
+      self.reclaim_due = true;
     }
     // The record's place is taken now, before the request goes, so that
     // a allocate started meanwhile, by a callback run while this one waits,
     // cannot take it too. It stays lost, never handed out, unless the
     // coordinator confirms it.
-    let index = self.coord_records.len();
-    let api_ptr = coord_ptr_of(index);
-    let release_id = self.next_release_id();
-    self.coord_records.push(CoordRecord {
-      node_id,
-      generation,
-      api_ptr,
-      coord_ptr: 0,
-      coord_block: 0,
-      index: index as u32,
-      busy: true,
-      lost: true,
-      freed: false,
-      release_id,
-      abandoned: false,
-    });
+    let placed = self.place_record(node_id, generation);
+    let index = placed.index as usize;
+    let api_ptr = placed.api_ptr;
+    let release_id = placed.release_id;
     let allocate = CoordAllocReq {
       client_ptr: api_ptr,
       client_block_ref: self.block_ref(),
@@ -1569,10 +1769,15 @@ impl ApidConnection {
         // allocated a record whose pointer nothing here would know, and
         // that nothing would give back, so it is freed as it comes.
         self.coord_records[index].abandoned = true;
+        self.coord_records[index].busy = false;
+        self.reclaim_due = true;
         return Err(e);
       }
     };
     if reply.sig_no == numbers::IC_SIG_COORD_ALLOC_REF {
+      // Nothing was allocated; the place is free once its link has gone.
+      self.coord_records[index].busy = false;
+      self.reclaim_due = true;
       let refusal = CoordAllocRef::decode(&reply.data)?;
       return Err(IcError::new(refusal.error_code as i32));
     }
@@ -1623,7 +1828,15 @@ impl ApidConnection {
       Some(held) => held,
       None => return,
     };
-    if held.api_ptr != rec.api_ptr || held.lost || !held.busy {
+    if !same_allocation(held, rec) {
+      return;
+    }
+    if held.lost {
+      // Let go of: its place is free once its link has gone.
+      self.reclaim_due = true;
+      return;
+    }
+    if !held.busy {
       return;
     }
     held.busy = false;
@@ -1636,11 +1849,14 @@ impl ApidConnection {
 
   /// Stop using a transaction record whose state is not known, such as
   /// one whose transaction timed out. The coordinator keeps it until the
-  /// link goes.
+  /// link goes, and its place is then free for a later record, once a
+  /// transaction holding it has let go of it too.
   pub fn lose_coord_record(&mut self, rec: &CoordRecord) {
     if let Some(held) = self.coord_records.get_mut(rec.index as usize) {
-      if held.api_ptr == rec.api_ptr {
+      if same_allocation(held, rec) {
         held.lost = true;
+        held.busy = false;
+        self.reclaim_due = true;
       }
     }
   }
@@ -1686,6 +1902,7 @@ impl ApidConnection {
         return Some(*rec);
       }
       rec.lost = true;
+      self.reclaim_due = true;
     }
     None
   }
@@ -1709,22 +1926,10 @@ impl ApidConnection {
     };
     // As for a transaction's record, the place is taken before the
     // request goes, and stays lost unless the coordinator confirms it.
-    let index = self.coord_records.len();
-    let api_ptr = coord_ptr_of(index);
-    let release_id = self.next_release_id();
-    self.coord_records.push(CoordRecord {
-      node_id,
-      generation,
-      api_ptr,
-      coord_ptr: 0,
-      coord_block: 0,
-      index: index as u32,
-      busy: true,
-      lost: true,
-      freed: false,
-      release_id,
-      abandoned: false,
-    });
+    let placed = self.place_record(node_id, generation);
+    let index = placed.index as usize;
+    let api_ptr = placed.api_ptr;
+    let release_id = placed.release_id;
     let allocate = CoordAllocReq {
       client_ptr: api_ptr,
       client_block_ref: self.block_ref(),
@@ -1741,7 +1946,7 @@ impl ApidConnection {
       numbers::IC_SIG_COORD_ALLOC_REF,
     ];
     // Over the link the record is noted on, as for a transaction's.
-    self.send_expecting_on(
+    let sent = self.send_expecting_on(
       node_id,
       generation,
       &header,
@@ -1749,7 +1954,13 @@ impl ApidConnection {
       &[],
       api_ptr,
       &replies,
-    )?;
+    );
+    if let Err(e) = sent {
+      // Nothing went: the place is free once its link has gone.
+      self.coord_records[index].busy = false;
+      self.reclaim_due = true;
+      return Err(e);
+    }
     self.scan_pools[pool].asked.push(index as u32);
     Ok(())
   }
@@ -1766,7 +1977,10 @@ impl ApidConnection {
     for index in asked {
       let api_ptr = self.coord_records[index as usize].api_ptr;
       self.expectations.forget(api_ptr);
-      self.coord_records[index as usize].abandoned = true;
+      let rec = &mut self.coord_records[index as usize];
+      rec.abandoned = true;
+      rec.busy = false;
+      self.reclaim_due = true;
     }
   }
 
@@ -1806,7 +2020,13 @@ impl ApidConnection {
             self.scan_pools[pool].refused = None;
             came = true;
           }
-          Err(e) => self.scan_pools[pool].refused = Some(e),
+          Err(e) => {
+            self.scan_pools[pool].refused = Some(e);
+            // Refused, or its link gone: the place is free once the link
+            // has gone.
+            self.coord_records[index as usize].busy = false;
+            self.reclaim_due = true;
+          }
         }
       }
       pool += 1;
@@ -1853,7 +2073,15 @@ impl ApidConnection {
   pub(crate) fn free_scan_record(&mut self, rec: &CoordRecord, instance: u32) {
     match self.coord_records.get_mut(rec.index as usize) {
       Some(held) => {
-        if held.api_ptr != rec.api_ptr || held.lost || !held.busy {
+        if !same_allocation(held, rec) {
+          return;
+        }
+        if held.lost {
+          // Let go of: its place is free once its link has gone.
+          self.reclaim_due = true;
+          return;
+        }
+        if !held.busy {
           return;
         }
         held.busy = false;
@@ -2012,6 +2240,8 @@ impl ApidConnection {
     if !given_up {
       return false;
     }
+    // Either way the place is free once its link has gone.
+    self.reclaim_due = true;
     if signal.sig_no == numbers::IC_SIG_COORD_ALLOC_REF {
       self.coord_records[index].abandoned = false;
       return true;
@@ -2283,6 +2513,95 @@ mod tests {
     assert!(!mark_freed(&mut unconfirmed, &rec));
   }
 
+  fn seen(node_id: u32, generation: u32, connected: bool) -> LinkSeen {
+    LinkSeen {
+      node_id,
+      generation,
+      connected,
+    }
+  }
+
+  #[test]
+  fn a_place_taken_again_is_not_the_allocation_it_held_before() {
+    let rec = CoordRecord::for_test(1);
+    assert!(same_allocation(&rec, &rec));
+    // The same place, taken by a later allocation over a later link, at
+    // another node or with another release id, is not this one.
+    let mut held = rec;
+    held.generation = 2;
+    assert!(!same_allocation(&held, &rec));
+    held = rec;
+    held.node_id = 2;
+    assert!(!same_allocation(&held, &rec));
+    held = rec;
+    held.release_id = 2;
+    assert!(!same_allocation(&held, &rec));
+    // Nor is a place waiting for its next record.
+    held = rec;
+    held.spare = true;
+    assert!(!same_allocation(&held, &rec));
+    // A copy kept by an ended transaction gives back nothing of the
+    // allocation that took its place.
+    let mut later = rec;
+    later.generation = 2;
+    later.release_id = 7;
+    assert!(!mark_freed(&mut later, &rec));
+  }
+
+  #[test]
+  fn a_link_is_gone_once_down_or_followed_by_another() {
+    let links = [seen(1, 3, true), seen(2, 5, false)];
+    assert!(!link_gone(&links, 1, 3), "up");
+    assert!(link_gone(&links, 1, 2), "a later link has come");
+    assert!(link_gone(&links, 2, 5), "down");
+    assert!(link_gone(&links, 2, 4));
+    assert!(!link_gone(&links, 3, 1), "not seen, so not known gone");
+  }
+
+  #[test]
+  fn a_place_is_free_once_lost_let_go_of_and_its_link_gone() {
+    // The test record is of link 1; link 2 has come since.
+    let links = [seen(1, 2, true)];
+    let mut rec = CoordRecord::for_test(1);
+    rec.lost = true;
+    rec.busy = false;
+    assert!(reclaimable(&rec, false, &links));
+    assert!(!reclaimable(&rec, true, &links), "a transaction holds it");
+    let mut held = rec;
+    held.busy = true;
+    assert!(!reclaimable(&held, false, &links), "its allocate is out");
+    let mut free = rec;
+    free.lost = false;
+    assert!(!reclaimable(&free, false, &links), "still in a free list");
+    let mut standing = rec;
+    standing.generation = 2;
+    assert!(!reclaimable(&standing, false, &links), "its link stands");
+    let mut spare = rec;
+    spare.spare = true;
+    assert!(!reclaimable(&spare, false, &links), "free already");
+    // Given up on, its link gone: no answer can come any more.
+    let mut abandoned = rec;
+    abandoned.abandoned = true;
+    assert!(reclaimable(&abandoned, false, &links));
+  }
+
+  #[test]
+  fn free_records_of_a_link_gone_leave_their_list_lost() {
+    let links = [seen(1, 2, true)];
+    let mut records = vec![
+      CoordRecord::for_test(1),
+      CoordRecord::for_test(1),
+      CoordRecord::for_test(1),
+    ];
+    records[1].generation = 2;
+    let mut list: Vec<u32> = vec![0, 1, 2];
+    drop_gone(&mut list, &mut records, &links);
+    assert_eq!(list, vec![1], "the record of the link up stays");
+    assert!(records[0].lost);
+    assert!(!records[1].lost);
+    assert!(records[2].lost);
+  }
+
   #[test]
   fn an_allocate_given_up_on_is_freed_when_its_answer_comes() {
     // The place as an allocate leaves it once its wait has ended: lost,
@@ -2345,7 +2664,13 @@ mod tests {
     assert_eq!(transaction_id(0, 1, 0), 1 << 40);
     assert_eq!(transaction_id(0x1000, 0, 0), 1 << 38);
     assert_eq!(transaction_id(0, 0x1000, 0), 1 << 39);
+    // The count takes the 38 bits below them all, and goes round
+    // within them.
     assert_eq!(transaction_id(0, 0, 0xFFFF_FFFF), 0xFFFF_FFFF);
+    assert_eq!(transaction_id(0, 0, IC_TRANS_COUNT_MASK), (1 << 38) - 1);
+    assert_eq!(transaction_id(0, 0, 1 << 38), 0);
+    assert_eq!(trans_count_after(0xFFFF_FFFF), 1 << 32);
+    assert_eq!(trans_count_after(IC_TRANS_COUNT_MASK), 0);
     // Thread i and thread i + 4 096 made the same ids with 12 bits.
     let mut seen = std::collections::HashSet::new();
     let mut index: u32 = 0;

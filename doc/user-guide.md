@@ -122,9 +122,10 @@ once, as many as RonDB lets an API node have
 **Binding.** `table_bind(db, table)` fetches a table's description from
 the cluster, once for every connection of the global; `index_bind(db,
 index, table)` a unique index's. A MySQL server names the hash index of
-`UNIQUE KEY k` `k$unique`. When a data node says a table has changed
-since it was bound (errors 241, 284), the library lets the description
-go, and the next bind fetches it again: bind again and retry.
+`UNIQUE KEY k` `k$unique`. When a data node says a table or index has
+changed or gone since it was bound (the schema errors 241, 283, 284,
+709, 710 and 723), the library lets the description go, and the next
+bind fetches it again: bind again and retry.
 
 **A record** says how a row is laid out in the program's memory: for
 each field, where its value is and where its null bit is. The values
@@ -240,8 +241,12 @@ memcpy(key, &row, sizeof row);
 
 A query is idle, defined, sent or completed. Once completed it is idle
 again when it is taken (below), and can be defined anew; `free_query`
-lets it go. In C a query and a transaction are named by a `uint32_t`;
-one freed or closed is refused if used again, never followed.
+lets it go. In C a query, a transaction and a scan are named by a
+64-bit id (`IC_QUERY_ID`, `IC_TRANS_ID`, `IC_SCAN_ID`), and each batch
+of a scan's by one of its own (`IC_SCAN_BATCH_ID`). An id is never 0,
+and one whose query, transaction, scan or batch is gone, freed, closed
+or handed back, is refused if used again, never followed: a later one
+always has an id of its own.
 
 **Reads** (`read_key`), by kind:
 
@@ -412,9 +417,13 @@ ic_request_add_read(req, shape, IC_READ_KIND_COMMITTED, &op);
 memcpy(ic_request_key_row(req, op, &len), &key, sizeof key);
 if ((ret = ic_apid_submitter_execute(sub, req)) != 0)
   goto error;
-if (ic_request_op_error(req, op) == IC_NDB_ERROR_NO_SUCH_ROW)
+ret = ic_request_op_error(req, op);
+if (ret == IC_NDB_ERROR_NO_SUCH_ROW)
   /* no such row */;
-memcpy(&row, ic_request_attr_row(req, op, &len), sizeof row);
+else if (ret != 0)
+  goto error;
+else
+  memcpy(&row, ic_request_attr_row(req, op, &len), sizeof row);
 ```
 
 A full executor makes `execute` wait for room; a stopped one refuses
@@ -428,9 +437,11 @@ function on the executor's thread when it ends, rather than waited for
 Measured on a Mac with two data nodes, 64 threads calling through one
 executor read 268 000 rows a second, 36 % more than 64 threads with a
 connection each, at half the CPU a call. Both are far from what one
-thread does asynchronously, two million a second: a blocking call
-costs a thread's sleep and wake-up, about 10 µs of CPU, however it
-reaches the cluster.
+thread does asynchronously on that Mac, pipelining primary key reads
+in batches of 200: 1.8 million a second with two batches in flight,
+2.6 million with four (`doc/rust/12-performance-model.md`). A blocking
+call costs a thread's sleep and wake-up, about 10 µs of CPU, however
+it reaches the cluster.
 
 ### Scans
 
@@ -445,9 +456,11 @@ their batch is handed back.
   `ic_apid_scan_create`), and start a run of it as often as you like
   (`start_scan`, `ic_apid_conn_start_scan`), with its arguments
   (`ScanArgs`, `ic_scan_args_init`): the lock (committed, shared or
-  exclusive), the batch size, one partition, a deadline. A program
-  run on the data nodes (section 6) can pass over the rows the
-  application does not want, so that only the others travel.
+  exclusive), the batch size, one partition, and `timeout_ms`: a run
+  still going that long after its start is closed with
+  `IC_ERROR_TIMEOUT`. A program run on the data nodes (section 6) can
+  pass over the rows the application does not want, so that only the
+  others travel.
 - **Row by row**: `next_row` (`ic_apid_conn_next_row`) reads the next
   row into the scan's row, handing each batch back as it goes and
   polling while it waits; it says false at the end, or gives the
@@ -513,8 +526,11 @@ reads the whole index.
   gives its rows range by range, so the numbers must rise in the order
   the ranges were added (`IC_ERROR_BAD_RANGE`, 7163, as for a range
   that cannot be sent).
-- **One partition**: a run whose every range fixes the table's
-  distribution key reads that partition alone. On a table made with
+- **One partition**: a run reads one partition alone when every range
+  fixes the table's distribution key, its low and high bound taking
+  the same values for it, and every range falls in the same partition,
+  one the library can work out (not, for instance, for a key in one of
+  the collations section 12 names). On a table made with
   `COMMENT="NDB_TABLE=PARTITION_HASH=base:detail:fanout"`, ranges
   that fix only the first `base` columns of the primary key, the same
   in every range, read the fanout's partitions for that base alone.
@@ -531,11 +547,14 @@ transaction (`ScanArgs::trans`, `IC_SCAN_ARGS`' `trans`), and act on
 the row last read: `lock_scan_row`, `update_scan_row` or
 `delete_scan_row` (`ic_apid_conn_lock_scan_row` and so on) define a
 query on the transaction that takes the row's lock over and locks,
-updates or deletes it. The query is any query over the scanned table:
-an update takes its values from the query's attribute row, and its key
-from the scan. A batch handed back asks for more only once its rows'
-takeovers have completed, so the locks never go before the changes are
-in. Commit the transaction once the scan is done.
+updates or deletes it. The query is one made with `create_query` over
+the scanned table, with no program and no reads after (section 6); one
+through a unique index, or with either, is refused
+(`IC_ERROR_NOT_SUPPORTED`, 7127). An update takes its values from the
+query's attribute row, and its key from the scan. A batch handed back
+asks for more only once its rows' takeovers have completed, so the
+locks never go before the changes are in. Commit the transaction once
+the scan is done.
 
 Close a run early with `close_scan` (`ic_apid_conn_close_scan`), or a
 reader's with `close` (`ic_scan_reader_close`). The run stops at once,
@@ -543,8 +562,11 @@ without waiting for the batches on their way, whose rows are dropped;
 a locking scan on a transaction that goes on first waits for its
 takeovers to be confirmed, so that each holds its lock. A batch kept
 too long ends the scan with 296; a lock waited for too long with 274
-or 266; the failure of the coordinator's node with 4028. All are
-temporary: start the scan again.
+or 266; the failure of the coordinator's node with 4028; six minutes
+without a word from the coordinator, while the run waits for it to
+start, to send a batch or to confirm the stop, with 4012, whose
+outcome is unknown (section 9). All are temporary: start the scan
+again.
 
 ## 6. Programs: conditions and updates on the data nodes
 
@@ -659,10 +681,14 @@ the data node.
 **What the finish refuses**: a comparison or assignment of values of
 different types (`IC_ERROR_NOT_COMPARABLE`, 7164), since a constant
 must have its column's type, length, precision, scale and collation;
-more than eight values live at once (`IC_ERROR_CONDITION_TOO_COMPLEX`,
-7130); a column the table does not have, or an input beyond 15. A
-program is for the table its builder was made over, and is refused on
-another's operations (`IC_ERROR_BAD_PROGRAM`).
+more than eight registers at once, or a program too long
+(`IC_ERROR_CONDITION_TOO_COMPLEX`, 7130); a column the table does not
+have, or an input beyond 15. Inputs, integers and sums are worked out
+in registers, and so is a column compared with or added to one; each
+comparison or assignment gives its registers back, and a column
+compared with a constant or another column takes none. A program is
+for the table its builder was made over, and is refused on another's
+operations (`IC_ERROR_BAD_PROGRAM`).
 
 The `conditional_update` example runs an optimistic update, once
 committed and once refused with 6000, a counter read back after its
@@ -776,9 +802,10 @@ Inside the callback the query is complete, with its error or its row,
 and its transaction's state is settled as far as this query decides it:
 a single-query transaction that committed is done, and can be closed
 there. The callback may read the query's rows, define queries, start,
-commit, roll back and close transactions, and send; a poll or flush
-inside it does nothing. When it returns the query is idle again, unless
-the callback defined it anew, which is how a pipeline keeps itself full.
+commit, roll back and close transactions, and send; a poll inside it
+does nothing, and a flush inside it only sends. When it returns the
+query is idle again, unless the callback defined it anew, which is how
+a pipeline keeps itself full.
 It must not free the connection.
 
 In Rust a callback is a plain function, `fn(&mut ApidConnection,
@@ -818,7 +845,7 @@ asked for once it has completed.
 | 630 | a row with that key is there already | user |
 | 893 | the row would break a unique index; the error data names it | user |
 | 6000 | a program's condition did not hold, on an operation that aborts on error | user |
-| 241, 284 | the table or index changed or went since it was bound | user: bind again |
+| 241, 283, 284, 709, 710, 723 | the table or index changed or went since it was bound | user: bind again |
 | 266 | a lock wait timed out, probably a deadlock | temporary |
 | 274, 296 | a scan waited too long for a lock; a scan's batch was kept too long | temporary |
 | 233, 4006, 899 and others | a node is out of a resource for the moment | temporary |
@@ -830,7 +857,7 @@ asked for once it has completed.
 | 7159 | an executor's list of requests is full (`submit` only) | temporary |
 | 7160 | the executor has stopped | error |
 | 7127 | something the library does not do (yet), such as a program on an insert | error |
-| 7130, 7164, 7165 | a program needs more than eight values at once; compares different types; names what it does not have | error |
+| 7130, 7164, 7165 | a program needs more than eight registers at once, or is too long; compares different types; names what it does not have | error |
 | 7163 | a range of an index scan that cannot be sent | error |
 | 7166 | the table has no AUTO_INCREMENT column | error |
 | 7139 | too many connections in this process | error |
@@ -916,8 +943,9 @@ transaction that goes to a cluster with no started node fails with
 
 - Programs are the basic set: comparisons, IS NULL, AND, OR and NOT,
   adding and subtracting integers, and assignments with a condition of
-  their own, with at most eight values live at once; none on inserts
-  or writes, through a unique index, or on a row a scan hands over.
+  their own, with at most eight registers at once (section 6); none on
+  inserts or writes, through a unique index, or on a row a scan hands
+  over.
 - Inserts do not fill an AUTO_INCREMENT column by themselves: the
   application asks for the value (section 7).
 - Rows a scan has locked are taken over on a connection only, not

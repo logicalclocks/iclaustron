@@ -24,7 +24,8 @@
 //!    executed here: that is what makes this thread the one writer of
 //!    the node's published state. The one exception is the dictionary's
 //!    notice that a table changed, which goes to the dictionary cache.
-//! 5. Post every inbox that got something, once, and wake its thread.
+//! 5. Post every inbox that got something, once, and wake its thread if
+//!    it waits.
 //!
 //! A socket that closes is noticed here, when it is read, which is as
 //! soon as the operating system says so.
@@ -266,7 +267,12 @@ impl Receiver {
     rec.fd = -1;
     rec.reader.reset();
     let node = Arc::clone(&rec.node);
-    // First, so that no one starts a send into a link going away.
+    // What the link brought this round is posted before the link is said
+    // to be down, so that a user thread that sees it down, or a newer
+    // link, takes in every signal it brought before reusing a record's
+    // place those signals could name.
+    self.router.post_all();
+    // Then at once, so that no one starts a send into a link going away.
     node.published.publish_down();
     crate::apid_global::note_link_event();
     // Before taking the node's mutex: shutting the socket makes a

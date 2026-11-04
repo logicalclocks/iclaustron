@@ -46,7 +46,7 @@ rewrite it. Performance is not an excuse; nothing below costs performance.
   functions may take `&`/`&mut` freely; that is C pointers with a checker.
 - **Closures** in library internals. Callbacks are `fn` pointers plus a
   `user_ref: *mut c_void` (C API) or `usize` (Rust API), exactly as in
-  `IC_APID_CALLBACK_FUNC`.
+  `IC_APID_CALLBACK`.
 - **Iterator adaptor chains over collections** (`.iter().map().filter()
   .collect()`). Write one `for` loop.
 

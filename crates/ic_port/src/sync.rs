@@ -37,8 +37,11 @@ pub const IC_MUTEX_LEVEL_AUTO_INCREMENT: u32 = 1;
 pub const IC_MUTEX_LEVEL_COUNTER: u32 = 2;
 /// Global dictionary cache.
 pub const IC_MUTEX_LEVEL_DICT: u32 = 3;
-/// `ApidGlobal`: thread table and stop flag. Taken at start and stop,
-/// not on the signal path.
+/// `ApidGlobal`'s two mutexes, neither taken per signal. The thread
+/// table, which also keeps the transaction counters: taken when a
+/// connection is made or freed, and by a receive thread refreshing its
+/// copy after a change. Our identity: taken by a connect thread to dial
+/// and to claim a link.
 pub const IC_MUTEX_LEVEL_GLOBAL: u32 = 4;
 /// One user thread's inbound signal queue.
 pub const IC_MUTEX_LEVEL_THREAD_CONN: u32 = 5;

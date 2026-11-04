@@ -154,8 +154,13 @@ impl PublishedNodeState {
   /// How many times this node has been connected. An answer that
   /// arrives carrying an older generation belongs to a connection that
   /// is gone and should be discarded.
+  ///
+  /// A reader that sees a newer generation sees what the receive thread
+  /// did before installing it, the earlier link's last signals posted
+  /// among them, so that a connection may then reuse what only that
+  /// link's signals could name.
   pub fn generation(&self) -> u32 {
-    self.generation.load(Ordering::Relaxed)
+    self.generation.load(Ordering::Acquire)
   }
 
   /// When the current link was installed, or zero while disconnected.
@@ -191,7 +196,7 @@ impl PublishedNodeState {
   /// registration, so a node is never published as connected without
   /// one.
   pub fn publish_connected(&self, state: &NodeState, now: IcTimer) {
-    self.generation.fetch_add(1, Ordering::Relaxed);
+    self.generation.fetch_add(1, Ordering::Release);
     self.connected_at.store(now, Ordering::Relaxed);
     self.write_state(state, now);
   }

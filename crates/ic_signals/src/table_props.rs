@@ -326,6 +326,9 @@ const IC_BLOB_V2_HEAD_WORDS: u32 = 4;
 /// The largest decimal precision, and the first scale that means "not
 /// specified", as MySQL defines them. Verify: chapter 05 §17.8.
 const IC_DECIMAL_MAX_PRECISION: u32 = 65;
+/// The largest row a data node keeps, in words (chapter 05 §13): no
+/// column is larger, and a description of one is refused.
+pub const IC_MAX_ROW_WORDS: u32 = 18_000;
 const IC_DECIMAL_NOT_SPECIFIED: u32 = 31;
 
 /// One column.
@@ -426,24 +429,33 @@ impl ColumnProps {
   }
 
   /// Work out the element size and count from the type, as the
-  /// reference does. False for a type this cannot size.
+  /// reference does. False for a type this cannot size, and for a
+  /// column larger than the largest row, which no data node describes:
+  /// the sizes worked out from what the description says are checked,
+  /// so that none overflows.
   fn size_from_type(&mut self) -> bool {
     let n = self.length;
     let (bits, count) = match self.type_code {
-      IC_TYPE_TINYINT | IC_TYPE_TINYUNSIGNED => (IC_COLUMN_SIZE_8, n),
-      IC_TYPE_SMALLINT | IC_TYPE_SMALLUNSIGNED => (IC_COLUMN_SIZE_16, n),
-      IC_TYPE_MEDIUMINT | IC_TYPE_MEDIUMUNSIGNED => (IC_COLUMN_SIZE_8, 3 * n),
-      IC_TYPE_INT | IC_TYPE_UNSIGNED | IC_TYPE_FLOAT => (IC_COLUMN_SIZE_32, n),
+      IC_TYPE_TINYINT | IC_TYPE_TINYUNSIGNED => (IC_COLUMN_SIZE_8, Some(n)),
+      IC_TYPE_SMALLINT | IC_TYPE_SMALLUNSIGNED => (IC_COLUMN_SIZE_16, Some(n)),
+      IC_TYPE_MEDIUMINT | IC_TYPE_MEDIUMUNSIGNED => {
+        (IC_COLUMN_SIZE_8, n.checked_mul(3))
+      }
+      IC_TYPE_INT | IC_TYPE_UNSIGNED | IC_TYPE_FLOAT => {
+        (IC_COLUMN_SIZE_32, Some(n))
+      }
       IC_TYPE_BIGINT | IC_TYPE_BIGUNSIGNED | IC_TYPE_DOUBLE => {
-        (IC_COLUMN_SIZE_64, n)
+        (IC_COLUMN_SIZE_64, Some(n))
       }
       IC_TYPE_OLDDECIMAL => {
         let point = if self.scale > 0 { 1 } else { 0 };
-        (IC_COLUMN_SIZE_8, (1 + self.precision + point) * n)
+        let digits = self.precision.checked_add(1 + point);
+        (IC_COLUMN_SIZE_8, times(digits, n))
       }
       IC_TYPE_OLDDECIMALUNSIGNED => {
         let point = if self.scale > 0 { 1 } else { 0 };
-        (IC_COLUMN_SIZE_8, (self.precision + point) * n)
+        let digits = self.precision.checked_add(point);
+        (IC_COLUMN_SIZE_8, times(digits, n))
       }
       IC_TYPE_DECIMAL | IC_TYPE_DECIMALUNSIGNED => {
         if self.precision > IC_DECIMAL_MAX_PRECISION
@@ -454,44 +466,56 @@ impl ColumnProps {
           return false;
         }
         let bytes = decimal_bin_size(self.precision, self.scale);
-        (IC_COLUMN_SIZE_8, bytes * n)
+        (IC_COLUMN_SIZE_8, bytes.checked_mul(n))
       }
-      IC_TYPE_CHAR | IC_TYPE_BINARY => (IC_COLUMN_SIZE_8, n),
+      IC_TYPE_CHAR | IC_TYPE_BINARY => (IC_COLUMN_SIZE_8, Some(n)),
       IC_TYPE_VARCHAR | IC_TYPE_VARBINARY => {
         if n > 0xFF {
           return false;
         }
-        (IC_COLUMN_SIZE_8, n + 1)
+        (IC_COLUMN_SIZE_8, Some(n + 1))
       }
       IC_TYPE_LONGVARCHAR | IC_TYPE_LONGVARBINARY => {
         if n > 0xFFFF {
           return false;
         }
-        (IC_COLUMN_SIZE_8, n + 2)
+        (IC_COLUMN_SIZE_8, Some(n + 2))
       }
-      IC_TYPE_DATETIME => (IC_COLUMN_SIZE_8, 8 * n),
-      IC_TYPE_DATE | IC_TYPE_TIME => (IC_COLUMN_SIZE_8, 3 * n),
-      IC_TYPE_YEAR => (IC_COLUMN_SIZE_8, n),
-      IC_TYPE_TIMESTAMP => (IC_COLUMN_SIZE_8, 4 * n),
+      IC_TYPE_DATETIME => (IC_COLUMN_SIZE_8, n.checked_mul(8)),
+      IC_TYPE_DATE | IC_TYPE_TIME => (IC_COLUMN_SIZE_8, n.checked_mul(3)),
+      IC_TYPE_YEAR => (IC_COLUMN_SIZE_8, Some(n)),
+      IC_TYPE_TIMESTAMP => (IC_COLUMN_SIZE_8, n.checked_mul(4)),
       IC_TYPE_BLOB | IC_TYPE_TEXT => {
         let mut head = IC_BLOB_V2_HEAD_WORDS;
         if self.array_kind == IC_ARRAY_KIND_FIXED {
           head = IC_BLOB_V1_HEAD_WORDS;
         }
-        (IC_COLUMN_SIZE_8, head * 4 + self.precision)
+        (IC_COLUMN_SIZE_8, (head * 4).checked_add(self.precision))
       }
-      IC_TYPE_BIT => (IC_COLUMN_SIZE_BIT, n),
+      IC_TYPE_BIT => (IC_COLUMN_SIZE_BIT, Some(n)),
       // Fractional seconds take one byte per two digits, rounded up;
       // the reference writes it (1 + precision) / 2.
-      IC_TYPE_TIME2 => (IC_COLUMN_SIZE_8, (3 + self.precision.div_ceil(2)) * n),
+      IC_TYPE_TIME2 => {
+        let each = self.precision.div_ceil(2).checked_add(3);
+        (IC_COLUMN_SIZE_8, times(each, n))
+      }
       IC_TYPE_DATETIME2 => {
-        (IC_COLUMN_SIZE_8, (5 + self.precision.div_ceil(2)) * n)
+        let each = self.precision.div_ceil(2).checked_add(5);
+        (IC_COLUMN_SIZE_8, times(each, n))
       }
       IC_TYPE_TIMESTAMP2 => {
-        (IC_COLUMN_SIZE_8, (4 + self.precision.div_ceil(2)) * n)
+        let each = self.precision.div_ceil(2).checked_add(4);
+        (IC_COLUMN_SIZE_8, times(each, n))
       }
       _ => return false,
     };
+    let count = match count {
+      Some(count) => count,
+      None => return false,
+    };
+    if byte_size(bits, count) > IC_MAX_ROW_WORDS as u64 * 4 {
+      return false;
+    }
     self.size_bits_log2 = bits;
     self.array_len = count;
     true
@@ -500,10 +524,8 @@ impl ColumnProps {
   /// The most bytes the column's value takes, length bytes included.
   /// A bit field is counted in whole words, as the data nodes store it.
   pub fn max_byte_size(&self) -> u32 {
-    if self.size_bits_log2 == IC_COLUMN_SIZE_BIT {
-      return 4 * self.array_len.div_ceil(32);
-    }
-    ((1 << self.size_bits_log2) / 8) * self.array_len
+    let bytes = byte_size(self.size_bits_log2, self.array_len);
+    u32::try_from(bytes).unwrap_or(u32::MAX)
   }
 
   /// True for the types a character set applies to.
@@ -1012,6 +1034,20 @@ fn default_value_of(bytes: &[u8]) -> Vec<u8> {
   bytes[4..end].to_vec()
 }
 
+/// `each` times `n`, if `each` is known and the product fits.
+fn times(each: Option<u32>, n: u32) -> Option<u32> {
+  each?.checked_mul(n)
+}
+
+/// The bytes `count` elements of 2^`bits` bits take, a bit field in
+/// whole words, in 64 bits so that no count overflows it.
+fn byte_size(bits: u32, count: u32) -> u64 {
+  if bits == IC_COLUMN_SIZE_BIT {
+    return 4 * (count as u64).div_ceil(32);
+  }
+  ((1u64 << bits) / 8) * count as u64
+}
+
 /// The size in bytes of a packed decimal of this precision and scale:
 /// four bytes for every nine digits, and fewer for the remainder, on
 /// each side of the point. The same rule as MySQL's `decimal_bin_size`.
@@ -1124,6 +1160,37 @@ mod tests {
     w.add_u32(IC_TP_COLUMN_END, 0);
     w.add_u32(999, 0);
     w.words().to_vec()
+  }
+
+  /// A table of one key column of `type_code`, `length` elements long.
+  fn one_column(type_code: u32, length: u32) -> Vec<u32> {
+    let mut w = PropertyWriter::new();
+    w.add_string(IC_TP_TABLE_NAME, "ictest/def/t1");
+    w.add_u32(IC_TP_COLUMN_COUNT, 1);
+    w.add_string(IC_TP_COLUMN_NAME, "c");
+    w.add_u32(IC_TP_COLUMN_ID, 0);
+    w.add_u32(IC_TP_COLUMN_IN_KEY, 1);
+    w.add_u32(IC_TP_COLUMN_TYPE, type_code);
+    w.add_u32(IC_TP_COLUMN_LENGTH, length);
+    w.add_u32(IC_TP_COLUMN_END, 0);
+    w.words().to_vec()
+  }
+
+  #[test]
+  fn a_column_larger_than_the_largest_row_is_refused() {
+    // The largest row fits; a byte more in one column does not.
+    let most = IC_MAX_ROW_WORDS * 4;
+    let fits = parse_table_info(&one_column(IC_TYPE_BINARY, most));
+    assert_eq!(fits.expect("fits").attributes[0].max_byte_size(), most);
+    assert!(refused(IC_TYPE_BINARY, most + 1));
+    // Lengths whose sizes would overflow 32 bits are refused too.
+    assert!(refused(IC_TYPE_DATETIME, 1 << 29));
+    assert!(refused(IC_TYPE_BIGINT, 1 << 29));
+    assert!(refused(IC_TYPE_MEDIUMINT, u32::MAX));
+  }
+
+  fn refused(type_code: u32, length: u32) -> bool {
+    parse_table_info(&one_column(type_code, length)).is_err()
   }
 
   #[test]
