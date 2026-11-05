@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! Transactions (`legacy-c/api/ic_apid_trans.ic`, which is stubs, and
+//! Transactions (`main:api/ic_apid_trans.ic`, which is stubs, and
 //! `ic_apid_conn.ic`, `apid_conn_start_transaction` and its kin, also
 //! stubs): defining key queries on a transaction, sending them, and
 //! completing them as their replies come, with the accounting of

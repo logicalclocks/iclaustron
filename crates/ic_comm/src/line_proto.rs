@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The line-oriented management protocol
-//! (`legacy-c/comm/ic_protocol_support.c`).
+//! (`main:comm/ic_protocol_support.c`).
 //!
 //! Every exchange with the management server is lines ending in a
 //! newline, with an empty line marking the end of a request or a reply

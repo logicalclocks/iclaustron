@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The receive thread (`legacy-c/api/ic_apid_rec_thread.ic`,
+//! The receive thread (`main:api/ic_apid_rec_thread.ic`,
 //! `run_receive_thread`).
 //!
 //! It owns a share of the data nodes, assigned when the threads start

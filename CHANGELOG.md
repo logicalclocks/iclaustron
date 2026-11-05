@@ -68,6 +68,8 @@ character column, and gets some conditions wrong
   `cargo xtask install` now links to 1.0's library, so they have to be
   built again.
 - No function of 0.1 was removed or changed; 114 were added.
+- The original iClaustron C code, under `legacy-c/` in 0.1, is no longer
+  in the tree; it is on branch `main`.
 
 ### Not done yet
 

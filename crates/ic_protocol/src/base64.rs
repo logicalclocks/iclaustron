@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! Base64 (`legacy-c/protocol/ic_base64.c`).
+//! Base64 (`main:protocol/ic_base64.c`).
 //!
 //! The management server sends the cluster configuration as a base64
 //! blob after the header lines of its `get config` reply, so decoding

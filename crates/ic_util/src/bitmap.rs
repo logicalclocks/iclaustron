@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! A bitmap of fixed width (`IC_BITMAP`,
-//! `legacy-c/util/ic_bitmap.c`). Used for the set of fields taking part
+//! `main:util/ic_bitmap.c`). Used for the set of fields taking part
 //! in a query, the set of partitions a scan covers, and the connected
 //! node bitmap that arrives in `HEARTBEAT_CONF`.
 

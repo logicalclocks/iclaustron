@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Turning a socket into a transporter connection to a data node
-//! (`legacy-c/api/ic_apid_send_thread.ic`,
+//! (`main:api/ic_apid_send_thread.ic`,
 //! `authenticate_client_connection`).
 //!
 //! This is the one part of the protocol that has changed since the C was

@@ -1,4 +1,0 @@
-# What a release's source archive leaves out (`git archive`, and the
-# archives GitHub makes of a tag). legacy-c/ is the original C code,
-# kept in the repository for reference and part of no release.
-/legacy-c export-ignore

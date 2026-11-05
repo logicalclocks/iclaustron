@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Handing signals from a receive thread to the user thread they are
-//! for (`legacy-c/api/ic_apid_rec_thread.ic`, `post_ndb_messages`, and
+//! for (`main:api/ic_apid_rec_thread.ic`, `post_ndb_messages`, and
 //! `ic_apid_exec_message.ic`, `get_thread_messages`).
 //!
 //! This is the heart of the threading model. A receive thread does not

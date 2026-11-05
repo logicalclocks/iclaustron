@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The cluster configuration as the rest of the library uses it
-//! (`legacy-c/include/ic_apic_data.h`).
+//! (`main:include/ic_apic_data.h`).
 //!
 //! [`ConfigBlob`] is what arrived; this is what it means. The C had one
 //! struct per node type with every parameter as a field, around 180 of

@@ -5,7 +5,7 @@ The containers and helpers the rest of the library is built from. See
 
 ## Source files translated
 
-| C file (legacy-c/) | Rust module | Mode | Status |
+| C file (branch `main`) | Rust module | Mode | Status |
 |---|---|---|---|
 | `util/ic_mc.c`, `include/ic_mc.h` | `mc.rs` | Redesign | done |
 | `util/ic_bitmap.c`, `include/ic_bitmap.h` | `bitmap.rs` | 1:1 | done |

@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The connect thread, one per data node
-//! (`legacy-c/api/ic_apid_send_thread.ic`, `run_send_thread` and
+//! (`main:api/ic_apid_send_thread.ic`, `run_send_thread` and
 //! `connect_by_send_thread`).
 //!
 //! In the C the per-node send thread also does the connecting. Here the

@@ -1,1 +1,0 @@
-aclocal; autoheader; glibtoolize --automake --copy; automake --add-missing --copy; autoconf

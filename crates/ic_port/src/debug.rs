@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Debug tracing: `DEBUG_ENTRY`/`DEBUG_RETURN`/`DEBUG_PRINT` from
-//! `legacy-c/include/ic_debug.h` and `legacy-c/util/ic_debug.c`.
+//! `main:include/ic_debug.h` and `main:util/ic_debug.c`.
 //!
 //! Each thread keeps an indent level and a stack of entry point names so
 //! the output is pretty printed as a call tree. Output goes to a file

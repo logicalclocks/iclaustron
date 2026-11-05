@@ -5,7 +5,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 //! `ic_util`: the containers and helpers the rest of the library builds
-//! on. Translates `legacy-c/util/*.c` apart from the error codes and the
+//! on. Translates `main:util/*.c` apart from the error codes and the
 //! debug tracer, which had to move down into `ic_port` because the C port
 //! layer used them.
 //!

@@ -5,7 +5,7 @@ Everything between a socket and the protocol layers above it. See
 
 ## Source files translated
 
-| C file (legacy-c/) | Rust module | Mode | Status |
+| C file (branch `main`) | Rust module | Mode | Status |
 |---|---|---|---|
 | `comm/ic_sock_buf.c`, `include/ic_sock_buf.h` | `sock_buf.rs` | 1:1 | done |
 | `comm/ic_poll_set.c`, `include/ic_poll_set.h` | `poll_set.rs` | 1:1 | done |

@@ -915,7 +915,7 @@ while ((ret = ic_apid_conn_next_row(conn, scan, &more)) == 0 && more) {
 A condition is built bottom-up, as a tree, and compiled whole (the
 author, 2026-10-20, choosing among the old builder's subroutine ids
 handed out top-down and its values at memory addresses,
-`legacy-c/include/ic_apid.h:1123-1217`; this tree; and groups opened
+`main:include/ic_apid.h:1123-1217`; this tree; and groups opened
 and closed in the order a condition is written, as MySQL compiles its
 conditions). The old builder's model stays, values and conditions
 between them, without subroutine ids for the caller to keep:

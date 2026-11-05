@@ -44,6 +44,8 @@ Read in order the first time; afterwards each chapter stands alone.
 
 ## Reference trees
 
-- iClaustron C code: this repository, branch `RUST-iclaustron` (now `trunk`), to be
-  moved unchanged to `legacy-c/` in Phase 0.
+- iClaustron C code: this repository, branch `main`. A C file is named
+  as `main:<path>`, which `git show main:<path>` prints; the module maps
+  (chapter 03 and each crate's `MODULE.md`) give the paths alone. Until
+  release 1.0 the code was also on this branch, under `legacy-c/`.
 - RonDB 26.10: a RonDB source tree. Read for protocol facts; never copy.

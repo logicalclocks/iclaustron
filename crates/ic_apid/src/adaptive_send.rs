@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The adaptive send algorithm (`legacy-c/api/ic_apid_adaptive_send.ic`):
+//! The adaptive send algorithm (`main:api/ic_apid_adaptive_send.ic`):
 //! whether a send to a node should be held back for company.
 //!
 //! One socket write per operation costs a data node a receive, an

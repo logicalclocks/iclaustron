@@ -2,7 +2,7 @@
 
 ## Facts
 
-- The iClaustron C code (`legacy-c/`) is GPLv2, authored by Mikael
+- The iClaustron C code (branch `main`) is GPLv2, authored by Mikael
   Ronström (AUTHORS). Its copyright moved from iClaustron AB to
   Hopsworks AB (2026-11-04), and its file headers name Hopsworks AB. The
   copyright holder can relicense a derivative work; the GPL is a grant
@@ -83,9 +83,11 @@ we used RonDB's names for signals and blocks as interface vocabulary.
   an application writes (collations, `AUTO_INCREMENT`) are MySQL's
   language and are used as they are. "RonDB" and "NDB" name what we
   interoperate with.
-- `legacy-c/` is iClaustron's old code, reference only, and is not
-  changed, but for its copyright headers, which name Hopsworks AB since
-  the copyright moved there (2026-11-04).
+- The C code is iClaustron's old code, reference only, and was not
+  changed while it was under `legacy-c/`, but for its copyright headers,
+  which name Hopsworks AB since the copyright moved there (2026-11-04).
+  It was removed from `trunk` and `1.0.0` before release 1.0
+  (2026-11-05) and is on branch `main`.
 
 ## Character sets and collations
 
@@ -127,7 +129,8 @@ installed, never part of a release artefact). The Rust workspace takes the
 repository root and the root `LICENSE` becomes MIT. The copyright holder
 can relicense; when a piece of C is translated its prose moves into Rust
 doc comments under MIT, and when `legacy-c/` is no longer needed it is
-deleted in one commit.
+deleted in one commit: done before release 1.0 (2026-11-05), the C code
+staying on branch `main`.
 
 Every new source file starts with:
 

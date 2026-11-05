@@ -16,8 +16,8 @@ The design is chapter 04, "The C ABI".
 | `tests/c_api.rs` | the `c_api` integration group, against a live cluster |
 
 The C code had no counterpart: its header was the API itself, with the
-`_OPS` function tables of `ic_apid.h`. Nothing is translated from
-`legacy-c/`.
+`_OPS` function tables of `ic_apid.h`. Nothing is translated from the
+C code.
 
 ## How a call crosses
 

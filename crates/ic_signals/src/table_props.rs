@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! What a table looks like, as the dictionary describes it
-//! (`legacy-c/include/ic_apid_dict_signals.h` for the C's version of
+//! (`main:include/ic_apid_dict_signals.h` for the C's version of
 //! the keys).
 //!
 //! A table description is a run of properties

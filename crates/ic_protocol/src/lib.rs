@@ -6,8 +6,8 @@
 
 //! `ic_protocol`: the pieces of the NDB management protocol that are
 //! neither sockets nor configuration. Translates
-//! `legacy-c/protocol/ic_base64.c` and the management half of
-//! `legacy-c/protocol/ic_proto_str.c`.
+//! `main:protocol/ic_base64.c` and the management half of
+//! `main:protocol/ic_proto_str.c`.
 //!
 //! Modules:
 //! - [`base64`]: the encoding the configuration blob travels in.

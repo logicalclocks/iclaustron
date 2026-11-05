@@ -5,8 +5,7 @@ branch. From it a C program gets the library, `libiclaustron` (shared
 and static), its header and a pkg-config file, through `cargo xtask
 install`; a Rust program depends on the crates by git at the tag (user
 guide, section 1). Nothing is published to crates.io, and no binaries
-are built for a release. The source archives of a tag leave `legacy-c/`
-out (`.gitattributes`).
+are built for a release.
 
 Supported: data nodes of RonDB 26.10.0 or later; Linux on x86_64 and
 aarch64, macOS on aarch64.

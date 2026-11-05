@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The dictionary cache (`legacy-c/api/ic_apid_table.ic`): the table
+//! The dictionary cache (`main:api/ic_apid_table.ic`): the table
 //! and index descriptions every thread of the process shares.
 //!
 //! **One object per table version, shared.** Binding a table gives a

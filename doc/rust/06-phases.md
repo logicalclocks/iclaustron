@@ -589,7 +589,7 @@ the stored names we look up (the counter table `sys/def/SYSTAB_0`, the
 hidden key column `$PK`). SQL names an application writes (collations,
 `AUTO_INCREMENT`, partition-balance options) are MySQL's language and
 are used as they are. "RonDB" and "NDB" name what we interoperate with.
-`legacy-c/` is not touched: it is iClaustron's old code, reference
+The C code is not touched: it is iClaustron's old code, reference
 only, never built.
 
 Citations: the code's comments cite chapter 05, and chapter 05 §17
@@ -2351,6 +2351,9 @@ branch of its own, `1.0.0`, which takes the fixes to the release;
 `trunk` (until then `RUST-iclaustron`) is the development branch, and
 every change goes to both. 0.2 and 0.3 were never tagged: what they
 were to hold is in 1.0. How a release is made: `doc/releasing.md`.
+Before the tag `legacy-c/` was removed from both branches, as chapter
+09 foresaw; the C code is on branch `main` (`doc/rust/README.md`, "Reference
+trees").
 
 **Data nodes of RonDB 26.02** (looked at 2026-11-05). Release 1.0
 needs data nodes of 26.10.0 or later; the author asked whether the bar

@@ -14,7 +14,6 @@ Line counts are the C sizes and feed the estimates in
 
 ```
 iclaustron/                    (this repository; branch trunk, a branch per release)
-  legacy-c/                    # all existing C code, unchanged, unbuilt reference
   Cargo.toml                   # [workspace]
   LICENSE                      # MIT
   rustfmt.toml  clippy.toml  deny.toml  rust-toolchain.toml
@@ -199,7 +198,7 @@ and `staticlib`; a `pkg-config` file is generated.
 
 Header-only RAII wrappers over the C ABI; no build step, no ABI of its own.
 
-## Out of this project (kept unchanged under `legacy-c/`)
+## Out of this project (the C code on branch `main`)
 
 `cluster_server/`, `cluster_mgr/`, `cluster_client/`, `pcntrl/`,
 `bootstrap/`, `cfg/`, `fileserver/`, `repserver/`, `scripts/`, the bison

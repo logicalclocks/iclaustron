@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The object every Data API thread works from
-//! (`legacy-c/api/ic_apid_global.ic`, `IC_INT_APID_GLOBAL`).
+//! (`main:api/ic_apid_global.ic`, `IC_INT_APID_GLOBAL`).
 //!
 //! [`ApidGlobal::start`] starts the threads that keep an API node in a
 //! cluster, and from then on nothing has to be driven by the

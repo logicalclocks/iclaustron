@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The query object (`legacy-c/api/ic_apid_op.ic`, `IC_INT_APID_QUERY`;
+//! The query object (`main:api/ic_apid_op.ic`, `IC_INT_APID_QUERY`;
 //! `IC_APID_QUERY` in `ic_apid.h`): one key operation, defined once and
 //! used many times.
 //!

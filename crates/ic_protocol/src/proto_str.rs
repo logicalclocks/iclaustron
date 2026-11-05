@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The vocabulary of the NDB management protocol
-//! (`legacy-c/protocol/ic_proto_str.c`), as RonDB 26.10 spells it.
+//! (`main:protocol/ic_proto_str.c`), as RonDB 26.10 spells it.
 //!
 //! Every string here is checked against the reference's client of this
 //! protocol, which is the other end of these conversations; chapter 05

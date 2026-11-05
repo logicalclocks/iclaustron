@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The socket buffer pool (`IC_SOCK_BUF`,
-//! `legacy-c/comm/ic_sock_buf.c`): a fixed set of buffer pages that the
+//! `main:comm/ic_sock_buf.c`): a fixed set of buffer pages that the
 //! receive threads read into and the user threads read out of.
 //!
 //! Pages are pooled rather than allocated per read because they are the

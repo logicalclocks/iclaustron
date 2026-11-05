@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! One connection to one data node
-//! (`legacy-c/api/ic_apid_send_thread.ic`).
+//! (`main:api/ic_apid_send_thread.ic`).
 //!
 //! Getting from a configuration to a working connection takes four
 //! steps, and the third is the one that catches people out:

@@ -5,7 +5,7 @@
 //! Standard output handling: `ic_printf!`, `ic_putchar`, redirection of
 //! all program output to a file (`ic_setup_stdout`) or to nowhere
 //! (`ic_set_stdout_null`). From the non-debug part of
-//! `legacy-c/util/ic_debug.c`.
+//! `main:util/ic_debug.c`.
 
 use std::fmt;
 use std::fs::File;

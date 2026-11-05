@@ -6,7 +6,7 @@ services. See `doc/rust/03-module-map.md` for the workspace-wide mapping.
 
 ## Source files translated
 
-| C file (legacy-c/) | Rust module | Mode | Status |
+| C file (branch `main`) | Rust module | Mode | Status |
 |---|---|---|---|
 | `include/ic_base_header.h` (constants) | `consts.rs` | 1:1 | done, values updated for RonDB 26.10 |
 | `include/ic_err.h`, `util/ic_err.c` | `err.rs` | 1:1 | done |

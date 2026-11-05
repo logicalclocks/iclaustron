@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! Error codes and the error value. Translates `legacy-c/include/ic_err.h`
-//! and `legacy-c/util/ic_err.c`.
+//! Error codes and the error value. Translates `main:include/ic_err.h`
+//! and `main:util/ic_err.c`.
 //!
 //! Codes 7000..=[`IC_LAST_ERROR`] are iClaustron errors; smaller positive
 //! codes are operating system `errno` values; codes outside both ranges

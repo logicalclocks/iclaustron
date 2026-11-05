@@ -5,7 +5,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 //! `ic_comm`: everything between a socket and the protocol layers above
-//! it. Translates `legacy-c/comm/*.c`.
+//! it. Translates `main:comm/*.c`.
 //!
 //! Modules:
 //! - [`sock_buf`]: the pool of buffer pages the receive path reads into.

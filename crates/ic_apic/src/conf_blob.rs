@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Decoding the binary cluster configuration
-//! (`legacy-c/api/ic_apic_conf_read_transl.ic`).
+//! (`main:api/ic_apic_conf_read_transl.ic`).
 //!
 //! The management server answers `get config_v2` with a base64 blob
 //! whose decoded form is described here. Every word after the magic is

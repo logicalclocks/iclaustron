@@ -20,8 +20,8 @@
 //! - `install`: build the C library in release mode and install it,
 //!   with its header and a pkg-config file, under a prefix.
 //! - `tags`: build a vim `tags` file over the Rust and C sources with
-//!   Universal Ctags (the successor of legacy-c/git_tags.sh);
-//!   `--no-legacy` leaves legacy-c/ out.
+//!   Universal Ctags (the successor of the C code's git_tags.sh, on
+//!   branch main).
 //!
 //! Written in the same C-like style as the library.
 
@@ -78,7 +78,7 @@ fn main() {
     "fuzz" => run_fuzz(rest),
     "header" => run_header(),
     "install" => run_install(rest),
-    "tags" => run_tags(rest),
+    "tags" => run_tags(),
     "names" => names::run_names(rest),
     _ => {
       print_help();
@@ -96,7 +96,7 @@ fn print_help() {
   println!("  fuzz [target] [cases] run the fuzz tests, all or one target");
   println!("  header            regenerate and diff the C header");
   println!("  install [prefix]  install libiclaustron (default /usr/local)");
-  println!("  tags [--no-legacy] build a vim tags file with Universal Ctags");
+  println!("  tags              build a vim tags file with Universal Ctags");
   println!("  names [rondb-tree] no RonDB name in our code or docs");
 }
 
@@ -613,14 +613,8 @@ fn is_universal_ctags() -> bool {
 }
 
 /// Build `./tags` for vim over every source file git knows about (tracked
-/// or new and not ignored), like legacy-c/git_tags.sh did for the C code.
-fn run_tags(rest: &[String]) -> i32 {
-  let mut include_legacy = true;
-  for arg in rest {
-    if arg == "--no-legacy" {
-      include_legacy = false;
-    }
-  }
+/// or new and not ignored), like `main:git_tags.sh` did for the C code.
+fn run_tags() -> i32 {
   if !is_universal_ctags() {
     eprintln!("tags: needs Universal Ctags on PATH");
     eprintln!("  macOS: brew install universal-ctags");
@@ -642,9 +636,6 @@ fn run_tags(rest: &[String]) -> i32 {
   let mut files = String::new();
   let mut count: u32 = 0;
   for line in text.lines() {
-    if !include_legacy && line.starts_with("legacy-c/") {
-      continue;
-    }
     if !has_tag_extension(line) {
       continue;
     }
@@ -653,7 +644,7 @@ fn run_tags(rest: &[String]) -> i32 {
     count += 1;
   }
   // Rust, C and C++ parsers are picked from the file names; .h, .ic
-  // and .y are treated as C as legacy-c/git_tags.sh did.
+  // and .y are treated as C as `main:git_tags.sh` did.
   let args: [&str; 12] = [
     "--map-C++=-.h",
     "--map-C=+.h",

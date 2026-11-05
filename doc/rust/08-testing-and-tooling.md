@@ -277,12 +277,11 @@ and rustfmt cannot:
 
 ## Editor navigation: `cargo xtask tags`
 
-The successor of `legacy-c/git_tags.sh`. It lists every source file git
-knows about (tracked, or new and not ignored), Rust and C, and feeds
-them to Universal Ctags with the Rust, C and C++ parsers, producing a
-sorted `./tags` file for vim/gvim (`tags` is git-ignored). `legacy-c/` is
-included by default so that a C function and its Rust translation are
-both one `Ctrl-]` away; `--no-legacy` leaves it out. Needs Universal
+The successor of the C code's `git_tags.sh`. It lists every source
+file git knows about (tracked, or new and not ignored), Rust and C, and
+feeds them to Universal Ctags with the Rust, C and C++ parsers,
+producing a sorted `./tags` file for vim/gvim (`tags` is git-ignored).
+Needs Universal
 Ctags (`brew install universal-ctags` or `sudo port install
 universal-ctags`); the BSD `ctags` that ships with macOS has no Rust
 parser and the command says so. Suggested `~/.vimrc` lines:

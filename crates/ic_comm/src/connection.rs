@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! One TCP connection (`IC_CONNECTION`,
-//! `legacy-c/comm/ic_connection.c`).
+//! `main:comm/ic_connection.c`).
 //!
 //! An API node only ever connects out: to a management server for the
 //! configuration, and to each data node for signals. The C also had a

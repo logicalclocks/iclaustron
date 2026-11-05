@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The heartbeat thread (`legacy-c/api/ic_apid_heartbeat.ic`).
+//! The heartbeat thread (`main:api/ic_apid_heartbeat.ic`).
 //!
 //! It sends `HEARTBEAT_REQ` to every connected data node on schedule, and
 //! notices a node that keeps its socket open but has stopped answering,

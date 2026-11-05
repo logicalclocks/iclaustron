@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Turning a byte stream into signals
-//! (`legacy-c/api/ic_apid_rec_thread.ic`, `ndb_receive_node`).
+//! (`main:api/ic_apid_rec_thread.ic`, `ndb_receive_node`).
 //!
 //! A socket delivers bytes whenever it likes: half a signal, three
 //! signals, a signal and a fragment of the next. This keeps what has

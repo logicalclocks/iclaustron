@@ -5,7 +5,7 @@ Base64 and the vocabulary of the NDB management protocol. See
 
 ## Source files translated
 
-| C file (legacy-c/) | Rust module | Mode | Status |
+| C file (branch `main`) | Rust module | Mode | Status |
 |---|---|---|---|
 | `protocol/ic_base64.c`, `include/ic_base64.h` | `base64.rs` | Redesign | done |
 | `protocol/ic_proto_str.c` (management half) | `proto_str.rs` | Redesign | done |

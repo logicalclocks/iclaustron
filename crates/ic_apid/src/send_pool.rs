@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The send thread pool (`legacy-c/api/ic_apid_send_thread.ic`,
+//! The send thread pool (`main:api/ic_apid_send_thread.ic`,
 //! `active_send_thread`; chapter 02, "Send thread pool"): the thread
 //! that writes what user threads leave behind.
 //!

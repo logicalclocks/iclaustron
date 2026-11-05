@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! Constants from `legacy-c/include/ic_base_header.h`, updated for
+//! Constants from `main:include/ic_base_header.h`, updated for
 //! RonDB 26.10 where the C values described NDB 7.2.9. Constants that
 //! only served the cluster server and the other management programs are
 //! not carried over.

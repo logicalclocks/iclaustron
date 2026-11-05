@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The memory container (`IC_MEMORY_CONTAINER`, `legacy-c/util/ic_mc.c`):
+//! The memory container (`IC_MEMORY_CONTAINER`, `main:util/ic_mc.c`):
 //! many small allocations grouped into a few large buffers, all released
 //! together.
 //!

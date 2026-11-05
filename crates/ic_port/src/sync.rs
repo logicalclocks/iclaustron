@@ -9,7 +9,7 @@
 //! doc/rust/02-architecture.md. In debug builds a thread that already
 //! holds a mutex of level N and tries to lock one of level <= N aborts
 //! with a message; this completes the discipline that
-//! `legacy-c/api/ic_api_mutex_doc.txt` started. Level 0 means unordered
+//! `main:api/ic_api_mutex_doc.txt` started. Level 0 means unordered
 //! (never checked).
 //!
 //! Rust notes for C readers: `IcMutex<T>` *contains* the data it

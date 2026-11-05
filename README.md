@@ -42,7 +42,6 @@ doc/rust/          the design and the plan
 doc/dev-cluster.md how to run a RonDB 26.10 cluster for development
 doc/releasing.md   how a release is checked, built, tagged and published
 CHANGELOG.md       what each release brought
-legacy-c/          the original iClaustron C code, unchanged, unbuilt, for reference
 ```
 
 ## Building
@@ -64,8 +63,7 @@ cargo xtask install /usr/local        # or any prefix
 
 ## License
 
-MIT, see [LICENSE](LICENSE). New code is copyright Hopsworks and/or its affiliates. The
-C code under `legacy-c/` is copyright Hopsworks AB, to which iClaustron AB
-moved its copyright, keeps its original GPLv2 notices, and is not part of
-any build or release. Rust files that are translations of that C code
-carry both copyright lines, the C code's years and the translation's.
+MIT, see [LICENSE](LICENSE). New code is copyright Hopsworks and/or its
+affiliates. Rust files that are translations of the original iClaustron
+C code carry both copyright lines, the C code's years and the
+translation's.

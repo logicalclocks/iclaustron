@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Fetching a table's description from the data nodes
-//! (`legacy-c/api/ic_apid_handle_dict_messages.ic` holds the C's
+//! (`main:api/ic_apid_handle_dict_messages.ic` holds the C's
 //! handlers for the answers).
 //!
 //! The API never creates tables; that is done through a MySQL server.

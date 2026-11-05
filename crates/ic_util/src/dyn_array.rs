@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! A growable byte buffer with positioned reads and writes
-//! (`IC_DYNAMIC_ARRAY`, `legacy-c/util/ic_dyn_array.c`). Used to collect
+//! (`IC_DYNAMIC_ARRAY`, `main:util/ic_dyn_array.c`). Used to collect
 //! a configuration blob or a protocol reply whose length is not known in
 //! advance.
 //!

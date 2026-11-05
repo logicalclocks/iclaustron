@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The few string helpers that have no direct equivalent in the Rust
-//! standard library (`legacy-c/util/ic_string.c`).
+//! standard library (`main:util/ic_string.c`).
 //!
 //! `IC_STRING` itself is not translated. It was a pointer, a length and
 //! a flag saying whether the text was NUL terminated, which is what Rust

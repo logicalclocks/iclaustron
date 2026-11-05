@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The conversation with a management server
-//! (`legacy-c/api/ic_apic_conf_read_proto.ic`).
+//! (`main:api/ic_apic_conf_read_proto.ic`).
 //!
 //! An API node starts knowing only a connectstring. It connects to a
 //! management server, asks for a node id, asks for the configuration,

@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The object map (`IC_DYNAMIC_PTR_ARRAY`,
-//! `legacy-c/util/ic_dyn_array.c`): objects in, ids out, and the object
+//! `main:util/ic_dyn_array.c`): objects in, ids out, and the object
 //! back from the id.
 //!
 //! An id is an index plus a generation, in 64 bits: the low 24 bits

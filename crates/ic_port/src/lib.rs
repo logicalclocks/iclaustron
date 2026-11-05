@@ -6,10 +6,10 @@
 
 //! `ic_port`: the portability layer.
 //!
-//! Translates `legacy-c/port/ic_port.c`, `legacy-c/include/ic_port.h`,
-//! the constants of `legacy-c/include/ic_base_header.h`, and, because the
+//! Translates `main:port/ic_port.c`, `main:include/ic_port.h`,
+//! the constants of `main:include/ic_base_header.h`, and, because the
 //! C port layer used them and Rust crates cannot depend upwards, also
-//! `legacy-c/util/ic_err.c` and `legacy-c/util/ic_debug.c`. Everything
+//! `main:util/ic_err.c` and `main:util/ic_debug.c`. Everything
 //! that touches the operating system or that glib used to provide lives
 //! here and nowhere else.
 //!

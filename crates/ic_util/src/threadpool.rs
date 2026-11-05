@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The thread pool (`IC_THREADPOOL_STATE`,
-//! `legacy-c/util/ic_threadpool.c`): numbered threads with a stop flag
+//! `main:util/ic_threadpool.c`): numbered threads with a stop flag
 //! each, a way to wake one, and an optional handshake at startup.
 //!
 //! The Data API runs its send threads, receive threads and heartbeat

@@ -5,7 +5,7 @@
 //! The signal header and the layout of a message on the wire.
 //!
 //! This format has not changed since NDB 7.2, so the C framing in
-//! `legacy-c/api/ic_apid_send_message.ic` is a sound reference for it,
+//! `main:api/ic_apid_send_message.ic` is a sound reference for it,
 //! cross-checked here against RonDB 26.10's framing.
 //! Verify: chapter 05 §17.6.
 //!

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Hopsworks and/or its affiliates.
 // Licensed under the MIT License. See LICENSE in the repository root.
 
-//! The per-thread connection object (`legacy-c/api/ic_apid_conn.ic`,
+//! The per-thread connection object (`main:api/ic_apid_conn.ic`,
 //! `IC_INT_APID_CONNECTION`, and `ic_apid_exec_message.ic`,
 //! `ic_poll_messages`).
 //!

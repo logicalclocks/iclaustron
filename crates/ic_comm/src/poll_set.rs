@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Waiting on many sockets at once (`IC_POLL_SET`,
-//! `legacy-c/comm/ic_poll_set.c`), over `epoll` on Linux and `kqueue` on
+//! `main:comm/ic_poll_set.c`), over `epoll` on Linux and `kqueue` on
 //! macOS and the BSDs.
 //!
 //! A receive thread owns one poll set holding the sockets of the data

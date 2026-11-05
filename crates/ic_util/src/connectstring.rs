@@ -3,7 +3,7 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Parsing an NDB connectstring
-//! (`legacy-c/util/ic_parse_connectstring.c`).
+//! (`main:util/ic_parse_connectstring.c`).
 //!
 //! A connectstring names the management servers to ask for the cluster
 //! configuration. The forms accepted are those a RonDB operator already

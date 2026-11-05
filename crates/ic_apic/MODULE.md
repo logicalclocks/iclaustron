@@ -4,7 +4,7 @@ See `doc/rust/03-module-map.md` for the file-by-file mapping.
 
 ## Source files translated
 
-| C file (legacy-c/) | Rust module | Mode | Status |
+| C file (branch `main`) | Rust module | Mode | Status |
 |---|---|---|---|
 | | | | Phase 0: nothing yet |
 

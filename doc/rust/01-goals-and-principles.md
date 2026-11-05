@@ -50,7 +50,7 @@ aggregation pushdown.
 
 - The iClaustron Cluster Server, Cluster Manager, Cluster Client, Process
   Controller, bootstrap, configurator, file server and replication server.
-  All existing C code moves unchanged to `legacy-c/` in this repository as
+  The existing C code stays on this repository's branch `main` as
   reference; only the parts named in chapter 03 are translated. (Possibly
   a future project.)
 - Configuration file reading and writing (`.ini` readers, transactional

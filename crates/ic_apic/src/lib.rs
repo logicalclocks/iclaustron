@@ -10,7 +10,7 @@
 //! management server for a node id and for the configuration, and from
 //! the answer it learns which data nodes exist, how to reach each of
 //! them, and the settings that govern its own behaviour. Translates the
-//! read side of `legacy-c/api/ic_apic_*.ic`.
+//! read side of `main:api/ic_apic_*.ic`.
 //!
 //! Modules:
 //! - [`conf_param`]: the parameter ids an API node cares about.
