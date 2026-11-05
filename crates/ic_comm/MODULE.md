@@ -12,7 +12,7 @@ Everything between a socket and the protocol layers above it. See
 | `comm/ic_connection.c` (client half) | `connection.rs` | Redesign | done |
 | `comm/ic_protocol_support.c` | `line_proto.rs` | 1:1 | done |
 | `comm/ic_connection.c` (server half) | — | Out | an API node only connects out |
-| `include/ic_ssl.h` | — | Later | TLS in release 0.3 |
+| `include/ic_ssl.h` | — | Later | TLS, after the first version (chapter 06, "Later") |
 
 ## Deviations from the C code
 

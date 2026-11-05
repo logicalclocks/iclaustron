@@ -467,12 +467,29 @@ fn copy_file(from: &str, to: &str) -> bool {
   }
 }
 
+/// Make `link` in `dir` a symbolic link to `real`, in the same
+/// directory, replacing whatever had the name.
+fn link_to(dir: &str, real: &str, link: &str) -> bool {
+  let path = format!("{}/{}", dir, link);
+  let _ = fs::remove_file(&path);
+  match std::os::unix::fs::symlink(real, &path) {
+    Ok(()) => true,
+    Err(e) => {
+      eprintln!("cannot link {} to {}: {}", path, real, e);
+      false
+    }
+  }
+}
+
 /// Build the C library in release mode and install it under the prefix
 /// given, `/usr/local` if none: the shared and static libraries in
 /// `lib/`, the header in `include/iclaustron/`, and `iclaustron.pc` in
 /// `lib/pkgconfig/`. On Linux the shared library is installed under its
-/// full version with the soname and the plain name linked to it; on
-/// macOS its install name is set to where it was installed.
+/// full version with the soname, `libiclaustron.so.<major>`, and the
+/// plain name linked to it; on macOS as `libiclaustron.<major>.dylib`,
+/// its install name set to that path, with the plain name linked to it.
+/// A program records the major version, so one built against an earlier
+/// major version keeps the library it was built with, if still there.
 fn run_install(rest: &[String]) -> i32 {
   let prefix: String = if !rest.is_empty() {
     rest[0].clone()
@@ -480,6 +497,7 @@ fn run_install(rest: &[String]) -> i32 {
     "/usr/local".to_string()
   };
   let version = env!("CARGO_PKG_VERSION");
+  let major = env!("CARGO_PKG_VERSION_MAJOR");
   let code = run("cargo", &["build", "--release", "-p", "ic_capi"]);
   if code != 0 {
     return code;
@@ -502,13 +520,17 @@ fn run_install(rest: &[String]) -> i32 {
     return 1;
   }
   let libs_private: &str = if cfg!(target_os = "macos") {
-    let installed = format!("{}/libiclaustron.dylib", lib_dir);
+    let real = format!("libiclaustron.{}.dylib", major);
+    let installed = format!("{}/{}", lib_dir, real);
     if !copy_file("target/release/libiclaustron.dylib", &installed) {
       return 1;
     }
     let code = run("install_name_tool", &["-id", &installed, &installed]);
     if code != 0 {
       return code;
+    }
+    if !link_to(&lib_dir, &real, "libiclaustron.dylib") {
+      return 1;
     }
     "-lSystem -lc -lm"
   } else {
@@ -517,11 +539,9 @@ fn run_install(rest: &[String]) -> i32 {
     if !copy_file("target/release/libiclaustron.so", &installed) {
       return 1;
     }
-    for link in ["libiclaustron.so.0", "libiclaustron.so"] {
-      let path = format!("{}/{}", lib_dir, link);
-      let _ = fs::remove_file(&path);
-      if let Err(e) = std::os::unix::fs::symlink(&real, &path) {
-        eprintln!("cannot link {} to {}: {}", path, real, e);
+    let soname = format!("libiclaustron.so.{}", major);
+    for link in [soname.as_str(), "libiclaustron.so"] {
+      if !link_to(&lib_dir, &real, link) {
         return 1;
       }
     }

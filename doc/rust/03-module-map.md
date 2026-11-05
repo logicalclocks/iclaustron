@@ -13,7 +13,7 @@ Line counts are the C sizes and feed the estimates in
 ## Workspace layout
 
 ```
-iclaustron/                    (this repository, branch RUST-iclaustron)
+iclaustron/                    (this repository; branch trunk, a branch per release)
   legacy-c/                    # all existing C code, unchanged, unbuilt reference
   Cargo.toml                   # [workspace]
   LICENSE                      # MIT

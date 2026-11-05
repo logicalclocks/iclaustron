@@ -44,6 +44,6 @@ Read in order the first time; afterwards each chapter stands alone.
 
 ## Reference trees
 
-- iClaustron C code: this repository, branch `RUST-iclaustron`, to be
+- iClaustron C code: this repository, branch `RUST-iclaustron` (now `trunk`), to be
   moved unchanged to `legacy-c/` in Phase 0.
 - RonDB 26.10: a RonDB source tree. Read for protocol facts; never copy.

@@ -154,12 +154,12 @@
 /*
  Major version of the C API.
  */
-#define IC_API_VERSION_MAJOR 0
+#define IC_API_VERSION_MAJOR 1
 
 /*
  Minor version of the C API.
  */
-#define IC_API_VERSION_MINOR 1
+#define IC_API_VERSION_MINOR 0
 
 /*
  Patch version of the C API.

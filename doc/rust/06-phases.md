@@ -2346,6 +2346,44 @@ Weighed in phase 11 and kept for later (the author, 2026-10-22): a
 Rust stream over the scan reader, with the Rust futures over executors
 (chapter 04, "Kept for later").
 
+**Release 1.0.0** (the author, 2026-11-05) is cut after phase 11, on a
+branch of its own, `1.0.0`, which takes the fixes to the release;
+`trunk` (until then `RUST-iclaustron`) is the development branch, and
+every change goes to both. 0.2 and 0.3 were never tagged: what they
+were to hold is in 1.0. How a release is made: `doc/releasing.md`.
+
+**Data nodes of RonDB 26.02** (looked at 2026-11-05). Release 1.0
+needs data nodes of 26.10.0 or later; the author asked whether the bar
+could be 26.02.9. Three things it uses are missing from 26.02.9, and
+the first two from every 26.02 so far (26.02.13 in development):
+- The collation request (signals 984–986, chapter 05 §8.2). 26.02's
+  highest signal number is 951, and a data node stops on a signal
+  numbered past its highest. The request goes out the first time a
+  table with a character column is bound, so nearly any table would
+  stop a node.
+- Integer columns read into registers by their types (RonDB
+  bab40b92982, chapter 05 §9.2). 26.02 fills a column of 32 bits or
+  fewer out with zeros, so a negative value compares through a register
+  as a large positive one, and a BIGINT UNSIGNED above 2^63 as a
+  negative one: wrong answers, no error. Only a comparison with an
+  integer, an input or a sum goes through registers; column tests and
+  assignments are right.
+- A scan that names no owning record, as every committed read of ours
+  does (chapter 05 §7.2, word 8): 26.02.9's coordinator requires a
+  valid owner and stops the node. Mended by d9f777a6847, in 26.02 as
+  5f1e93882a3, first released in 26.02.12.
+
+Everything else 1.0 relies on is in 26.02.9 already: release ids,
+which a coordinator without them reads past; the dropped-table notice
+(26.02.5); fanout tables; the instructions 71, 72 and 121; every
+configuration parameter we read; the socket handshake; the dictionary's
+keys; and our announced 26.10.0, which a data node accepts from any API
+node of its own version or newer. Smaller in 26.02 but not a dependency:
+a row of at most 7 500 words, against 18 000 (chapter 05 §13), so the
+`big_rows` group cannot run there. The author is to bring the first two
+to 26.02 later; the bar is then the first 26.02 release that has them,
+and chapter 01's "no version gating" is to be weighed again.
+
 ## Working method per module (all phases)
 
 1. Read the C header and source; copy the header prose into Rust doc

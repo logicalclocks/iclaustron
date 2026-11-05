@@ -5,10 +5,10 @@ read and write rows of a RonDB cluster directly, as an API node: by
 primary key and by unique key, in transactions, and by scans of tables
 and of ordered indexes, with conditions and updates that run on the
 data nodes. It is written in Rust and has a C API; this guide covers
-both, against RonDB 26.10. Release 0.1 had the key operations; the
-guide also covers what came after it, on the way to 0.2 (executors and
-scans, section 5) and 0.3 (programs, section 6; AUTO_INCREMENT and
-tables without a primary key, section 7).
+both, against RonDB 26.10, as of release 1.0: the key operations of
+0.1, executors and scans (section 5), programs (section 6), and
+AUTO_INCREMENT and tables without a primary key (section 7). What
+changed from release to release is in [`CHANGELOG.md`](../CHANGELOG.md).
 
 The examples in `examples/` are the same eleven programs in Rust and in
 C, and the guide quotes them. The C API's reference is its header,
@@ -32,13 +32,17 @@ development cluster on one machine.
 
 ### Building and linking
 
-From Rust, depend on the crates by path or git:
+From Rust, depend on the crates by path or git, at a release's tag:
 
 ```toml
 [dependencies]
-ic_apid = { git = "https://github.com/iClaustron/iclaustron", branch = "RUST-iclaustron" }
-ic_port = { git = "https://github.com/iClaustron/iclaustron", branch = "RUST-iclaustron" }
+ic_apid = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.0.0" }
+ic_port = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.0.0" }
 ```
+
+A release's fixes go to its branch (`1.0.0`), and development to
+`trunk`; name `branch = "1.0.0"` in place of the tag to follow the
+fixes.
 
 and name each item from its module, as the examples do:
 
@@ -59,6 +63,12 @@ cc -o prog prog.c $(pkg-config --cflags --libs iclaustron)
 ```c
 #include <iclaustron/ic_apid.h>
 ```
+
+A program records the library's major version, `libiclaustron.so.1` on
+Linux and `libiclaustron.1.dylib` on macOS, and runs with any 1.x. One
+built against 0.1, whose ids were 32 bits, is to be built again.
+`ic_api_version` gives the version at run time, `IC_API_VERSION_MAJOR`
+and its two neighbours the one a program was compiled with.
 
 ## 2. Connecting
 
@@ -199,7 +209,7 @@ field, or for a query through a unique index every indexed field. One
 record covering every field serves as both.
 
 **Blob columns** (BLOB, TEXT, JSON, GEOMETRY) are not read or written in
-0.1: a table that has one can be bound and used, but records leave the
+1.0: a table that has one can be bound and used, but records leave the
 column out (a default record does so by itself), and deleting a row of
 such a table is refused (`IC_ERROR_DELETE_WITH_BLOBS`, 7153), since
 its blob's parts would be left behind.

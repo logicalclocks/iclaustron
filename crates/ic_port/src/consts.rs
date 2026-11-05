@@ -117,10 +117,34 @@ pub const IC_STOP_CHECK_TIMER: u32 = 3;
 /// Size of error message buffers.
 pub const IC_ERROR_MSG_BUF_SIZE: usize = 512;
 
-/// iClaustron version number.
-pub const IC_VERSION: u32 = 0x00_0100;
+/// A decimal number written out, read when the crate is compiled.
+const fn decimal(text: &str) -> u32 {
+  let bytes = text.as_bytes();
+  let mut value: u32 = 0;
+  let mut i = 0;
+  while i < bytes.len() {
+    value = value * 10 + (bytes[i] - b'0') as u32;
+    i += 1;
+  }
+  value
+}
+
+/// iClaustron's major version, from the workspace's `Cargo.toml`, the
+/// one place the version is kept.
+pub const IC_VERSION_MAJOR: u32 = decimal(env!("CARGO_PKG_VERSION_MAJOR"));
+/// iClaustron's minor version, from `Cargo.toml`.
+pub const IC_VERSION_MINOR: u32 = decimal(env!("CARGO_PKG_VERSION_MINOR"));
+/// iClaustron's patch version, from `Cargo.toml`.
+pub const IC_VERSION_PATCH: u32 = decimal(env!("CARGO_PKG_VERSION_PATCH"));
+/// iClaustron version number, `(major << 16) | (minor << 8) | patch`.
+pub const IC_VERSION: u32 =
+  (IC_VERSION_MAJOR << 16) | (IC_VERSION_MINOR << 8) | IC_VERSION_PATCH;
 /// iClaustron version string.
-pub const IC_VERSION_STR: &str = "iclaustron-0.1.0";
+pub const IC_VERSION_STR: &str =
+  concat!("iclaustron-", env!("CARGO_PKG_VERSION"));
+
+// The minor and the patch have a byte each in IC_VERSION.
+const _: () = assert!(IC_VERSION_MINOR < 256 && IC_VERSION_PATCH < 256);
 /// NDB version announced to the cluster: RonDB 26.10.0 encoded as
 /// `(major << 16) | (minor << 8) | build`.
 /// Verify: chapter 05 §17.1.
@@ -214,6 +238,15 @@ mod tests {
     assert_eq!(ic_align(4, 4), 4);
     assert_eq!(ic_align(5, 4), 8);
     assert_eq!(ic_align(10, 4), 12);
+  }
+
+  #[test]
+  fn version_number_and_string_agree() {
+    let major = IC_VERSION >> 16;
+    let minor = (IC_VERSION >> 8) & 0xFF;
+    let patch = IC_VERSION & 0xFF;
+    let text = format!("iclaustron-{}.{}.{}", major, minor, patch);
+    assert_eq!(IC_VERSION_STR, text);
   }
 
   #[test]

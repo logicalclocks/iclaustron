@@ -2,14 +2,19 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! The shared library's name as a program linked with it records it:
-//! `libiclaustron.so.0` on Linux, the major version in the soname, and
-//! `@rpath/libiclaustron.dylib` on macOS, which `cargo xtask install`
-//! turns into the installed path.
+//! on Linux the soname, `libiclaustron.so.` and the major version from
+//! Cargo.toml (`libiclaustron.so.1`); on macOS `@rpath/libiclaustron.dylib`,
+//! the name of the file in `target/`, which `cargo xtask install` turns
+//! into the installed path, `libiclaustron.1.dylib`.
 
 fn main() {
   let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+  let major = env!("CARGO_PKG_VERSION_MAJOR");
   if os == "linux" {
-    println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,libiclaustron.so.0");
+    println!(
+      "cargo:rustc-cdylib-link-arg=-Wl,-soname,libiclaustron.so.{}",
+      major
+    );
   } else if os == "macos" {
     println!(concat!(
       "cargo:rustc-cdylib-link-arg=-Wl,-install_name,",

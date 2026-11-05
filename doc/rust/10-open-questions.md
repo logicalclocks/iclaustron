@@ -19,7 +19,7 @@
 | Tests | designed for the developer to run with `cargo test` and an env var for the cluster |
 | Interpreter | the full RonDB 26.10 interpreter may be targeted; revised 2026-10-08: a basic interpreter in 0.3, after scans, the rest later |
 | Option parsing | our own table-driven parser |
-| Repository | this repository, branch `RUST-iclaustron`; **all** existing C code moves unchanged to `legacy-c/` and stays there for now as reference; the Rust workspace takes the root; root `LICENSE` becomes MIT |
+| Repository | this repository, branch `RUST-iclaustron`, renamed `trunk` for development on 2026-11-05, with each release on a branch of its own (`1.0.0`); **all** existing C code moves unchanged to `legacy-c/` and stays there for now as reference; the Rust workspace takes the root; root `LICENSE` becomes MIT |
 | BLOBs | skipped for the moment; tables with BLOB columns can be bound, the BLOB columns themselves cannot be read or written (`IC_ERROR_NOT_SUPPORTED`); 2026-10-08: deletes on such tables are refused too, since the parts would be left behind; BLOBs are phase 10; later, after the first version, since 2026-10-20 |
 | Receive threads | count fixed at connect (`GlobalOptions.receive_threads`) |
 | Error texts | progressive: codes and classification first, texts added over time, fallback `"NDB error <code>"` |

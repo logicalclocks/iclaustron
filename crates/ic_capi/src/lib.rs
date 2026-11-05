@@ -73,15 +73,22 @@ use ic_apid::scan_reader::ScanShape;
 use ic_apid::text_row;
 use ic_apid::transaction::CommitState;
 use ic_apid::transaction::TransactionHint;
+use ic_port::consts::IC_VERSION_MAJOR;
+use ic_port::consts::IC_VERSION_MINOR;
+use ic_port::consts::IC_VERSION_PATCH;
 use ic_port::err;
 use ic_port::IcError;
 use ic_signals::key_ops;
 use ic_signals::table_props;
 
+// The header's numbers. cbindgen copies only literals, so they are
+// written out here and checked against Cargo.toml's in ic_api_version
+// when the crate is compiled.
+
 /// Major version of the C API.
-pub const IC_API_VERSION_MAJOR: u32 = 0;
+pub const IC_API_VERSION_MAJOR: u32 = 1;
 /// Minor version of the C API.
-pub const IC_API_VERSION_MINOR: u32 = 1;
+pub const IC_API_VERSION_MINOR: u32 = 0;
 /// Patch version of the C API.
 pub const IC_API_VERSION_PATCH: u32 = 0;
 
@@ -1118,6 +1125,12 @@ pub unsafe extern "C" fn ic_api_version(
   minor: *mut u32,
   patch: *mut u32,
 ) {
+  // The numbers the header was given are the package's (Cargo.toml).
+  const _: () = assert!(
+    IC_API_VERSION_MAJOR == IC_VERSION_MAJOR
+      && IC_API_VERSION_MINOR == IC_VERSION_MINOR
+      && IC_API_VERSION_PATCH == IC_VERSION_PATCH
+  );
   if !major.is_null() {
     // SAFETY: caller guarantees a valid, writable u32.
     unsafe { *major = IC_API_VERSION_MAJOR };
