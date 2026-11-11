@@ -1125,6 +1125,90 @@ fail the node, if they fail it at all.
   time when the connection let go of its records, and the node stopped
   with error 2343 (17.10).
 
+### 6.10 BLOB, TEXT and JSON (phase 12; read 2026-11-11, to be seen live in 12.1)
+
+From the author's model of how the reference keeps a blob column
+(2026-11-11), and the reference read the same day; none of it is seen
+on the wire yet. A blob is the client's work: the data node stores a
+main row and the rows of a parts table, and knows nothing joining them.
+
+- **Which columns.** Types Blob (20) and Text (21); MySQL's BLOB, TEXT,
+  JSON and GEOMETRY are all one of the two. In the main row the column
+  is variable-sized with a 2-byte length, and holds a head and the first
+  bytes of the value, its inline bytes. NULL in the column is a NULL
+  value; an empty value has a head with length 0.
+- **The head, second version**: 16 bytes, little-endian. A 16-bit size,
+  which counts the bytes after it, 14 plus the inline bytes there are,
+  and is the column's 2-byte length; 16 bits reserved, 0; a 32-bit part
+  key id, always 0; the value's whole length, 64 bits. The inline bytes
+  follow, as many as the length or the inline size allows, the smaller.
+  The first version is not used by MySQL's tables and is not read.
+- **Sizes.** Inline size *I*, part size *P* and stripe *S* are kept in
+  the column's precision, scale and length. MySQL gives every BLOB and
+  TEXT type 256 inline bytes, and parts of 2 000 bytes (BLOB, TEXT),
+  4 000 (MEDIUM) or 13 948 (LONG, and GEOMETRY); JSON has 4 000 inline
+  bytes and parts of 8 100; TINYBLOB and TINYTEXT have part size 0 and
+  no parts table. MySQL's stripe is always 0.
+- **The parts table**, `NDB$BLOB_<table id>_<column id>`, in the main
+  table's database, schema `def`. Its columns, in order: the main
+  table's primary key columns, copied, each a distribution key if it is
+  one in the main table (all of them when the main table names none);
+  `NDB$DIST`, only when the stripe is not 0; `NDB$PART`, a 32-bit
+  unsigned part number, key but not distribution key; `NDB$PKID`, 32
+  bits, always 0; `NDB$DATA`, a long variable-sized binary (Blob) or
+  character (Text) column of *P* bytes, or, for a column stored on
+  disk, a fixed binary or character column of *P* bytes padded with
+  0x00 or 0x20. Its key is the main key and the part number, and with
+  stripe 0 its rows hash as their main row does, so they lie in its
+  partition. It takes the main table's logging, fragment count and
+  type, hash map, read-backup and full-replication settings and
+  tablespace, but not a fanout table's hashing, nor a TTL or a ring
+  buffer.
+- **Part arithmetic.** Bytes past the inline ones lie in parts: part *k*
+  holds bytes *I + kP* up to *I + (k+1)P − 1*, so the byte at position
+  *pos ≥ I* is in part ⌊(*pos* − *I*)/*P*⌋, and a value of length *L >
+  I* has ⌈(*L* − *I*)/*P*⌉ parts, the last perhaps short; one of length
+  *L ≤ I* has none.
+- **Errors.** A part read that finds no row (626) is a corrupted value,
+  4267. A value longer than the inline size in a column with no parts
+  table is refused with 4266.
+- **How the reference runs an operation.** It reads the head with a
+  shared lock before an update, a write or a delete, ignoring its error
+  for a write, and writes the parts in the next batch, once the head is
+  back; an insert writes its parts in its first batch, unless it
+  ignores errors, when it waits for the main insert to succeed. It
+  reads parts with a simple read, not committed: the main row's lock
+  does not fully protect them, since a data node commits each row of a
+  transaction on its own. A committed or simple read of a blob column
+  it turns into a shared read of the main row, with bit 20 of the flags
+  word set (§6.8) and its lock reference read, and unlocks the row
+  after the parts; through a unique index it reads no lock reference,
+  and the lock is held to the commit.
+- **A simple read** (the simple flag without the dirty one, §6.4) takes
+  a shared lock and lets it go once the row is read.
+- **The lock reference** (pseudo column 0xFFEE), read beside a locked
+  read, is three words: the data node's id in bits 16–31 and the
+  fragment id in bits 0–15; the coordinator's index for the locking
+  operation; and the low 32 bits of the data node's own number for that
+  operation.
+- **The unlock** is a `KEY_OP_REQ` of operation type 7 in the same
+  transaction, on the main table, with the distribution key flag (bit
+  2) set and the lock reference's first word as its distribution key
+  word, by which the coordinator sends it to that node and fragment;
+  its key section is the lock reference's other two words. The data
+  node finds the locking operation by them within the transaction,
+  checks it, and lets its lock go; a key of other than two words is
+  refused with 4109. The reference sends it as a committed read that
+  aborts on error.
+- **Asked of the author (2026-11-11).** How we run each operation, the
+  rounds, and why, are in chapter 06, phase 12: part writes in the
+  second round (1), parts read with a simple read (2), the commit on
+  the last round (3), a committed read committed first, with a flag to
+  lock first (4), 1 MiB of parts per query in a round (5), an insert
+  ignoring errors only when its abort option asks, its parts then in
+  the second round (6), unique keys by the primary key read through the
+  index (7).
+
 ## 7. Scans
 
 ### 7.1 The exchange (the author, 2026-10-15)
@@ -2093,8 +2177,8 @@ BLOB/TEXT: the main table holds a head plus inline data (V2 head 16
 bytes: u16 varsize, u16 reserved, u32 pkid, u64 length, little-endian);
 the rest is in a parts table `NDB$BLOB_<tableid>_<colno>` with columns =
 main PK, `NDB$PART`, `NDB$PKID`, `NDB$DATA`, sharing the main table's
-partitioning. BLOB support is not scheduled; records must leave BLOB
-columns out.
+partitioning (§6.10). BLOB support is phase 12 (chapter 06); until it
+is built, records leave blob columns out.
 
 ### 8.2 Describing a collation, and its weights (signals 984–986, 2026-10-08)
 

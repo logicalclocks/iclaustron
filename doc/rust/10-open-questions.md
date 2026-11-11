@@ -84,6 +84,20 @@
 |---|---|
 | Stale ids | a stale id is never followed: ids are 64 bits, a 24-bit slot index and a 40-bit generation, and a slot whose generation would wrap is retired; each scan batch has an id of its own, so one handed back names nothing. The C ABI changed with it (`IC_QUERY_ID`, `IC_TRANS_ID`, `IC_SCAN_ID` to `uint64_t`, `IC_NO_TRANS` 0, `ic_apid_scan_batch_scan(conn, batch)`), and programs built against the earlier header are to be built again; the wire is unchanged (chapter 04, "Ids") |
 
+## Decided (2026-11-11), for phase 12
+
+| Topic | Decision |
+|---|---|
+| BLOB, TEXT and JSON | move from Later to phase 12: read and written whole, by key, on a connection, through an executor and with the synchronous helpers; the second blob layout only (chapter 06, phase 12) |
+| Part writes | in the second round, with the deletes, never beside the main row in the first, so that every operation locks the main row before its parts |
+| Part reads | a simple read, the lock taken and let go of in the read: the main row's lock does not fully protect the parts |
+| The commit | rides on the last round |
+| Committed reads | the main row read committed first, one round when the value is inline; three with parts. A flag on the query, `blob_lock_first`, locks first: two rounds always |
+| Round size | at most 1 MiB of part data per BLOB query in a round (`GlobalOptions::blob_round_bytes`) |
+| Unique keys | the primary key read through the index first, with the operation's lock, then as by primary key |
+| Inserts that ignore errors (was Q14) | an insert has a flag for it, its abort option, which by default does not ignore them: one round. One that ignores them sends the main insert alone in round 1, and its parts with the commit in round 2 only if the row went in |
+| The API's shape | ours to choose: each value belongs to its query, a blob field takes no room in a row, the executor swaps buffers, new synchronous helpers; the C ABI only grows (chapter 06, phase 12, "The API") |
+
 ## Still open
 
 The recommendation is the default and the plan proceeds on it unless

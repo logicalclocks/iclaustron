@@ -136,7 +136,7 @@ ret = ic_record_create(table, specs, 3, sizeof(struct my_row), &rec);
   doubles on eight, the row rounded to eight bytes. Without ids it takes
   every field but the blob columns.
 - A record naming a blob column is refused (`IC_ERROR_NOT_SUPPORTED`);
-  blob columns wait for later (chapter 06).
+  blob columns wait for phase 12, whose planned API is in chapter 06.
 - A record over the key fields serves as a key record; one covering
   every key field serves as key and attribute record alike.
 - `text_row::put_value` and `value_text` put a value given as text into
@@ -181,7 +181,7 @@ then, into the connection's staged buffer, and goes with the next send.
 - `WriteKind`: `Update`, `Write`, `Insert`, `Delete`. An insert or write
   through a unique index is refused, and so is an update through one
   whose values hold an indexed column (Q12). A delete on a table with a
-  blob column is refused until blobs are built.
+  blob column is refused until blobs are built (phase 12).
 - `AbortOption`: `Default` (abort on error for a write, ignore it for a
   read), `AbortOnError`, `IgnoreError`; a committed read only ignores.
 - `BatchHint`: `None`, `Safe`, `Unsafe` (bits 22 and 23 of the request).

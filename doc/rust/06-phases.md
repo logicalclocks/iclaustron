@@ -21,7 +21,8 @@ release is at the end of Phase 7.
 | 9 | 0.3: basic interpreter, AUTO_INCREMENT, tables without a primary key | 4–5 | 44 |
 | 10 | Scans completed: four receivers per fragment for committed reads, a fanout table's scans pruned, closing a scan at once | 2 | 46 |
 | 11 | Hardening, and what early applications need | open | |
-| Later | After the first version: TLS, location domains, BLOBs, neighbour-weighted collations, the C++ header, events, DDL, pushdown joins, … | open | |
+| 12 | BLOB, TEXT and JSON by key, in all three models | about 7 | |
+| Later | After the first version: TLS, location domains, scans of BLOBs, neighbour-weighted collations, the C++ header, events, DDL, pushdown joins, … | open | |
 
 **Replanned 2026-10-08** by the author. 0.1 is now the key operations
 made complete and the C API with its documentation and examples; the
@@ -37,6 +38,10 @@ is the three scan items left from phase 8, and then the work stops to
 harden the code and to see whether early applications need anything
 more (phase 11). Much of the rest is not needed in a first version and
 is later, after it. Phase 10's size is an estimate of ours.
+
+**Planned 2026-11-11** by the author, after release 1.0.0: BLOB, TEXT
+and JSON by key move from Later into phase 12, whose size is an
+estimate of ours. It goes to `trunk` only, for release 1.1.0.
 
 ## Phase 0 — Bootstrap and header rewrite (1–2 weeks)
 
@@ -2327,12 +2332,299 @@ the two disagreed; what followed from those places is here too.
   free records of a link gone.
 - Tests: to be run, with the fuzz targets.
 
+## Phase 12 — BLOB, TEXT and JSON (about 7 weeks)
+
+Planned with the author on 2026-11-11, from the author's model of how
+the reference keeps a blob column (chapter 05 §6.10): BLOB, TEXT, JSON
+and GEOMETRY columns, read and written whole, by primary key and
+through a unique index, in the three ways a program runs key
+operations: on a connection, through an executor, and with the
+synchronous helpers. Only the second version of the blob layout. Scans
+of such columns stay later.
+
+Phase 12 is built on `trunk` alone, not on `1.0.0`, and is released
+from `trunk` as 1.1.0, blob support for key operations (the author,
+2026-11-11). Fixes go to both branches as before.
+
+### How each operation goes
+
+The author's rules (2026-11-11): an insert is one round trip in one
+transaction. A write reads the main row as it writes it, and cannot
+commit in that round, since the old value's surplus parts may need
+deleting; an update goes as a write and fails if the row is missing. A
+delete first reads the main row with an exclusive lock, then deletes
+everything in one round trip. A locked read takes two rounds without
+parts and three with them; a committed read locks the main row, reads
+the parts and unlocks it.
+
+What the plan asked, as the author answered it the same day:
+
+1. **Parts are written in the second round**, with the deletes, never
+   beside the main row in the first. Operations on different rows of
+   one batch run in no set order, and two transactions' batches
+   interleave at the data node, so a part written in the first round
+   could be locked before its main row: two writers of one row would
+   then wait for each other until the deadlock timeout (266). The
+   second round is there anyway for the deletes and the commit, and an
+   update that fails sends no part data.
+2. **Parts are read with a simple read**: each part's lock is taken and
+   let go of in the read itself. The main row's lock does not fully
+   protect the parts, since a data node commits each row of a
+   transaction on its own, and a committed read of a part could see a
+   writer's new part beside the old main row.
+3. **The commit rides on the last round.** A transaction asked to commit
+   holds the commit until each of its BLOB queries has sent its last
+   round, and sends it with that round.
+4. **A committed read reads the main row committed first**: one round
+   when the whole value is inline, which is the common case. A value
+   with parts takes three: the main row read again with a shared lock
+   and its lock reference, then the parts, with the unlock or the
+   commit. A flag on the query, `blob_lock_first`, takes the lock in the
+   first round instead: two rounds whatever the value.
+5. **At most 1 MiB of part data per BLOB query in a round**
+   (`GlobalOptions::blob_round_bytes`); a larger value goes on in
+   further rounds, the commit with the last.
+6. **An insert ignores errors only when asked to**, by its abort option
+   (`WriteKeyArgs::abort_option`, `IC_WRITE_KEY_ARGS`, an executor's
+   `KeyOp`), whose default for an insert is to abort on error: one
+   round. One that ignores errors takes two (below the table).
+7. **Through a unique index**, which a BLOB table seldom needs to be
+   fast: the first round reads the row's primary key through the index
+   with the lock the operation takes, the heads and inline bytes beside
+   it; from the second round on the operation goes by primary key, its
+   head read done. A read through an index always locks (chapter 05
+   §6.8), so a committed read that way holds its shared lock to the
+   commit, as it does today.
+
+Round trips. **+C** marks where the commit rides when the transaction
+commits; *n* is the new value's number of parts, *old* the old value's.
+
+| Operation | Round 1 | Round 2 | Round 3 | Open transaction | Committing |
+|---|---|---|---|---|---|
+| Insert | main insert (head and inline) and every part insert, +C | | | 1 | 1 |
+| Insert that ignores errors | main insert (head and inline) | every part insert, if the row went in, +C | | 2 | 2 |
+| Write | head read, exclusive, errors ignored; main write | parts 0..n−1 written, n..old−1 deleted, +C | | 1–2 | 2 |
+| Update | as a write, the head read with the update's abort option | as a write, +C | | 1–2 | 2 |
+| Delete | head read, exclusive, of every blob column | main delete, every part deleted, +C | | 2 | 2 |
+| Locked read | main read with the lock asked for | parts read, +C | | 1–2 | 2 |
+| Committed read | main read, committed, +C | main read, shared, with its lock reference | parts read; unlock, or +C | 1 or 3 | 1 or 3 |
+| Committed read, `blob_lock_first` | main read, shared, with its lock reference | parts read; unlock, or +C | | 1–2 | 2 |
+
+- Where the old and the new value both fit inline, a write has nothing
+  for round 2 while the transaction stays open; a committing one sends
+  its commit alone there. So does a locked read whose value is inline.
+- A column with no parts table (part size 0, MySQL's TINYBLOB and
+  TINYTEXT) is a plain column: its operations take one round with no
+  head read, and a value past the inline size is refused with 4266.
+- A write whose head read found no row deletes part *n* in round 2 as
+  well, ignoring the error: a row inserted between the head read and
+  the write would otherwise leave its parts behind. If that part was
+  there, the deletes go on in further rounds until one is missing.
+- An update or a delete of a row not there fails in round 1, as it
+  would without blobs, and sends nothing more.
+- A committed read's commit rides on round 1 only when no other BLOB
+  query of the transaction plans another round. If its value then has
+  parts, rounds 2 and 3 go in a transaction of the driver's own, which
+  it opens and commits; the program's transaction ends only after it.
+  While the program's transaction stays open, they go in that one.
+- **Lock order.** Every operation locks the main row before any of its
+  parts. Inserts are the exception, since no one else can lock a row
+  that is not there yet. Head reads are exclusive, where the reference
+  reads shared and upgrades with the write, and two writers that both
+  hold the shared lock then deadlock.
+- **The unlock** goes only while the transaction stays open, and is not
+  waited for: the query completes with its parts. Once the commit is
+  asked for, the commit unlocks.
+- **An insert that ignores errors** (item 6) may find its row there
+  already, and then its parts must not go in: inserting a part of a row
+  that is there fails, and a part operation aborts on error, so the
+  transaction the program asked to keep would roll back; and parts
+  numbered past the old value's would stay behind as orphans. So, as
+  the reference does it, round 1 sends the main insert alone, and round
+  2 its parts, +C, only if the row went in. An inline value has no
+  parts, and its insert needs no round 2 while the transaction stays
+  open.
+- Known and left: an insert racing a write or an insert of the same new
+  key can deadlock (266) where it would otherwise wait, since its parts
+  go in its first round.
+
+### The driver
+
+One driver, `ic_apid::blob`, in the connection's transaction layer, and
+all three models use it:
+
+- the head's encoding and the part arithmetic (chapter 05 §6.10);
+- a planner, a pure function from what an operation is and what its
+  rounds have returned to the operations of its next round, tested on
+  its own;
+- each BLOB query's run: its round, what is known of the old and the
+  new length, what is left of its budget.
+
+Its operations are not queries the program sees. Head reads, part
+reads, writes and deletes, and the unlock each take a slot in the
+connection's query table, so that their replies are routed by their
+word as any query's are and the transaction counts them as it does
+today; the slots are reused from round to round. A part's key is the
+main row's key words with the part number after them. A part is packed
+straight from the BLOB buffer, and a part read unpacks straight into it
+at the part's offset: no row is allocated for a part.
+
+- A transaction counts its BLOB queries that still plan rounds, and
+  holds a commit asked for until the last of them sends its last round
+  (item 3).
+- The poll plans each BLOB query's next round from the replies it took,
+  and sends the rounds at its end, as it sends what scans ask for. A
+  program that sends once and then polls needs nothing new, nor does
+  the executor, which sends only after it admits.
+- Two BLOB queries on one row (one table, the same key words) in one
+  transaction run one after the other, in the order they were defined;
+  others run side by side, so many TEXT rows inserted in one
+  transaction still go in one round.
+- A missing part fails its query with 4267. A part operation always
+  aborts on error, so a failed part write rolls the transaction back. A
+  rollback drops the rounds not yet sent, and a node lost fails the
+  transaction as it fails any.
+
+### Dictionary and records
+
+- Binding a table binds each blob column's parts table,
+  `<database>/def/NDB$BLOB_<table id>_<column id>` (a stored name, as
+  `$PK` is), and both are let go of together. The inline size, the part
+  size and the stripe come from the column's precision, scale and
+  length.
+- A blob column is usable if it is of the second version, its stripe is
+  0, and its parts table is there or it has none (part size 0), on a
+  table neither partitioned by the user nor with a TTL or ring-buffer
+  option. Naming another in a record is refused, and a delete on its
+  table keeps 7153.
+- A blob field in a record takes no room in the row, only its null bit.
+  `Record::default_for(&table, None)` still leaves blob columns out, so
+  a program written before is unchanged and no slower; naming the field
+  opts in. Records naming blob fields are taken by key queries, by
+  `OpShape` and by the new helpers, and refused by scans, takeovers,
+  key records and the helpers there are now.
+
+### The API
+
+The shape is ours to choose (chapter 10, 2026-11-11): each value
+belongs to its query, as rows do.
+
+- On a query: `blob(field)`, which gives `Option<&[u8]>`, `None` for
+  NULL; `set_blob(field, &[u8])`, `set_blob_null(field)`, and
+  `blob_buf_mut(field)` to fill the buffer in place;
+  `set_blob_lock_first(bool)` for a committed read (item 4). In C,
+  `ic_apid_query_blob`, `ic_apid_query_set_blob`,
+  `ic_apid_query_set_blob_null`, `ic_apid_query_blob_buffer` and
+  `ic_apid_query_set_blob_lock_first`.
+- On an executor's `KeyOp`, the same calls. `define_op` swaps its
+  buffers into the pooled query and `complete_op` swaps them back, so
+  nothing is copied, and a buffer keeps its capacity, so that a run
+  after the first allocates nothing. In C, `ic_request_blob` and its
+  setters.
+- Synchronous: `key_op::read_committed_blobs` and
+  `key_op::write_key_blobs`, given a `BlobValues` holder with the same
+  calls, and built on the transaction API as `read_unique_committed`
+  is: a query per call, `wait_for_end`, the transaction always closed.
+  In C, `IC_BLOB_VALUES` (`ic_blob_values_create`,
+  `ic_blob_values_free`), `ic_apid_conn_read_committed_blobs` and
+  `ic_apid_conn_write_key_blobs`. `key_op::write_key` deletes from a
+  table with blob columns, in two rounds, where it refused with 7153.
+- `GlobalOptions::blob_round_bytes`, 1 MiB by default (item 5); in C a
+  field appended to `IC_GLOBAL_OPTIONS`, which is read field by field.
+- Every C call is an addition and no argument struct grows, since a
+  shorter one is refused (§11.2, item 3): that is why the lock-first
+  flag is set on the query and not in `IC_READ_KEY_ARGS`. The library's
+  major version stays.
+
+### The three models
+
+- **On a connection**: a BLOB query stays sent until its last round,
+  then completes once, by its callback or in the executed list.
+- **Through an executor**: a request is a transaction and completes when
+  it ends, as now; the commit asked for at admission waits inside the
+  connection. A request of several rounds counts once towards
+  `in_flight`, and the statistics count rounds.
+- **Synchronous**: the two helpers above, each a transaction of its own.
+
+### 12.1 The protocol, seen and written down (3 days)
+
+Captures of a MySQL server inserting, updating, replacing, deleting and
+selecting TEXT, JSON and LONGBLOB values, at read committed (which it
+reads with a shared lock and then unlocks) and with a shared lock, read
+with our dissector, which learns the parts tables' requests and the
+unlock. Chapter 05 §6.10 completed from them. Exit: every fact of
+§6.10 seen on the wire, or marked as not.
+
+### 12.2 Dictionary, records, `BlobValues` (3 days)
+
+Exit: unit tests of the head and of the part arithmetic at every
+boundary; a table with TEXT, JSON, LONGBLOB, TINYBLOB and a BLOB stored
+on disk binds with its parts tables and the sizes MySQL gave them; the
+columns that are not usable are refused by name.
+
+### 12.3 The driver, and inserts on a connection (1.5 weeks)
+
+The planner, the commit held, the poll sending rounds, part operations
+as the connection's own. Exit: values of 0, 1, I−1, I, I+1, I+P and
+I+P+1 bytes, 1 MiB and 10 MiB, inserted by us, read back byte for byte
+through MySQL; a disk-stored BLOB's last part padded and read back
+right; many TEXT rows inserted in one transaction in one round, seen in
+a capture.
+
+### 12.4 Write, update, delete (1 week)
+
+Exit: a value grown, shrunk, set NULL and set empty leaves exactly the
+parts it should, counted by scanning its parts table; a delete leaves
+none; writes racing inserts of the same keys leave no part past any
+value's length; an update of a missing row fails and sends nothing
+more; a data node stopped during large writes leaves no part past any
+value's length.
+
+### 12.5 Locked and committed reads, the lock reference, the unlock (1 week)
+
+Exit: values written by MySQL read back the same; readers and writers
+of the same rows, with values that check themselves, give no torn value
+and no 266; a committed read of an inline value takes one round, and
+one with `blob_lock_first` two, seen in a capture.
+
+### 12.6 The executor and the synchronous helpers (3 days)
+
+Exit: the cases of 12.3 to 12.5 through an executor and through the
+helpers; a request of many BLOB operations on many rows.
+
+### 12.7 Unique keys (3 days)
+
+Exit: reads, updates and deletes through a unique index of a table with
+blob columns, checked as by primary key.
+
+### 12.8 C ABI, chapter 04, the user guide, examples in Rust and C (3 days)
+
+Exit: the C API test reads and writes blob values; the examples build
+and run.
+
+### 12.9 Measured (2 days)
+
+`ic_bench` with a TEXT column of 200 B, 4 KB and 100 KB; chapter 12
+updated.
+
+The tests are the integration group `blob`, beside unit tests of the
+head, the arithmetic, the planner and the commit held.
+
+### Not in this phase
+
+Scans of blob columns, and takeovers (the next step after this phase);
+reading or writing part of a value, and streaming; appending; events;
+stripes above 0; tables partitioned by the user; TTL and ring-buffer
+tables; parts placed beside their row on a fanout table; the first
+blob layout.
+
 ## Later — after the first version
 
 Not needed in a first version (the author, 2026-10-20): TLS to the data
 nodes and the management server; choosing nodes by location domain;
 BLOB, TEXT and JSON through the parts table, and with them deletes on
-such tables; the three collations that weigh a character by its
+such tables (moved to phase 12 by the author, 2026-11-11; what it
+leaves out stays here); the three collations that weigh a character by its
 neighbours (latin2_czech_cs, cp1250_czech_cs, tis620_thai_ci), whose
 keys are placed in turn and whose ordered runs are refused (utf8mb4's
 are hashed and merged since phase 8, §8.6); the C++ header and bindings
