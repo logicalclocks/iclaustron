@@ -2344,7 +2344,9 @@ of such columns stay later.
 
 Phase 12 is built on `trunk` alone, not on `1.0.0`, and is released
 from `trunk` as 1.1.0, blob support for key operations (the author,
-2026-11-11). Fixes go to both branches as before.
+2026-11-11). `1.0.0` is released and takes no further changes, fixes
+included; the branch `1.1.0` is made from `trunk` once blob handling is
+ready to release (the author, 2026-11-12).
 
 ### How each operation goes
 
@@ -2659,8 +2661,10 @@ Rust stream over the scan reader, with the Rust futures over executors
 **Release 1.0.0** (the author, 2026-11-05) is cut after phase 11, on a
 branch of its own, `1.0.0`, which takes the fixes to the release;
 `trunk` (until then `RUST-iclaustron`) is the development branch, and
-every change goes to both. 0.2 and 0.3 were never tagged: what they
-were to hold is in 1.0. How a release is made: `doc/releasing.md`.
+every change goes to both. Since 2026-11-12 (the author) a released
+branch takes no further changes: everything goes to `trunk`. 0.2 and
+0.3 were never tagged: what they were to hold is in 1.0. How a release
+is made: `doc/releasing.md`.
 Before the tag `legacy-c/` was removed from both branches, as chapter
 09 foresaw; the C code is on branch `main` (`doc/rust/README.md`, "Reference
 trees").

@@ -14,10 +14,11 @@ aarch64, macOS on aarch64.
 
 - `trunk` is where development goes on.
 - Each release has a branch named by its version, `1.0.0`, made from
-  `trunk` when the release is cut. It takes the fixes to that release,
-  and its patch releases are tagged on it: `v1.0.0`, `v1.0.1`, ...
-- Every change goes to both: committed on one branch and cherry-picked
-  to the other.
+  `trunk` when the release is cut, and is tagged on it: `v1.0.0`.
+- A released branch takes no further changes (the author, 2026-11-12),
+  fixes included: they go to `trunk`, and reach users in the next
+  release, which gets a branch of its own, `1.1.0`, made from `trunk`
+  once its work is ready to release.
 
 ## Version numbers
 
