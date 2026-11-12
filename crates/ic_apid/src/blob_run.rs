@@ -19,7 +19,17 @@
 //!   parts; a write's or an update's heads read beside the main row's
 //!   write, then the new parts written and the old ones past them
 //!   deleted; a delete's heads read, then the main row and every part
-//!   deleted. A column without parts takes no head read.
+//!   deleted. A column without parts takes no head read. A locked read
+//!   reads the main row with its lock, then its parts with simple
+//!   reads; a committed read reads it committed first, all for an
+//!   inline value, else again with a shared lock and its lock
+//!   reference, then the parts, and unlocks it unless a commit is asked
+//!   for; one that locks first, as a simple read does, takes the lock
+//!   and its reference in its first round. A committed read reads
+//!   committed first only when it is its transaction's only operation,
+//!   decided as the transaction is sent; it holds the commit back from
+//!   its first round, so that a value with parts can be read again
+//!   with the locking reads, a new transaction at the data nodes.
 //! - **The poll plans the next round** at its end, from what the round
 //!   brought ([`blob::plan_part_ops`]), and sends it there, as it sends
 //!   what scans ask for. A send there sends whatever else is defined on
@@ -77,6 +87,8 @@ use crate::query::QueryId;
 use crate::query::QueryState;
 use crate::query::TransId;
 use crate::row_codec;
+use crate::row_codec::IC_COL_LOCK_REF;
+use crate::row_codec::IC_LOCK_REF_WORDS;
 
 /// Columns a parts table has after the main key's: the part number,
 /// the part key id and the part's bytes, in that order.
@@ -110,8 +122,10 @@ enum OpRole {
   Main,
   /// The read of the old values' heads.
   Heads,
-  /// A part's write, delete or probe.
+  /// A part's read, write, delete or probe.
   Part(PartOp),
+  /// The unlock of the main row a read locked, which is not waited for.
+  Unlock,
 }
 
 /// A value of a run: its column, by its place among the table's, and
@@ -140,6 +154,8 @@ struct OpReq<'a> {
   is_read: bool,
   key: &'a [u32],
   attr: &'a [u32],
+  /// The distribution key word an unlock carries.
+  dist_key: Option<u32>,
 }
 
 /// The run of a BLOB query's rounds (chapter 06, phase 12), kept with
@@ -152,6 +168,10 @@ pub(crate) struct BlobRun {
   after: Option<QueryId>,
   /// True once the first round has been defined.
   started: bool,
+  /// A committed read whose first round waits for its transaction's
+  /// send, which tells whether it is the transaction's only operation:
+  /// only then is it read committed first (the author, 2026-11-12).
+  undecided: bool,
   /// What the query does.
   kind: RunKind,
   /// A write that finds no row probes for parts a racing insert left.
@@ -175,6 +195,13 @@ pub(crate) struct BlobRun {
   /// What failed an operation, and what its refusal said beyond its
   /// code.
   error: Option<(IcError, u32)>,
+  /// The main row's read asks for its lock reference.
+  main_locks: bool,
+  /// The lock reference a read brought, which an unlock names.
+  lock_ref: Option<[u32; IC_LOCK_REF_WORDS]>,
+  /// The next round lets the main row's lock go, as a read that locked
+  /// it does once its parts are read, while no commit is asked for.
+  unlock_due: bool,
   /// The main row's operation: its flags, and its column section.
   main_flags: KeyOpFlags,
   main_attr: Vec<u32>,
@@ -228,6 +255,7 @@ impl BlobRun {
       active: false,
       after: None,
       started: false,
+      undecided: false,
       kind: RunKind::Insert,
       probe: false,
       round: 0,
@@ -237,6 +265,9 @@ impl BlobRun {
       heads_due: false,
       main_due: false,
       error: None,
+      main_locks: false,
+      lock_ref: None,
+      unlock_due: false,
       main_flags: KeyOpFlags::default(),
       main_attr: Vec::new(),
       heads_info: Vec::new(),
@@ -276,12 +307,20 @@ impl BlobRun {
     budget: u64,
   ) -> Result<(), IcError> {
     let ignores = flags.abort_option == key_ops::IC_IGNORE_ERROR;
+    let committed = flags.dirty;
+    let simple = flags.simple && !flags.dirty;
+    let lock_first = simple || (committed && query.blob_lock_first());
     self.kind = match flags.operation {
       key_ops::IC_OP_INSERT if ignores => RunKind::InsertIgnoring,
       key_ops::IC_OP_INSERT => RunKind::Insert,
       key_ops::IC_OP_WRITE => RunKind::Write,
       key_ops::IC_OP_UPDATE => RunKind::Update,
       key_ops::IC_OP_DELETE => RunKind::Delete,
+      key_ops::IC_OP_READ if lock_first => RunKind::LockFirstRead,
+      key_ops::IC_OP_READ if committed => RunKind::CommittedRead,
+      key_ops::IC_OP_READ | key_ops::IC_OP_READ_EXCLUSIVE => {
+        RunKind::LockedRead
+      }
       _ => return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED)),
     };
     self.probe = query.blob_probe();
@@ -310,9 +349,12 @@ impl BlobRun {
           Some(column) => column,
           None => return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED)),
         };
+        // A read's values are what it brings; a write's what it sends.
         let mut length: u64 = 0;
         if let Some(value) = field.value {
-          length = value.len() as u64;
+          if !self.kind.is_read() {
+            length = value.len() as u64;
+          }
         }
         if !field.sizes.holds(length) {
           return Err(IcError::new(blob::IC_NDB_ERROR_BLOB_TOO_LONG));
@@ -345,13 +387,30 @@ impl BlobRun {
       abort_option: flags.abort_option,
       batch_safe: flags.batch_safe,
       batch_unsafe: flags.batch_unsafe,
+      simple: flags.simple,
+      dirty: flags.dirty,
+      no_wait: flags.no_wait,
       ..KeyOpFlags::default()
     };
+    self.main_locks = false;
+    self.lock_ref = None;
+    self.unlock_due = false;
     // The main row's values, the blob columns' heads and inline bytes
     // among them; an update leaves the key columns out, a delete has
-    // none.
+    // none. A read asks for the attribute record's columns, the blob
+    // columns among them, a read that locks first its lock reference
+    // too, unless no column has parts, when the read is the program's
+    // own, in one round.
     self.main_attr.clear();
-    if self.kind != RunKind::Delete {
+    if self.kind.is_read() {
+      row_codec::read_attr_info_append(
+        query.attr_record(),
+        &mut self.main_attr,
+      );
+      if self.kind == RunKind::LockFirstRead && has_parts {
+        self.lock_read(flags.abort_option);
+      }
+    } else if self.kind != RunKind::Delete {
       row_codec::write_attr_info_append(
         query.attr_record(),
         query.attr_row(),
@@ -372,12 +431,13 @@ impl BlobRun {
         index += 1;
       }
     }
-    blob::heads_read_info(&ids, &mut self.heads_info);
+    blob::masked_read_info(&ids, &mut self.heads_info);
     // A delete's main row waits for its heads, read with its lock.
     self.main_due = !(self.kind == RunKind::Delete && self.heads_due);
     self.error = None;
     self.after = None;
     self.started = false;
+    self.undecided = self.kind == RunKind::CommittedRead && has_parts;
     self.last = blob::plan_first_round(
       self.kind,
       &mut self.values,
@@ -385,6 +445,31 @@ impl BlobRun {
       &mut self.plan,
     );
     Ok(())
+  }
+
+  /// Have the main row's next read take the shared lock and its lock
+  /// reference: a shared read with bit 20, the lock reference asked for
+  /// after the columns (chapter 05 §6.10).
+  fn lock_read(&mut self, abort_option: u32) {
+    self.main_flags = KeyOpFlags {
+      operation: key_ops::IC_OP_READ,
+      committed_base: true,
+      abort_option,
+      ..KeyOpFlags::default()
+    };
+    self
+      .main_attr
+      .push(column_header::column_header(IC_COL_LOCK_REF, 0));
+    self.main_locks = true;
+  }
+
+  /// A committed read that is not its transaction's only operation
+  /// takes the lock first: two rounds, its commit held.
+  fn lock_first(&mut self) {
+    self.kind = RunKind::LockFirstRead;
+    let abort_option = self.main_flags.abort_option;
+    self.lock_read(abort_option);
+    self.last = false;
   }
 
   /// Every operation the run has made.
@@ -467,7 +552,7 @@ impl ApidConnection {
     run.active = true;
     run.after = after;
     let mut defined: Result<(), IcError> = Ok(());
-    if after.is_none() {
+    if after.is_none() && !run.undecided {
       defined = self.define_round(qid, tid, &mut run, values.as_ref());
     }
     let mut hold = false;
@@ -495,6 +580,67 @@ impl ApidConnection {
       }
     }
     defined
+  }
+
+  /// Plan the first round of each committed BLOB read of `tid` that
+  /// waits for its send: read committed first when it is the
+  /// transaction's only operation, else the lock taken first, its
+  /// commit held. A round that cannot be defined fails its query.
+  pub(crate) fn decide_blob_reads(&mut self, tid: TransId) {
+    let runs = match self.transactions.get(tid.0) {
+      Some(trans) if !trans.blob_runs().is_empty() => {
+        trans.blob_runs().to_vec()
+      }
+      _ => return,
+    };
+    for qid in runs {
+      let waiting = match self.queries.get(qid.0) {
+        Some(query) => match &query.run {
+          Some(run) => run.active && run.undecided && run.after.is_none(),
+          None => false,
+        },
+        None => false,
+      };
+      if !waiting {
+        continue;
+      }
+      let alone = match self.transactions.get(tid.0) {
+        Some(trans) => trans.only_query(qid),
+        None => return,
+      };
+      let (mut run, values) = match self.take_run(qid) {
+        Some(taken) => taken,
+        None => continue,
+      };
+      run.undecided = false;
+      if !alone {
+        run.lock_first();
+      }
+      // Alone, the commit is held back from the first round all the
+      // same: a value with parts is read again with the locking reads,
+      // and an inline one then commits at the client, at no cost.
+      let defined = self.define_round(qid, tid, &mut run, values.as_ref());
+      let hold = defined.is_ok() && !run.holds_commit;
+      if hold {
+        run.holds_commit = true;
+      }
+      self.put_run(qid, run, values);
+      match defined {
+        Ok(()) => {
+          if hold {
+            if let Some(trans) = self.transactions.get_mut(tid.0) {
+              trans.hold_commit();
+            }
+          }
+        }
+        Err(e) => {
+          if let Some(query) = self.queries.get_mut(qid.0) {
+            query.fail(e);
+          }
+          self.finish_query(qid);
+        }
+      }
+    }
   }
 
   /// The latest BLOB query of `tid` still running on the row `run` is
@@ -618,6 +764,7 @@ impl ApidConnection {
         is_read: true,
         key: &run.main_key,
         attr: &run.heads_info,
+        dist_key: None,
       };
       self.define_op(to, &req)?;
       run.round_ops.push((slot, OpRole::Heads));
@@ -631,9 +778,10 @@ impl ApidConnection {
         of: part_of(qid, run),
         table: &main_table,
         flags: run.main_flags,
-        is_read: false,
+        is_read: run.kind.is_read(),
         key: &run.main_key,
         attr: &run.main_attr,
+        dist_key: None,
       };
       self.define_op(to, &req)?;
       run.round_ops.push((slot, OpRole::Main));
@@ -658,7 +806,20 @@ impl ApidConnection {
         abort_option: key_ops::IC_ABORT_ON_ERROR,
         ..KeyOpFlags::default()
       };
+      let mut is_read = false;
       match op.kind {
+        // A simple read of the part's bytes, by bitmask; a part not
+        // there is the value's damage, not the transaction's.
+        PartOpKind::Read => {
+          blob::masked_read_info(&[column.keys + 2], &mut scratch.attr);
+          flags = KeyOpFlags {
+            operation: key_ops::IC_OP_READ,
+            simple: true,
+            abort_option: key_ops::IC_IGNORE_ERROR,
+            ..KeyOpFlags::default()
+          };
+          is_read = true;
+        }
         PartOpKind::Write => {
           let value: &[u8] = match (values, target.slot) {
             (Some(values), Some(slot)) => values
@@ -700,13 +861,41 @@ impl ApidConnection {
         of: part_of(qid, run),
         table: &parts,
         flags,
-        is_read: false,
+        is_read,
         key: &scratch.key,
         attr: &scratch.attr,
+        dist_key: None,
       };
       self.define_op(to, &req)?;
       run.round_ops.push((slot, OpRole::Part(op)));
       run.ops_out += 1;
+    }
+    // The unlock, last, named by the lock reference: its first word the
+    // distribution key, its other two the key. Not waited for.
+    if run.unlock_due {
+      run.unlock_due = false;
+      if let Some(lock) = run.lock_ref {
+        let slot = self.main_slot(run)?;
+        let flags = KeyOpFlags {
+          operation: key_ops::IC_OP_UNLOCK,
+          dist_key: true,
+          abort_option: key_ops::IC_ABORT_ON_ERROR,
+          ..KeyOpFlags::default()
+        };
+        let key = [lock[1], lock[2]];
+        let req = OpReq {
+          slot,
+          of: part_of(qid, run),
+          table: &main_table,
+          flags,
+          is_read: false,
+          key: &key,
+          attr: &[],
+          dist_key: Some(lock[0]),
+        };
+        self.define_op(to, &req)?;
+        run.round_ops.push((slot, OpRole::Unlock));
+      }
     }
     Ok(())
   }
@@ -736,11 +925,18 @@ impl ApidConnection {
     if req.attr.is_empty() {
       sections = &both[..1];
     }
+    let eight = request.encode();
+    let nine;
+    let mut words: &[u32] = &eight;
+    if let Some(dist_key) = req.dist_key {
+      nine = request.encode_dist_key(dist_key);
+      words = &nine;
+    }
     let staged = self.stage_signal(
       to.coord.node_id,
       to.coord.generation,
       &header,
-      &request.encode(),
+      words,
       sections,
     )?;
     if let Some(op) = self.queries.get_mut(req.slot.0) {
@@ -820,11 +1016,11 @@ impl ApidConnection {
     error: Option<IcError>,
     error_data: u32,
   ) {
-    let role = match self.queries.get(of.owner.0) {
+    let (role, kind) = match self.queries.get(of.owner.0) {
       Some(query) => match &query.run {
         Some(run) if run.active && run.round == of.round => {
           match run.round_ops.get(of.index as usize) {
-            Some((slot, role)) if *slot == op => *role,
+            Some((slot, role)) if *slot == op => (*role, run.kind),
             _ => return,
           }
         }
@@ -832,48 +1028,32 @@ impl ApidConnection {
       },
       None => return,
     };
-    // A read's row stays with its operation; the heads are taken from
-    // it, and the buffer given back.
+    // The unlock is not waited for: the query completes with its parts.
+    if role == OpRole::Unlock {
+      return;
+    }
+    // A read's row stays with its operation; the run takes what it needs
+    // from it, and gives the buffer back.
+    let reads = match role {
+      OpRole::Heads => true,
+      OpRole::Main => kind.is_read(),
+      OpRole::Part(part) => part.kind == PartOpKind::Read,
+      OpRole::Unlock => false,
+    };
     let mut row: Vec<u32> = Vec::new();
-    if role == OpRole::Heads && error.is_none() {
+    if reads && error.is_none() {
       if let Some(query) = self.queries.get_mut(op.0) {
         row = std::mem::take(&mut query.execution.row);
       }
     }
-    let missing =
-      matches!(error, Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32);
-    if let Some(query) = self.queries.get_mut(of.owner.0) {
-      if let Some(run) = query.run.as_mut() {
-        run.ops_out = run.ops_out.saturating_sub(1);
-        match (role, error) {
-          (OpRole::Heads, None) => {
-            run.take_heads(&row);
-            // A delete's main row goes in the next round, with the
-            // parts its heads have told of.
-            if run.kind == RunKind::Delete {
-              run.main_due = true;
-            }
-          }
-          // A write finds no row: it inserts one, with no old parts to
-          // delete; asked to, it probes for parts an insert racing it
-          // may have left.
-          (OpRole::Heads, Some(_)) if missing && run.kind == RunKind::Write => {
-            if run.probe {
-              for value in &mut run.values {
-                value.no_row();
-              }
-            }
-          }
-          (OpRole::Part(part), None) if part.kind == PartOpKind::Probe => {
-            run.values[part.value].probe_found(part.part);
-          }
-          // A probed part not there: the probing is over.
-          (OpRole::Part(part), Some(_))
-            if part.kind == PartOpKind::Probe && missing => {}
-          (_, Some(e)) => run.fail(e, error_data),
-          _ => {}
-        }
+    match role {
+      OpRole::Main if kind.is_read() => {
+        self.blob_read_done(of.owner, &row, error, error_data);
       }
+      OpRole::Part(part) if part.kind == PartOpKind::Read => {
+        self.blob_part_read(of.owner, part, &row, error, error_data);
+      }
+      _ => self.blob_write_done(of.owner, role, &row, error, error_data),
     }
     row.clear();
     if let Some(query) = self.queries.get_mut(op.0) {
@@ -882,6 +1062,162 @@ impl ApidConnection {
       }
     }
     self.blob_round_check(of.owner);
+  }
+
+  /// A write's, an update's or a delete's operation has completed.
+  fn blob_write_done(
+    &mut self,
+    owner: QueryId,
+    role: OpRole,
+    row: &[u32],
+    error: Option<IcError>,
+    error_data: u32,
+  ) {
+    let run = match self.queries.get_mut(owner.0) {
+      Some(query) => match query.run.as_mut() {
+        Some(run) => run,
+        None => return,
+      },
+      None => return,
+    };
+    run.ops_out = run.ops_out.saturating_sub(1);
+    let missing =
+      matches!(error, Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32);
+    match (role, error) {
+      (OpRole::Heads, None) => {
+        run.take_heads(row);
+        // A delete's main row goes in the next round, with the parts
+        // its heads have told of.
+        if run.kind == RunKind::Delete {
+          run.main_due = true;
+        }
+      }
+      // A write finds no row: it inserts one, with no old parts to
+      // delete; asked to, it probes for parts an insert racing it may
+      // have left.
+      (OpRole::Heads, Some(_)) if missing && run.kind == RunKind::Write => {
+        if run.probe {
+          for value in &mut run.values {
+            value.no_row();
+          }
+        }
+      }
+      (OpRole::Part(part), None) if part.kind == PartOpKind::Probe => {
+        run.values[part.value].probe_found(part.part);
+      }
+      // A probed part not there: the probing is over.
+      (OpRole::Part(part), Some(_))
+        if part.kind == PartOpKind::Probe && missing => {}
+      (_, Some(e)) => run.fail(e, error_data),
+      _ => {}
+    }
+  }
+
+  /// A read of the main row has completed: its fields into the query's
+  /// row, its blob values' heads and inline bytes into its values, and
+  /// what comes next planned. A committed read that found parts reads
+  /// the row again, locked, before them; a read that locked first lets
+  /// the lock go once its parts are read.
+  fn blob_read_done(
+    &mut self,
+    owner: QueryId,
+    row: &[u32],
+    error: Option<IcError>,
+    error_data: u32,
+  ) {
+    let query = match self.queries.get_mut(owner.0) {
+      Some(query) => query,
+      None => return,
+    };
+    let mut run = match query.run.take() {
+      Some(run) => run,
+      None => return,
+    };
+    run.ops_out = run.ops_out.saturating_sub(1);
+    let unpacked = match error {
+      Some(e) => Err((e, error_data)),
+      None => match query.unpack_blob_row(row) {
+        Ok(used) => Ok(used),
+        Err(e) => Err((e, 0)),
+      },
+    };
+    match unpacked {
+      Err((e, data)) => run.fail(e, data),
+      Ok(used) => {
+        if run.main_locks {
+          match lock_ref_after(row, used) {
+            Some(lock) => run.lock_ref = Some(lock),
+            None => run.fail(IcError::new(err::IC_ERROR_INCONSISTENT_DATA), 0),
+          }
+        }
+        // Each value's length, now known: its parts to be read.
+        let mut parts = false;
+        let mut index: usize = 0;
+        while index < run.values.len() {
+          let sizes = run.values[index].sizes;
+          let mut length: u64 = 0;
+          if let (Some(values), Some(slot)) =
+            (query.blob_values(), run.targets[index].slot)
+          {
+            if let Some(value) = values.nth(slot).and_then(|field| field.value)
+            {
+              length = value.len() as u64;
+            }
+          }
+          run.values[index] = ValueParts::read_value(sizes, length);
+          parts |= run.values[index].parts() > 0;
+          index += 1;
+        }
+        if run.kind == RunKind::CommittedRead && !run.main_locks && parts {
+          // Read again, locked, so that the parts are the head's.
+          let abort_option = run.main_flags.abort_option;
+          run.main_attr.clear();
+          row_codec::read_attr_info_append(
+            query.attr_record(),
+            &mut run.main_attr,
+          );
+          run.lock_read(abort_option);
+          run.main_due = true;
+          run.last = false;
+        } else {
+          run.unlock_due = run.lock_ref.is_some();
+          run.last = !parts && !run.unlock_due;
+        }
+      }
+    }
+    query.run = Some(run);
+  }
+
+  /// A part read has completed: its bytes into the value, at its
+  /// offset. A part not there is a damaged value (4267).
+  fn blob_part_read(
+    &mut self,
+    owner: QueryId,
+    part: PartOp,
+    row: &[u32],
+    error: Option<IcError>,
+    error_data: u32,
+  ) {
+    let query = match self.queries.get_mut(owner.0) {
+      Some(query) => query,
+      None => return,
+    };
+    let mut run = match query.run.take() {
+      Some(run) => run,
+      None => return,
+    };
+    run.ops_out = run.ops_out.saturating_sub(1);
+    let copied = match error {
+      Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32 => {
+        Err((IcError::new(blob::IC_NDB_ERROR_BLOB_DAMAGED), 0))
+      }
+      Some(e) => Err((e, error_data)),
+      None => copy_part(query, &run, part, row),
+    };
+    if let Err((e, data)) = copied {
+      run.fail(e, data);
+    }
+    query.run = Some(run);
   }
 
   /// Once a round is done: complete the query if it was the last, or if
@@ -980,7 +1316,7 @@ impl ApidConnection {
     };
     if commit_due {
       self.queue_for_send(tid);
-      self.blob_send_due = true;
+      self.send_due = true;
     }
   }
 
@@ -1004,8 +1340,8 @@ impl ApidConnection {
         break;
       }
     }
-    if self.blob_send_due {
-      self.blob_send_due = false;
+    if self.send_due {
+      self.send_due = false;
       // A send that fails fails its transactions at the next poll, as
       // their link is gone.
       let _ = self.send_queries(false);
@@ -1033,10 +1369,16 @@ impl ApidConnection {
       }
       None => return,
     };
-    let (goes_on, ended, trans_error) = match self.transactions.get(tid.0) {
-      Some(trans) => (trans.takes_blob_rounds(), trans.ended(), trans.error()),
-      None => return,
-    };
+    let (goes_on, ended, trans_error, commit_asked) =
+      match self.transactions.get(tid.0) {
+        Some(trans) => (
+          trans.takes_blob_rounds(),
+          trans.ended(),
+          trans.error(),
+          trans.commit_asked(),
+        ),
+        None => return,
+      };
     if !goes_on {
       // A rollback asked for, or under way, fails the query as the
       // transaction ends; one that has ended already did, unless it
@@ -1060,21 +1402,54 @@ impl ApidConnection {
     };
     let budget = self.shared.blob_round_bytes;
     let later = run.started;
+    // A committed read that waited behind another on its row is not its
+    // transaction's only operation: it takes the lock first.
+    if run.undecided {
+      run.undecided = false;
+      run.lock_first();
+    }
+    let mut alone = false;
     if later {
-      run.last = blob::plan_part_ops(&mut run.values, budget, &mut run.plan);
+      if run.kind.is_read() && run.main_due {
+        // A committed read's row read again, locked: its parts wait for
+        // the lengths that read brings, and its commit with them.
+        run.plan.clear();
+        run.last = false;
+      } else {
+        run.last = blob::plan_part_ops(&mut run.values, budget, &mut run.plan);
+      }
+      // No unlock once a commit is asked for: the commit lets the lock
+      // go.
+      if run.unlock_due && commit_asked {
+        run.unlock_due = false;
+      }
       if run.plan.is_empty() && !run.main_due {
-        // Nothing left to do: the query is done, and a commit it held
-        // goes alone.
-        self.put_run(qid, run, values);
-        self.complete_blob_query(qid);
-        return;
+        if !run.unlock_due {
+          // Nothing left to do: the query is done, and a commit it held
+          // goes alone.
+          self.put_run(qid, run, values);
+          self.complete_blob_query(qid);
+          return;
+        }
+        // The unlock alone, not waited for: the query is done.
+        alone = true;
       }
     }
     let defined = self.define_round(qid, tid, &mut run, values.as_ref());
     let mut release = false;
-    if defined.is_ok() && run.last && run.holds_commit {
-      run.holds_commit = false;
-      release = true;
+    if defined.is_ok() {
+      if run.last || alone {
+        if run.holds_commit {
+          run.holds_commit = false;
+          release = true;
+        }
+      } else if !run.holds_commit {
+        // A run that plans a further round holds the commit.
+        run.holds_commit = true;
+        if let Some(trans) = self.transactions.get_mut(tid.0) {
+          trans.hold_commit();
+        }
+      }
     }
     self.put_run(qid, run, values);
     match defined {
@@ -1085,7 +1460,10 @@ impl ApidConnection {
         if later {
           self.blob_rounds += 1;
         }
-        self.blob_send_due = true;
+        self.send_due = true;
+        if alone {
+          self.complete_blob_query(qid);
+        }
       }
       Err(e) => {
         // A value's head may be in without its parts: the transaction
@@ -1095,7 +1473,7 @@ impl ApidConnection {
           query.fail(e);
         }
         self.finish_query(qid);
-        self.blob_send_due = true;
+        self.send_due = true;
       }
     }
   }
@@ -1137,5 +1515,58 @@ fn part_of(qid: QueryId, run: &BlobRun) -> PartOf {
     owner: qid,
     round: run.round,
     index: run.round_ops.len() as u32,
+  }
+}
+
+/// The lock reference a locked read brought after its row, which took
+/// `used` words: the pseudo column's header and its three words.
+fn lock_ref_after(
+  row: &[u32],
+  used: usize,
+) -> Option<[u32; IC_LOCK_REF_WORDS]> {
+  let header = *row.get(used)?;
+  let size = (4 * IC_LOCK_REF_WORDS) as u32;
+  if column_header::column_id(header) != IC_COL_LOCK_REF
+    || column_header::byte_size(header) != size
+  {
+    return None;
+  }
+  let words = row.get(used + 1..used + 1 + IC_LOCK_REF_WORDS)?;
+  Some([words[0], words[1], words[2]])
+}
+
+/// A part a read brought, in `row`, into `query`'s value at its offset.
+fn copy_part(
+  query: &mut ApidQuery,
+  run: &BlobRun,
+  part: PartOp,
+  row: &[u32],
+) -> Result<(), (IcError, u32)> {
+  let failed = |e: IcError| (e, 0);
+  let target = run.targets[part.value];
+  let column = &run.columns[target.column];
+  let (parts, part_column) = match (&column.parts, column.part_column) {
+    (Some(parts), Some(part_column)) => (parts, part_column),
+    _ => return Err(failed(IcError::new(err::IC_ERROR_NOT_SUPPORTED))),
+  };
+  let value = run.values[part.value];
+  let offset = value.sizes.part_offset(part.part) as usize;
+  let len = value.sizes.part_len(value.length, part.part);
+  let read =
+    blob::parse_part_row(parts, column.keys + 2, row).map_err(failed)?;
+  let bytes = blob::decode_part(part_column, len, read).map_err(failed)?;
+  let slot = match target.slot {
+    Some(slot) => slot,
+    None => return Err(failed(IcError::new(err::IC_ERROR_NO_SUCH_FIELD))),
+  };
+  let into = query
+    .blob_values_mut()
+    .and_then(|values| values.part_buf(slot, offset, len));
+  match into {
+    Some(into) => {
+      into.copy_from_slice(bytes);
+      Ok(())
+    }
+    None => Err(failed(IcError::new(blob::IC_NDB_ERROR_BLOB_DAMAGED))),
   }
 }

@@ -2382,7 +2382,10 @@ What the plan asked, as the author answered it the same day:
    with parts takes three: the main row read again with a shared lock
    and its lock reference, then the parts, with the unlock or the
    commit. A flag on the query, `blob_lock_first`, takes the lock in the
-   first round instead: two rounds whatever the value.
+   first round instead: two rounds whatever the value. The committed
+   read first is only for a read that is its transaction's only
+   operation; in a transaction with other rows a committed read always
+   takes the lock first (the author, 2026-11-12, in 12.5).
 5. **At most 1 MiB of part data per BLOB query in a round**
    (`GlobalOptions::blob_round_bytes`); a larger value goes on in
    further rounds, the commit with the last.
@@ -2766,6 +2769,75 @@ Exit: values written by MySQL read back the same; readers and writers
 of the same rows, with values that check themselves, give no torn value
 and no 266; a committed read of an inline value takes one round, and
 one with `blob_lock_first` two, seen in a capture.
+
+Done 2026-11-12, every test passing, the capture still to be taken:
+
+- **The reads** of chapter 06's table: a locked read's row with its
+  lock, then its parts; a committed read's row committed, all for an
+  inline value, else read again shared with its lock reference (bit 20,
+  pseudo column 0xFFEE after the columns), then the parts and the
+  unlock; `set_blob_lock_first` taking the lock first, two rounds. A
+  simple read goes as one that locks first (ours to choose: its lock is
+  to be let go of once read, which only the unlock does for a value
+  read in two rounds). A read of only columns without parts is the
+  program's own, in one round.
+- **The row read** is unpacked into the query's row and values: a blob
+  field's head and inline bytes, the value sized to its length, each
+  part's bytes put at its offset as its read comes, straight from the
+  reply.
+- **Parts are read** with simple reads asking for the data column by
+  bitmask, ignoring errors (ours to choose: a part not there fails the
+  query with 4267, as chapter 06 says, rather than rolling the
+  transaction back with 626).
+- **The unlock**, operation 7 with the distribution key flag, the lock
+  reference's first word as its distribution key word and its other two
+  as its key, goes last in the parts' round, or alone, and is not waited
+  for; none once a commit is asked for, which lets the lock go.
+- **A committed read reads committed first only alone** (the author,
+  the same day): its first round is planned when its transaction is
+  sent, and read committed only if it is the transaction's only
+  operation; otherwise it takes the lock first, as `blob_lock_first`
+  does. Alone, it holds the transaction's commit back from its first
+  round. An inline value is then done, and the commit ends the
+  transaction at the client, as the coordinator holds nothing of it; a
+  value with parts is read again with the locking reads, which begin a
+  new transaction at the data nodes under the same transaction object
+  (the author), the commit riding on the parts' round. A first version
+  let the commit ride on the first round and read the parts in a
+  transaction of the driver's own; holding the commit made that
+  needless.
+- **A commit alone waits for every operation sent** to have its
+  reply: the coordinator aborts a transaction asked to commit while an
+  operation still executes, with 253 (the author, the same day; chapter
+  05 §6.7). Found when an unlock, not waited for, was still out as its
+  transaction's commit went; a plain query's commit asked while it was
+  out had the same fault. A commit riding on a batch's last request is
+  not held.
+- **A transaction begins at the coordinator** only with an operation
+  other than a committed read, which leaves it nothing once run
+  (chapter 05 §6.10): until one has gone, a commit or a rollback ends
+  the transaction at the client, and each batch's first request carries
+  the start flag. Found when a committed read sent alone and committed
+  after came back rolled back; a plain committed read followed by its
+  commit had the same fault.
+- **The row read again, locked, is never a read's last round**: its
+  parts are planned from the lengths that read brings, in the round
+  after. Found when a committed read with parts, its commit asked
+  first, failed with 7151: its parts had been planned beside the locked
+  read from the committed read's lengths, that round counted as the
+  last and carried the commit, and the parts' round then found the
+  transaction committed. Beside a writer, a part the committed read's
+  length named could also be gone by then, failing the read with 4267.
+- Tests: unit tests of the reads' rounds, the part's row parsed, the
+  heads and inline bytes unpacked into the values and the parts put
+  after them, and the unlock's nine words; integration tests in the
+  `blob` group: values MySQL wrote at every boundary, TEXT and
+  LONGBLOB, 1 MiB too, read back the same by each read, the commit
+  asked first and after, with the rounds each takes, and a row not
+  there; parts on disk read without their padding; and readers and
+  writers of the same rows, each its own way, meeting no torn value and
+  no failure. The capture of a committed read's one round, and a
+  locking one's two, is the author's to take.
 
 ### 12.6 The executor and the synchronous helpers (3 days)
 

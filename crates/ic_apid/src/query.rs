@@ -252,6 +252,9 @@ pub(crate) struct Execution {
   /// For a part operation, the BLOB query it is for and that query's
   /// round.
   pub part_of: Option<PartOf>,
+  /// A BLOB query itself, which goes on no wire: its run's operations
+  /// carry it.
+  pub shell: bool,
 }
 
 /// The BLOB query an operation of the driver's is for, the round it
@@ -352,6 +355,9 @@ pub struct ApidQuery {
   /// A write of a BLOB query that finds no row probes for parts a
   /// racing insert may have left ([`set_blob_probe`](Self::set_blob_probe)).
   blob_probe: bool,
+  /// A committed read of a BLOB query takes its lock first
+  /// ([`set_blob_lock_first`](Self::set_blob_lock_first)).
+  blob_lock_first: bool,
   pub(crate) execution: Execution,
 }
 
@@ -411,6 +417,7 @@ impl ApidQuery {
       run: None,
       internal: false,
       blob_probe: false,
+      blob_lock_first: false,
       execution: Execution::default(),
     })
   }
@@ -448,6 +455,7 @@ impl ApidQuery {
       run: None,
       internal: false,
       blob_probe: false,
+      blob_lock_first: false,
       execution: Execution::default(),
     })
   }
@@ -479,6 +487,7 @@ impl ApidQuery {
       run: None,
       internal: true,
       blob_probe: false,
+      blob_lock_first: false,
       execution: Execution::default(),
     })
   }
@@ -736,6 +745,48 @@ impl ApidQuery {
     self.blob_probe
   }
 
+  /// Have a committed read take the shared lock and its lock reference
+  /// in its first round, for the executions defined from now on
+  /// (`ic_apid_query_set_blob_lock_first`; chapter 06, phase 12, item
+  /// 4): two rounds, the parts read and the row unlocked in the second,
+  /// whatever the value. Without it a committed read reads the row
+  /// committed first, all of it for an inline value, and takes three
+  /// rounds for a value with parts. Refused while the query is defined
+  /// or sent (`IC_ERROR_TRANSACTION_ACTIVE`).
+  pub fn set_blob_lock_first(
+    &mut self,
+    lock_first: bool,
+  ) -> Result<(), IcError> {
+    self.check_idle()?;
+    self.blob_lock_first = lock_first;
+    Ok(())
+  }
+
+  /// True if a committed read takes its lock first
+  /// ([`set_blob_lock_first`](Self::set_blob_lock_first)).
+  pub fn blob_lock_first(&self) -> bool {
+    self.blob_lock_first
+  }
+
+  /// A read of the main row a BLOB query's run made, a packed row in
+  /// `words`: its fields into the attribute row, its blob fields' heads
+  /// and inline bytes into the values, their parts to come. The words
+  /// it took, those after it being what else the read asked for, as a
+  /// lock reference.
+  pub(crate) fn unpack_blob_row(
+    &mut self,
+    words: &[u32],
+  ) -> Result<usize, IcError> {
+    let used = crate::row_codec::unpack_row_with(
+      &self.attr_rec,
+      words,
+      &mut self.attr_row,
+      self.blobs.as_mut(),
+    )?;
+    self.result_len = 4 * used as u32;
+    Ok(used)
+  }
+
   /// The values of the attribute record's blob fields, if it names any.
   pub fn blob_values(&self) -> Option<&BlobValues> {
     self.blobs.as_ref()
@@ -746,6 +797,11 @@ impl ApidQuery {
       Some(values) => Ok(values),
       None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     }
+  }
+
+  /// The values, for a read's parts to be put into.
+  pub(crate) fn blob_values_mut(&mut self) -> Option<&mut BlobValues> {
+    self.blobs.as_mut()
   }
 
   /// The blob values taken out while the driver plans a round, and put

@@ -972,6 +972,14 @@ and the transaction id; `ROLLBACK_CONF` is those three back;
 `COMMIT_REF` adds the error code, and `ROLLBACK_REF` that and the
 coordinator's state.
 
+**A commit asked while an operation still executes is an abort** (the
+author, 2026-11-12): the coordinator cannot commit a transaction that is
+started with operations not yet completed, and aborts it instead, with
+253. A `COMMIT_REQ` therefore goes only once every operation sent has
+its reply; a commit flag on a request of a batch is not affected. Found
+when a BLOB read's unlock, not waited for, was still out as its
+transaction's commit went.
+
 **The takeover replies, as built** (`ic_apid::transaction`): both are
 three words, our pointer for the transaction and its id, sent by the
 coordinator that took over from the failed one, so from another node
@@ -1196,6 +1204,13 @@ table, and knows nothing joining them.
   and the lock is held to the commit.
 - **A simple read** (the simple flag without the dirty one, §6.4) takes
   a shared lock and lets it go once the row is read.
+- **A committed read leaves no state at the coordinator** (the author,
+  2026-11-12): it only sends the read to the node that owns the row,
+  which answers with the row. A transaction whose operations so far are
+  all committed reads is unknown to the coordinator once they have run:
+  a commit or rollback of it ends at the client, with no signal, and its
+  next operation carries the start flag again. Found when a committed
+  read sent alone and committed after came back rolled back.
 - **The lock reference** (pseudo column 0xFFEE), read beside a locked
   read, is three words: the data node's id in bits 16–31 and the
   fragment id in bits 0–15; the coordinator's index for the locking

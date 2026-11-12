@@ -52,6 +52,13 @@ pub const IC_COL_READ_EVERY: u32 = 0xFFF0;
 pub const IC_COL_READ_MASKED: u32 = 0xFFF3;
 /// Pseudo column: the partition the row is in, as one word.
 pub const IC_COL_PARTITION: u32 = 0xFFFE;
+/// Pseudo column: the lock reference of a locked read, three words: the
+/// data node and fragment, the coordinator's operation and the data
+/// node's operation, by which an unlock names the lock. Verify: chapter
+/// 05 §6.10.
+pub const IC_COL_LOCK_REF: u32 = 0xFFEE;
+/// Words of a lock reference.
+pub const IC_LOCK_REF_WORDS: usize = 3;
 /// NDB's error for a key column given as NULL. A row with NULL in an
 /// indexed column is not in the unique index, so a lookup by NULL can
 /// find nothing; whatever bytes lie under the NULL would find a row by
@@ -317,11 +324,24 @@ pub(crate) fn write_attr_info_append(
 }
 
 /// Put a packed row into `row` as the record lays it out, and set or
-/// clear each field's null bit. Returns how many words it took.
+/// clear each field's null bit. Returns how many words it took. A blob
+/// field's value is not in the row: a record naming one is refused with
+/// `IC_ERROR_NOT_SUPPORTED`, and a query reads it into its blob values.
 pub fn unpack_row(
   rec: &Record,
   words: &[u32],
   row: &mut [u8],
+) -> Result<usize, IcError> {
+  unpack_row_with(rec, words, row, None)
+}
+
+/// As [`unpack_row`], with each blob field's head and inline bytes put
+/// into `blobs` (`BlobValues::read_head`), its parts to come.
+pub(crate) fn unpack_row_with(
+  rec: &Record,
+  words: &[u32],
+  row: &mut [u8],
+  mut blobs: Option<&mut BlobValues>,
 ) -> Result<usize, IcError> {
   let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
   if row.len() < rec.row_size() as usize {
@@ -366,6 +386,38 @@ pub fn unpack_row(
       Some(found) => found,
       None => return Err(bad),
     };
+    if field.is_blob() {
+      // No null bit in the row: NULL, or the head and inline bytes, a
+      // byte array behind a 2-byte length, go to the values.
+      let mut is_null = false;
+      if attr.nullable {
+        is_null = bit < total_bits && mask_bit(mask, bit);
+        bit += 1;
+      }
+      let values = match blobs.as_deref_mut() {
+        Some(values) => values,
+        None => return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED)),
+      };
+      if is_null {
+        values.read_head(position, None)?;
+        continue;
+      }
+      pos += 4 * bit_pos.div_ceil(32);
+      bit_pos = 0;
+      if pos + 2 > data.len() {
+        return Err(bad);
+      }
+      let len = 2 + data[pos] as usize + 256 * data[pos + 1] as usize;
+      if pos + len > data.len() {
+        return Err(bad);
+      }
+      let sizes = values.sizes_at(position)?;
+      let (length, inline) =
+        blob::decode_main_value(sizes, &data[pos..pos + len])?;
+      values.read_head(position, Some((length, inline)))?;
+      pos += len;
+      continue;
+    }
     if attr.nullable {
       let is_null = bit < total_bits && mask_bit(mask, bit);
       bit += 1;

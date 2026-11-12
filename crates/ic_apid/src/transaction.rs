@@ -202,8 +202,9 @@ pub struct Transaction {
   /// The coordinator's node and the record allocated there.
   pub(crate) coord: CoordRecord,
   state: CommitState,
-  /// True once the first operation has been sent: the coordinator has
-  /// the transaction.
+  /// True once an operation other than a committed read has been sent:
+  /// the coordinator has the transaction. A committed read leaves it
+  /// nothing once run (chapter 05 §6.10).
   pub(crate) begun: bool,
   /// Queries defined and not yet sent, in order.
   pub(crate) defined: Vec<QueryId>,
@@ -316,6 +317,20 @@ impl Transaction {
   /// no rollback asked for.
   pub(crate) fn takes_blob_rounds(&self) -> bool {
     self.state == CommitState::Started && !self.rolls_back()
+  }
+
+  /// True once a commit has been asked for, gone or not: a BLOB read's
+  /// last round then sends no unlock, as the commit lets its lock go.
+  pub(crate) fn commit_asked(&self) -> bool {
+    self.end_wanted == Some(CommitState::CommitRequested)
+      || self.state == CommitState::CommitRequested
+      || self.state == CommitState::Committed
+  }
+
+  /// True if `qid` is its only operation: none sent before, and no
+  /// other defined.
+  pub(crate) fn only_query(&self, qid: QueryId) -> bool {
+    self.ops_sent == 0 && self.defined.len() == 1 && self.defined[0] == qid
   }
 
   /// Its BLOB queries whose runs go on, in the order they were defined.
@@ -844,19 +859,11 @@ impl ApidConnection {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
     // A query with blob values goes in rounds, as such a delete does
-    // (chapter 06, phase 12): a write by primary key, running no
-    // program, and never a takeover, which is a scan's. Reads come in
-    // 12.5.
+    // (chapter 06, phase 12): by primary key, running no program, and
+    // never a takeover, which is a scan's.
     if query.blob_values().is_some() || (delete && blob_table) {
-      let writes = matches!(
-        flags.operation,
-        key_ops::IC_OP_INSERT
-          | key_ops::IC_OP_WRITE
-          | key_ops::IC_OP_UPDATE
-          | key_ops::IC_OP_DELETE
-      );
       let plain = query.program().is_none() && query.after_record().is_none();
-      if !writes || !plain || query.index().is_some() || takeover.is_some() {
+      if !plain || query.index().is_some() || takeover.is_some() {
         return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
       }
       return self.define_blob_query(
@@ -988,6 +995,7 @@ impl ApidConnection {
           unpacked: false,
           takeover: takeover.map(|over| over.of),
           part_of: None,
+          shell: false,
         },
         user_ref,
         callback,
@@ -1019,6 +1027,8 @@ impl ApidConnection {
       None => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
     };
     self.prepare_blob_run(query_id, &flags)?;
+    let is_read = flags.operation == key_ops::IC_OP_READ
+      || flags.operation == key_ops::IC_OP_READ_EXCLUSIVE;
     if let Some(query) = self.queries.get_mut(query_id.0) {
       if query.state() == QueryState::Completed && query.callback().is_none() {
         self.executed.retain(|done| *done != query_id);
@@ -1028,6 +1038,8 @@ impl ApidConnection {
           trans: Some(trans_id),
           trans_id: id,
           flags,
+          is_read,
+          shell: true,
           ..Execution::default()
         },
         user_ref,
@@ -1170,6 +1182,12 @@ impl ApidConnection {
     if !ids.is_empty() {
       now = ic_port::time::gethrtime();
     }
+    // A committed BLOB read's first round is planned now that its
+    // transaction's batch is known: alone in it, it reads committed
+    // first, else it takes the lock first.
+    for id in &ids {
+      self.decide_blob_reads(*id);
+    }
     for id in &ids {
       if let Some(trans) = self.transactions.get_mut(id.0) {
         trans.queued_for_send = false;
@@ -1250,7 +1268,13 @@ impl ApidConnection {
         last_packed = Some(index);
       }
     }
+    // The start flag goes on the batch's first request while the
+    // coordinator holds nothing of the transaction. A committed read
+    // leaves it nothing once run (chapter 05 §6.10): only another
+    // operation begins the transaction there, and until one has, a
+    // commit or a rollback ends it here.
     let mut begun = begun;
+    let mut start = !begun;
     let mut i: usize = 0;
     while i < defined.len() {
       let qid = defined[i];
@@ -1266,12 +1290,19 @@ impl ApidConnection {
         }
         continue;
       }
-      let sent = self.send_query(qid, !begun, last, last && commit_now);
+      let committed_read = match self.queries.get(qid.0) {
+        Some(query) => query.execution.flags.dirty,
+        None => false,
+      };
+      let sent = self.send_query(qid, start, last, last && commit_now);
       match sent {
         Ok(()) => {
-          begun = true;
+          start = false;
+          if !committed_read {
+            begun = true;
+          }
           if let Some(trans) = self.transactions.get_mut(id.0) {
-            trans.begun = true;
+            trans.begun = begun;
             trans.sent.push(qid);
             trans.ops_sent += 1;
             if last && commit_now {
@@ -1305,13 +1336,51 @@ impl ApidConnection {
       None => None,
     };
     if let Some(how) = end {
-      // A commit held goes on the last round of the last BLOB query.
-      let waits = how == CommitState::CommitRequested && held;
+      // A commit held goes on the last round of the last BLOB query; a
+      // commit alone, once every operation sent has its reply, as the
+      // coordinator aborts a transaction asked to commit while one
+      // still executes (chapter 05 §6.7).
+      let commit = how == CommitState::CommitRequested;
+      let waits = commit && (held || self.ops_out(id));
       if !waits {
         self.send_end(id, how, &coord, trans_id, begun)?;
       }
     }
     Ok(())
+  }
+
+  /// True if an operation of the transaction is out: sent, its replies
+  /// not all in. A BLOB query itself goes on no wire, and is not one.
+  fn ops_out(&self, id: TransId) -> bool {
+    let trans = match self.transactions.get(id.0) {
+      Some(trans) => trans,
+      None => return false,
+    };
+    for qid in &trans.sent {
+      if let Some(query) = self.queries.get(qid.0) {
+        if !query.execution.shell {
+          return true;
+        }
+      }
+    }
+    false
+  }
+
+  /// A commit asked for that waited for the transaction's operations
+  /// goes once the last of them is in, with the poll's send.
+  fn commit_when_done(&mut self, id: TransId) {
+    let waiting = match self.transactions.get(id.0) {
+      Some(trans) => {
+        trans.end_wanted == Some(CommitState::CommitRequested)
+          && trans.state == CommitState::Started
+          && trans.blob_planning == 0
+      }
+      None => false,
+    };
+    if waiting && !self.ops_out(id) {
+      self.queue_for_send(id);
+      self.send_due = true;
+    }
   }
 
   /// True if the query has a request packed: false for a BLOB query,
@@ -1968,8 +2037,8 @@ impl ApidConnection {
     }
   }
 
-  /// The query off its transaction's lists, and the transaction closed
-  /// out if that was its last.
+  /// The query off its transaction's lists, the transaction closed out
+  /// if that was its last, and a commit that waited for it sent.
   fn leave_transaction(&mut self, qid: QueryId, tid: TransId) {
     if let Some(trans) = self.transactions.get_mut(tid.0) {
       let mut i: usize = 0;
@@ -1991,6 +2060,7 @@ impl ApidConnection {
       }
     }
     self.release_if_done(tid);
+    self.commit_when_done(tid);
   }
 
   /// The coordinator's last word on a transaction. A rollback cancels

@@ -835,6 +835,45 @@ impl BlobValues {
     }
   }
 
+  /// A read has brought the head of the blob field at `position`: a
+  /// value of `length` bytes, the first of them `inline`, the rest to
+  /// come from its parts ([`part_buf`](Self::part_buf)); or NULL. The
+  /// buffer keeps its capacity. Damaged (4267) when the inline bytes
+  /// are more than the length.
+  pub(crate) fn read_head(
+    &mut self,
+    position: u32,
+    head: Option<(u64, &[u8])>,
+  ) -> Result<(), IcError> {
+    let index = self.slot(position)?;
+    let slot = &mut self.slots[index];
+    slot.value.clear();
+    match head {
+      Some((length, inline)) => {
+        if (inline.len() as u64) > length {
+          return Err(IcError::new(IC_NDB_ERROR_BLOB_DAMAGED));
+        }
+        slot.value.resize(length as usize, 0);
+        slot.value[..inline.len()].copy_from_slice(inline);
+        slot.null = false;
+      }
+      None => slot.null = true,
+    }
+    Ok(())
+  }
+
+  /// Where a part read puts its bytes: `len` of the `index`th blob
+  /// field's, in record order, from `offset`; `None` past the value.
+  pub(crate) fn part_buf(
+    &mut self,
+    index: usize,
+    offset: usize,
+    len: usize,
+  ) -> Option<&mut [u8]> {
+    let slot = self.slots.get_mut(index)?;
+    slot.value.get_mut(offset..offset.checked_add(len)?)
+  }
+
   /// The sizes of the blob field at `position`.
   pub(crate) fn sizes_at(&self, position: u32) -> Result<BlobSizes, IcError> {
     Ok(self.slots[self.slot(position)?].sizes)
@@ -891,6 +930,17 @@ pub enum RunKind {
   /// A delete: the heads read first, then the main row and every part
   /// deleted.
   Delete,
+  /// A read that locks the main row, shared or exclusive, to the
+  /// commit: then the parts, with simple reads.
+  LockedRead,
+  /// A committed read: the main row read committed first, which is all
+  /// for an inline value; a value with parts is read again with a
+  /// shared lock and its lock reference, then its parts, and unlocked.
+  CommittedRead,
+  /// A read that takes the shared lock and its lock reference first,
+  /// as a committed read asked to lock first and a simple read do: then
+  /// the parts, and the unlock.
+  LockFirstRead,
 }
 
 impl RunKind {
@@ -898,6 +948,14 @@ impl RunKind {
   /// values whose columns have parts.
   pub fn reads_heads(self) -> bool {
     matches!(self, RunKind::Write | RunKind::Update | RunKind::Delete)
+  }
+
+  /// True for a read.
+  pub fn is_read(self) -> bool {
+    matches!(
+      self,
+      RunKind::LockedRead | RunKind::CommittedRead | RunKind::LockFirstRead
+    )
   }
 }
 
@@ -919,6 +977,8 @@ pub struct ValueParts {
   /// the write reached it may have left parts the write did not write
   /// over (chapter 06, phase 12).
   pub probe: Option<u64>,
+  /// Its parts are read, not written: a value a read brought.
+  pub read: bool,
 }
 
 impl ValueParts {
@@ -932,7 +992,16 @@ impl ValueParts {
       old_parts: 0,
       next_delete: 0,
       probe: None,
+      read: false,
     }
+  }
+
+  /// A value of `length` bytes a read brought the head of: its parts
+  /// are to be read.
+  pub fn read_value(sizes: BlobSizes, length: u64) -> ValueParts {
+    let mut value = ValueParts::new(sizes, length);
+    value.read = true;
+    value
   }
 
   /// How many parts the new value has.
@@ -972,6 +1041,9 @@ impl ValueParts {
 /// What is done to a part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PartOpKind {
+  /// Read, with a simple read: the lock taken and let go of in the
+  /// read, since the main row's lock does not fully protect the parts.
+  Read,
   /// Written, with the write operation.
   Write,
   /// Deleted: it is there.
@@ -993,9 +1065,10 @@ pub struct PartOp {
 }
 
 /// Plan the next round's part operations into `out`, emptied first:
-/// value by value, its writes, then its deletes, then its probe, while
-/// the round stays within `budget` bytes, at least one operation. A
-/// write costs its part's bytes, a delete or a probe a whole part's
+/// value by value, its reads or writes, then its deletes, then its
+/// probe, while the round stays within `budget` bytes, at least one
+/// operation. A read or a write costs its part's bytes, a delete or a
+/// probe a whole part's
 /// (ours to choose: the operations of a round stay as few as a round of
 /// writes has, whatever is deleted). True when the round is the run's
 /// last: nothing is left after it, and it probes nothing, since a part
@@ -1010,6 +1083,10 @@ pub fn plan_part_ops(
   let mut probes = false;
   for (index, value) in values.iter_mut().enumerate() {
     let parts = value.parts();
+    let mut kind = PartOpKind::Write;
+    if value.read {
+      kind = PartOpKind::Read;
+    }
     while value.next < parts {
       let cost = value.sizes.part_len(value.length, value.next) as u64;
       if !out.is_empty() && bytes + cost > budget {
@@ -1018,7 +1095,7 @@ pub fn plan_part_ops(
       out.push(PartOp {
         value: index,
         part: value.next,
-        kind: PartOpKind::Write,
+        kind,
       });
       bytes += cost;
       value.next += 1;
@@ -1055,23 +1132,24 @@ pub fn plan_part_ops(
 
 /// Plan a run's first round into `out`: the part operations that go
 /// beside the main row's operation, which only an insert that aborts
-/// on error has. True when it is the run's last round: an insert's
-/// whose parts all fit it, one that ignores errors with no parts, and
-/// any other with no head to read, as for a column without parts.
+/// on error has. True when it may be the run's last round, so that a
+/// commit may ride on it: an insert's whose parts all fit it, one that
+/// ignores errors with no parts, any other with no column with parts,
+/// and a committed read, which is done in one round when its values
+/// are inline.
 pub fn plan_first_round(
   kind: RunKind,
   values: &mut [ValueParts],
   budget: u64,
   out: &mut Vec<PartOp>,
 ) -> bool {
-  if kind == RunKind::Insert {
-    return plan_part_ops(values, budget, out);
-  }
   out.clear();
-  if kind.reads_heads() {
-    return !reads_any_head(values);
+  match kind {
+    RunKind::Insert => plan_part_ops(values, budget, out),
+    RunKind::InsertIgnoring => values.iter().all(ValueParts::planned),
+    RunKind::CommittedRead => true,
+    _ => !reads_any_head(values),
   }
-  values.iter().all(ValueParts::planned)
 }
 
 /// True when some value's column has parts, whose old value's head is
@@ -1080,10 +1158,10 @@ pub fn reads_any_head(values: &[ValueParts]) -> bool {
   values.iter().any(|value| value.sizes.has_parts())
 }
 
-/// The column section of a read of the blob columns `ids`, asked for
-/// by bitmask, into `out`, emptied first: the read of the old values'
-/// heads.
-pub fn heads_read_info(ids: &[u32], out: &mut Vec<u32>) {
+/// The column section of a read of the columns `ids`, asked for by
+/// bitmask, into `out`, emptied first: the read of the old values'
+/// heads, and of a part's bytes.
+pub fn masked_read_info(ids: &[u32], out: &mut Vec<u32>) {
   out.clear();
   let mut max_id: u32 = 0;
   for id in ids {
@@ -1100,18 +1178,24 @@ pub fn heads_read_info(ids: &[u32], out: &mut Vec<u32>) {
   }
 }
 
-/// The heads a read of blob columns of `table` brought, a packed row as
-/// a read by bitmask gets it back: each column read, by its id, with
-/// its value's length, `None` for NULL, into `out`, emptied first. A
-/// head that disagrees with its column's sizes is a damaged value
-/// (4267); a row not as asked for is `IC_ERROR_INCONSISTENT_DATA`.
-pub fn parse_heads(
+/// What [`walk_packed`] gives each column read: its description, and its
+/// value as a request carries it, from a row of lifetime `'row`, `None`
+/// for NULL. `'f` is the closure's own, which may borrow what it fills.
+pub type EachColumn<'row, 'f> =
+  dyn FnMut(&ColumnProps, Option<&'row [u8]>) -> Result<(), IcError> + 'f;
+
+/// Walk a packed row of `table`, as a read by bitmask gets it back:
+/// `each` is given each column read, by its description, with its
+/// value as a request carries it, a variable-sized one behind its
+/// length bytes, `None` for NULL. The words the row took. Bit columns,
+/// which no blob read asks for, are refused, as is a row not as asked
+/// for (`IC_ERROR_INCONSISTENT_DATA`).
+pub fn walk_packed<'a>(
   table: &TableDef,
-  words: &[u32],
-  out: &mut Vec<(u32, Option<u64>)>,
-) -> Result<(), IcError> {
+  words: &'a [u32],
+  each: &mut EachColumn<'a, '_>,
+) -> Result<usize, IcError> {
   let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
-  out.clear();
   let header = match words.first() {
     Some(header) => *header,
     None => return Err(bad),
@@ -1145,36 +1229,98 @@ pub fn parse_heads(
       Some(attr) => attr,
       None => return Err(bad),
     };
-    let sizes = match table.blob_column(id).and_then(BlobColumn::sizes) {
-      Some(sizes) => sizes,
-      None => return Err(bad),
-    };
     // After a nullable column read, one more bit: set for NULL.
     if attr.nullable {
       let null = bit < total_bits && (mask[bit / 32] >> (bit % 32)) & 1 != 0;
       bit += 1;
       if null {
-        out.push((id, None));
+        each(attr, None)?;
         continue;
       }
     }
-    // As any value is placed: a wide type on a word, a byte array, as
-    // a blob's column is, on the next byte.
+    if attr.size_bits_log2 == table_props::IC_COLUMN_SIZE_BIT {
+      return Err(bad);
+    }
+    // A wide type starts on a word, a byte array on the next byte.
     if attr.size_bits_log2 >= table_props::IC_COLUMN_SIZE_32 {
       pos = pos.next_multiple_of(4);
     }
-    if pos + 2 > data.len() {
-      return Err(bad);
-    }
-    let len = 2 + data[pos] as usize + 256 * data[pos + 1] as usize;
+    let len = match attr.array_kind {
+      table_props::IC_ARRAY_KIND_SHORT_VARSIZE => match data.get(pos) {
+        Some(n) => 1 + *n as usize,
+        None => return Err(bad),
+      },
+      table_props::IC_ARRAY_KIND_LONG_VARSIZE => {
+        if pos + 2 > data.len() {
+          return Err(bad);
+        }
+        2 + data[pos] as usize + 256 * data[pos + 1] as usize
+      }
+      _ => attr.max_byte_size() as usize,
+    };
     if pos + len > data.len() {
       return Err(bad);
     }
-    let (length, _) = decode_main_value(sizes, &data[pos..pos + len])?;
-    out.push((id, Some(length)));
+    each(attr, Some(&data[pos..pos + len]))?;
     pos += len;
   }
+  Ok(1 + mask_words + pos.div_ceil(4))
+}
+
+/// The heads a read of blob columns of `table` brought, a packed row as
+/// a read by bitmask gets it back: each column read, by its id, with
+/// its value's length, `None` for NULL, into `out`, emptied first. A
+/// head that disagrees with its column's sizes is a damaged value
+/// (4267); a row not as asked for is `IC_ERROR_INCONSISTENT_DATA`.
+pub fn parse_heads(
+  table: &TableDef,
+  words: &[u32],
+  out: &mut Vec<(u32, Option<u64>)>,
+) -> Result<(), IcError> {
+  out.clear();
+  let mut each =
+    |attr: &ColumnProps, value: Option<&[u8]>| -> Result<(), IcError> {
+      let id = attr.column_id;
+      let sizes = match table.blob_column(id).and_then(BlobColumn::sizes) {
+        Some(sizes) => sizes,
+        None => return Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA)),
+      };
+      match value {
+        Some(value) => {
+          let (length, _) = decode_main_value(sizes, value)?;
+          out.push((id, Some(length)));
+        }
+        None => out.push((id, None)),
+      }
+      Ok(())
+    };
+  walk_packed(table, words, &mut each)?;
   Ok(())
+}
+
+/// A part's value as a simple read of its parts table's data column
+/// brought it, a packed row of `parts`, the data column being
+/// `data_id`: the column's value, its length bytes first for a part
+/// kept in memory, for [`decode_part`]. A row without it is
+/// `IC_ERROR_INCONSISTENT_DATA`.
+pub fn parse_part_row<'a>(
+  parts: &TableDef,
+  data_id: u32,
+  words: &'a [u32],
+) -> Result<&'a [u8], IcError> {
+  let mut found: Option<&'a [u8]> = None;
+  let mut each =
+    |attr: &ColumnProps, value: Option<&'a [u8]>| -> Result<(), IcError> {
+      if attr.column_id == data_id {
+        found = value;
+      }
+      Ok(())
+    };
+  walk_packed(parts, words, &mut each)?;
+  match found {
+    Some(value) => Ok(value),
+    None => Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA)),
+  }
 }
 
 #[cfg(test)]
@@ -1940,13 +2086,117 @@ mod tests {
       assert!(plan_first_round(kind, &mut plain, 1 << 20, &mut out));
       assert!(!reads_any_head(&plain));
     }
+    // A read that locks may find parts to read: its first round is not
+    // the last, unless no column has parts. A committed read's may be,
+    // when its values are inline.
+    for kind in [RunKind::LockedRead, RunKind::LockFirstRead] {
+      let mut values = [ValueParts::new(text, 0)];
+      assert!(!plan_first_round(kind, &mut values, 1 << 20, &mut out));
+      let mut plain = [ValueParts::new(tiny, 0)];
+      assert!(plan_first_round(kind, &mut plain, 1 << 20, &mut out));
+    }
+    let mut values = [ValueParts::new(text, 0)];
+    let committed = RunKind::CommittedRead;
+    assert!(plan_first_round(committed, &mut values, 1 << 20, &mut out));
+    assert!(out.is_empty());
+  }
+
+  #[test]
+  fn blob_parts_read_go_in_rounds_as_writes_do() {
+    let text = sizes_of(&main_table(), "t");
+    let (inline, part) = (text.inline as u64, text.part as u64);
+    let read = PartOpKind::Read;
+    let mut values = [
+      ValueParts::read_value(text, inline + 2 * part + 5),
+      ValueParts::read_value(text, 10),
+    ];
+    let mut out = Vec::new();
+    // Three parts, two parts' bytes a round.
+    assert!(!plan_part_ops(&mut values, 2 * part, &mut out));
+    assert_eq!(out, [op(0, 0, read), op(0, 1, read)]);
+    assert!(plan_part_ops(&mut values, 2 * part, &mut out));
+    assert_eq!(out, [op(0, 2, read)]);
+  }
+
+  #[test]
+  fn blob_a_part_read_is_parsed_from_its_row() {
+    let def = bound_main_table();
+    let parts = def.blob_column(1).and_then(BlobColumn::parts_table);
+    let parts = parts.expect("t's parts table");
+    let column = def.blob_column(1).and_then(BlobColumn::part_column);
+    let column = column.expect("t's data column");
+    // NDB$DATA, column 3, read alone by bitmask: a 2-byte length, then
+    // the bytes.
+    let bytes = value_of(744);
+    let mut encoded = Vec::new();
+    encode_part(column, &bytes, &mut encoded);
+    let masked = crate::row_codec::IC_COL_READ_MASKED;
+    let mut info = Vec::new();
+    masked_read_info(&[3], &mut info);
+    assert_eq!(info, [column_header::column_header(masked, 4), 1 << 3]);
+    let mut words = info.clone();
+    words.extend_from_slice(&padded(&encoded));
+    let value = parse_part_row(parts, 3, &words).expect("the part");
+    assert_eq!(value, &encoded[..]);
+    assert_eq!(decode_part(column, 744, value).expect("decoded"), &bytes);
+    // A row without the column read is not the part.
+    let mut other = info.clone();
+    other[1] = 0;
+    let refused = parse_part_row(parts, 3, &other).expect_err("no part");
+    assert_eq!(refused.code, err::IC_ERROR_INCONSISTENT_DATA);
+  }
+
+  #[test]
+  fn blob_a_read_puts_heads_in_the_values_and_parts_after() {
+    let def = bound_main_table();
+    // id, t, tiny: positions 0, 1 and 2; t and tiny nullable.
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let mut values = BlobValues::new(&rec);
+    let text = value_of(300);
+    let sizes = values.sizes_at(1).expect("t's sizes");
+    let mut head = Vec::new();
+    encode_main_value(sizes, &text, &mut head).expect("t's head");
+    // id read; t read, not NULL; b not read; tiny read, NULL. The INT
+    // first, on a word, then t's bytes at the next byte.
+    let masked = crate::row_codec::IC_COL_READ_MASKED;
+    let mut words = vec![column_header::column_header(masked, 4)];
+    words.push(0b11_0011);
+    let mut data = 7u32.to_le_bytes().to_vec();
+    data.extend_from_slice(&head);
+    words.extend_from_slice(&padded(&data));
+    let mut row = vec![0u8; rec.row_size() as usize];
+    let used = crate::row_codec::unpack_row_with(
+      &rec,
+      &words,
+      &mut row,
+      Some(&mut values),
+    )
+    .expect("unpacked");
+    assert_eq!(used, words.len());
+    let at = rec.field(0).expect("id").offset() as usize;
+    assert_eq!(row[at..at + 4], 7u32.to_le_bytes());
+    // The head's length, the inline bytes, the rest to come.
+    let got = values.blob(1).expect("t").expect("not NULL");
+    assert_eq!(got.len(), 300);
+    assert_eq!(&got[..256], &text[..256]);
+    assert_eq!(values.blob(2).expect("tiny"), None);
+    let rest = values.part_buf(0, 256, 44).expect("part 0's place");
+    rest.copy_from_slice(&text[256..]);
+    assert_eq!(values.blob(1).expect("t"), Some(&text[..]));
+    assert!(values.part_buf(0, 256, 45).is_none());
+    // Without the values, a blob field cannot be read.
+    let refused = crate::row_codec::unpack_row(&rec, &words, &mut row);
+    assert_eq!(
+      refused.expect_err("no values").code,
+      err::IC_ERROR_NOT_SUPPORTED
+    );
   }
 
   #[test]
   fn blob_heads_are_read_by_bitmask_and_parsed() {
     let def = bound_main_table();
     let mut info = Vec::new();
-    heads_read_info(&[1, 3], &mut info);
+    masked_read_info(&[1, 3], &mut info);
     let masked = crate::row_codec::IC_COL_READ_MASKED;
     assert_eq!(info, [column_header::column_header(masked, 4), 0b1010]);
     // t, read and not NULL; tiny, read and NULL. A column takes a bit,

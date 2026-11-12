@@ -50,6 +50,9 @@ pub const IC_KEY_OP_REQ_LEN: usize = 8;
 /// Words in a takeover's `KEY_OP_REQ`: the eight, the scan information
 /// and the distribution key.
 pub const IC_KEY_OP_REQ_TAKEOVER_LEN: usize = 10;
+/// Words in a `KEY_OP_REQ` that carries a distribution key and no scan
+/// information: the eight, then the distribution key.
+pub const IC_KEY_OP_REQ_DIST_LEN: usize = 9;
 /// Section of a `KEY_OP_REQ` holding the key.
 pub const IC_KEY_OP_REQ_KEY_SECTION: usize = 0;
 /// Section of a `KEY_OP_REQ` holding the column data.
@@ -75,6 +78,10 @@ pub const IC_OP_DELETE: u32 = 3;
 pub const IC_OP_WRITE: u32 = 4;
 /// Read with an exclusive lock.
 pub const IC_OP_READ_EXCLUSIVE: u32 = 5;
+/// Let go of the lock an earlier read of the transaction took, named by
+/// that read's lock reference: its first word the distribution key, its
+/// other two the key. Verify: chapter 05 §6.10.
+pub const IC_OP_UNLOCK: u32 = 7;
 
 // Abort options.
 /// A failed operation aborts the transaction.
@@ -204,6 +211,20 @@ impl KeyOpReq {
       self.table_version,
       self.trans_id_lo,
       self.trans_id_hi,
+    ]
+  }
+
+  /// The nine words of a request whose flags have `dist_key` and not
+  /// `scan_takeover`: the eight, then the distribution key, as an unlock
+  /// carries its lock reference's first word. Verify: chapter 05 §6.10.
+  pub fn encode_dist_key(
+    &self,
+    dist_key: u32,
+  ) -> [u32; IC_KEY_OP_REQ_DIST_LEN] {
+    let eight = self.encode();
+    [
+      eight[0], eight[1], eight[2], eight[3], eight[4], eight[5], eight[6],
+      eight[7], dist_key,
     ]
   }
 
@@ -695,6 +716,31 @@ mod tests {
       trans_id_hi: 0x2000,
     };
     assert_eq!(req.encode(), [11, 22, 0, 15, 0x0D11, 3, 0x1000, 0x2000]);
+  }
+
+  #[test]
+  fn an_unlock_carries_its_distribution_key_after_the_eight() {
+    // Operation 7, the distribution key flag, aborting on error, and
+    // neither dirty nor simple (chapter 05 §6.10).
+    let flags = KeyOpFlags {
+      operation: IC_OP_UNLOCK,
+      dist_key: true,
+      ..KeyOpFlags::default()
+    };
+    assert_eq!(flags.flags_word(), (7 << 5) | (1 << 2));
+    let req = KeyOpReq {
+      coord_ptr: 11,
+      query_ref: 22,
+      table_id: 15,
+      flags_word: flags.flags_word(),
+      table_version: 3,
+      trans_id_lo: 0x1000,
+      trans_id_hi: 0x2000,
+    };
+    let words = req.encode_dist_key(0x0002_0005);
+    assert_eq!(words.len(), IC_KEY_OP_REQ_DIST_LEN);
+    assert_eq!(words[..8], req.encode());
+    assert_eq!(words[8], 0x0002_0005);
   }
 
   #[test]

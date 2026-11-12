@@ -727,9 +727,10 @@ pub struct ApidConnection {
   /// BLOB queries whose round is done and whose next round the poll is
   /// to plan and send at its end (`blob_run`).
   pub(crate) blob_due: Vec<QueryId>,
-  /// The poll is to send at its end: a BLOB query's round, or a commit
-  /// it held, is waiting.
-  pub(crate) blob_send_due: bool,
+  /// The poll is to send at its end: a BLOB query's round is waiting,
+  /// or a commit that a BLOB query held or that waited for its
+  /// transaction's operations to come in.
+  pub(crate) send_due: bool,
   /// Where a part's value is made, kept for its allocation.
   pub(crate) blob_bytes: Vec<u8>,
   /// Rounds BLOB queries have sent after their first.
@@ -864,7 +865,7 @@ impl ApidConnection {
       scan_bounds: Vec::new(),
       takeover_key: Vec::new(),
       blob_due: Vec::new(),
-      blob_send_due: false,
+      send_due: false,
       blob_bytes: Vec::new(),
       blob_rounds: 0,
     })

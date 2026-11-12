@@ -54,12 +54,12 @@
 //! the other, and compares the twins (chapter 06 §9.1); `blob`, which
 //! binds tables with every kind of blob column a MySQL server makes,
 //! with their parts tables, inserts values of every length that
-//! matters, in memory and on disk, for MySQL to read back, and writes,
+//! matters, in memory and on disk, for MySQL to read back, writes,
 //! updates and deletes them, counting the rounds they take and the
-//! parts they leave by a scan of the parts tables (chapter 06, phase
-//! 12). The `big_rows` and
-//! `blob` groups make a log file group and a tablespace if the cluster
-//! has none, and keep them.
+//! parts they leave by a scan of the parts tables, and reads back what
+//! MySQL wrote, every way a read goes (chapter 06, phase 12). The
+//! `big_rows` and `blob` groups make a log file group and a tablespace
+//! if the cluster has none, and keep them.
 //! Each test is its own program against the cluster, as an application
 //! would be: it takes an API node id, binds its tables, does its work
 //! through the public API and lets go.
@@ -2813,26 +2813,15 @@ fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
   let parts = blob.parts_table().expect("its parts table");
   assert_eq!(parts.num_fields(), 5);
 
-  // A record may name a blob column. A query takes it, and writes with
-  // it (12.3, 12.4); its reads are refused until 12.5, an executor's
-  // shapes until 12.6, and a scan's always.
+  // A record may name a blob column. A query takes it, and reads and
+  // writes with it (12.3 to 12.5); an executor's shapes refuse it until
+  // 12.6, and a scan always.
   let id = t.def.field_id("id").expect("id");
   let text = t.def.field_id("t").expect("t");
   let rec = Record::default_for(&t.def, Some(&[id, text])).expect("a record");
   assert!(rec.has_blob_fields());
   let key_rec = Record::default_for(&t.def, Some(&[id])).expect("its key");
   let qid = conn.create_query(&t.def, &key_rec, &rec).expect("a query");
-  let tid = conn
-    .start_transaction(TransactionHint::Any, Some(&t.def))
-    .expect("a transaction");
-  let read = ReadKeyArgs::default();
-  assert_eq!(
-    refused_with(conn.read_key(qid, tid, &read)),
-    err::IC_ERROR_NOT_SUPPORTED
-  );
-  conn.rollback_transaction(tid).expect("ask to roll back");
-  assert_eq!(finish(&mut conn, tid), CommitState::RolledBack);
-  conn.close_transaction(tid).expect("close");
   conn.free_query(qid).expect("free the query");
   match OpShape::new(&t.def, &key_rec, &rec) {
     Ok(_) => panic!("a shape naming a blob field was taken"),
@@ -4163,6 +4152,441 @@ fn blob_a_data_node_restarted_during_large_writes_leaves_no_stray_part() {
   let mut conn = cluster.global.create_connection().expect("a connection");
   let t = bind(&mut conn, "bl_kinds");
   assert_parts_match(&mut conn, &t, "bl_kinds", "b");
+}
+
+/// `pattern` repeated to `length` bytes: what MySQL makes of
+/// `LEFT(REPEAT(pattern, n), length)`.
+fn repeated(pattern: &[u8], length: usize) -> Vec<u8> {
+  let mut value = Vec::with_capacity(length);
+  while value.len() < length {
+    let take = (length - value.len()).min(pattern.len());
+    value.extend_from_slice(&pattern[..take]);
+  }
+  value
+}
+
+/// Read a row of `t` by its `id` with the read `kind`, the query asked
+/// to lock first if `lock_first`, as a transaction of its own: its
+/// commit asked for before anything is sent if `commit_first`, else
+/// once the query has completed. How the query did, and the values of
+/// the blob fields at `positions` in `rec`.
+#[allow(clippy::too_many_arguments)]
+fn read_blob_row(
+  conn: &mut ApidConnection,
+  t: &Table,
+  rec: &Record,
+  id: i64,
+  kind: ReadKind,
+  lock_first: bool,
+  commit_first: bool,
+  positions: &[u32],
+) -> (Option<IcError>, Vec<Option<Vec<u8>>>) {
+  let qid = blob_query(conn, t, rec, id, &[]);
+  conn
+    .query_mut(qid)
+    .expect("the query")
+    .set_blob_lock_first(lock_first)
+    .expect("lock first");
+  let tid = start_for_query(conn, t, qid);
+  let read = ReadKeyArgs {
+    kind,
+    ..ReadKeyArgs::default()
+  };
+  conn.read_key(qid, tid, &read).expect("define the read");
+  if commit_first {
+    conn.commit_transaction(tid).expect("ask to commit");
+  } else {
+    complete(conn, qid);
+    conn.commit_transaction(tid).expect("ask to commit");
+  }
+  let state = finish(conn, tid);
+  let why = conn.transaction(tid).and_then(|trans| trans.error());
+  let what = conn.query(qid).and_then(|query| query.error());
+  assert_eq!(
+    state,
+    CommitState::Committed,
+    "row {} by {:?}, lock first {}, commit first {}: {:?}, the query {:?}",
+    id,
+    kind,
+    lock_first,
+    commit_first,
+    why,
+    what
+  );
+  conn.close_transaction(tid).expect("close");
+  let query = conn.query(qid).expect("the query");
+  let error = query.error();
+  let mut values: Vec<Option<Vec<u8>>> = Vec::new();
+  for position in positions {
+    let value = query.blob(*position).expect("a blob field");
+    values.push(value.map(|bytes| bytes.to_vec()));
+  }
+  conn.free_query(qid).expect("free the query");
+  (error, values)
+}
+
+/// A committed read of row `id`'s blob field at `position`, with a
+/// committed read of row `other` beside it in its transaction: not its
+/// transaction's only operation, it takes the lock first. How it did,
+/// and its value.
+fn committed_read_beside(
+  conn: &mut ApidConnection,
+  t: &Table,
+  rec: &Record,
+  id: i64,
+  other: i64,
+  position: u32,
+) -> (Option<IcError>, Option<Vec<u8>>) {
+  let key_rec = record_over(t, &["id"]);
+  let plain = conn
+    .create_query(&t.def, &key_rec, &key_rec)
+    .expect("a query");
+  let mut key = vec![0; key_rec.row_size() as usize];
+  put_into(t, &key_rec, &mut key, "id", &other.to_string());
+  conn
+    .query_mut(plain)
+    .expect("the query")
+    .key_row_mut()
+    .copy_from_slice(&key);
+  let qid = blob_query(conn, t, rec, id, &[]);
+  let tid = start_for_query(conn, t, qid);
+  let read = ReadKeyArgs {
+    kind: ReadKind::Committed,
+    ..ReadKeyArgs::default()
+  };
+  conn
+    .read_key(plain, tid, &read)
+    .expect("define the plain read");
+  conn
+    .read_key(qid, tid, &read)
+    .expect("define the BLOB read");
+  complete(conn, qid);
+  conn.commit_transaction(tid).expect("ask to commit");
+  assert_eq!(finish(conn, tid), CommitState::Committed);
+  conn.close_transaction(tid).expect("close");
+  let query = conn.query(qid).expect("the query");
+  let error = query.error();
+  let value = query.blob(position).expect("a blob field");
+  let value = value.map(|bytes| bytes.to_vec());
+  conn.free_query(qid).expect("free the query");
+  conn.free_query(plain).expect("free the plain query");
+  (error, value)
+}
+
+/// The rounds a read takes after its first: a committed read's value
+/// with parts is read again locked, then its parts are; a read that
+/// locks first reads its parts, or lets its lock go alone while no
+/// commit is asked for; a locked read reads its parts.
+fn read_rounds(
+  kind: ReadKind,
+  lock_first: bool,
+  commit_first: bool,
+  parts: bool,
+) -> u64 {
+  let committed = kind == ReadKind::Committed;
+  let locks_first = (committed && lock_first) || kind == ReadKind::Simple;
+  if committed && !locks_first {
+    return 2 * u64::from(parts);
+  }
+  if locks_first {
+    return u64::from(parts || !commit_first);
+  }
+  u64::from(parts)
+}
+
+#[test]
+fn blob_reads_bring_back_what_mysql_wrote() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let t_sizes = blob_column_of(&t, "t").sizes().expect("sizes");
+  let b_sizes = blob_column_of(&t, "b").sizes().expect("sizes");
+  let (inline, part) = (t_sizes.inline as usize, t_sizes.part as usize);
+  let text: &[u8] = b"abcdefg";
+  let bytes: &[u8] = &[0x00, 0xFF, 0x7F, 0x80, 0xEE, 0x11];
+  // Rows MySQL writes: (id, TEXT length, LONGBLOB length), None NULL.
+  let rows: [(i64, Option<usize>, Option<usize>); 10] = [
+    (1, Some(0), None),
+    (2, Some(1), Some(0)),
+    (3, Some(inline - 1), Some(1)),
+    (4, Some(inline), Some(b_sizes.inline as usize + 1)),
+    (5, Some(inline + 1), None),
+    (6, Some(inline + part), Some(b_sizes.inline as usize)),
+    (
+      7,
+      Some(inline + part + 1),
+      Some(b_sizes.part as usize + 300),
+    ),
+    (8, Some(3 * part + 7), None),
+    (9, None, Some((1 << 20) + 5)),
+    (10, None, None),
+  ];
+  let mut sql = format!("DELETE FROM {}.bl_kinds;", IC_IT_DB);
+  for (id, t_len, b_len) in &rows {
+    let t_sql = match t_len {
+      Some(n) => format!("LEFT(REPEAT('abcdefg', {}), {})", n / 7 + 1, n),
+      None => "NULL".to_string(),
+    };
+    let b_sql = match b_len {
+      Some(n) => {
+        format!("LEFT(REPEAT(UNHEX('00FF7F80EE11'), {}), {})", n / 6 + 1, n)
+      }
+      None => "NULL".to_string(),
+    };
+    sql.push_str(&format!(
+      "INSERT INTO {}.bl_kinds (id, t, b) VALUES ({}, {}, {});",
+      IC_IT_DB, id, t_sql, b_sql
+    ));
+  }
+  mysql(&sql).expect("rows written by MySQL");
+  let rec = record_over(&t, &["id", "t", "b"]);
+  let positions = [position_in(&t, &rec, "t"), position_in(&t, &rec, "b")];
+  let kinds: [(ReadKind, bool); 5] = [
+    (ReadKind::Committed, false),
+    (ReadKind::Committed, true),
+    (ReadKind::Simple, false),
+    (ReadKind::Locked, false),
+    (ReadKind::Exclusive, false),
+  ];
+  for (id, t_len, b_len) in rows {
+    let want = [
+      t_len.map(|n| repeated(text, n)),
+      b_len.map(|n| repeated(bytes, n)),
+    ];
+    let parts = t_sizes.part_count(t_len.unwrap_or(0) as u64) > 0
+      || b_sizes.part_count(b_len.unwrap_or(0) as u64) > 0;
+    for (kind, lock_first) in kinds {
+      for commit_first in [false, true] {
+        let rounds = conn.blob_rounds();
+        let (error, values) = read_blob_row(
+          &mut conn,
+          &t,
+          &rec,
+          id,
+          kind,
+          lock_first,
+          commit_first,
+          &positions,
+        );
+        let what = format!(
+          "row {} by {:?}, lock first {}, commit first {}",
+          id, kind, lock_first, commit_first
+        );
+        assert!(error.is_none(), "{}: {:?}", what, error);
+        assert!(values[0] == want[0], "{}: the TEXT", what);
+        assert!(values[1] == want[1], "{}: the LONGBLOB", what);
+        assert_eq!(
+          conn.blob_rounds() - rounds,
+          read_rounds(kind, lock_first, commit_first, parts),
+          "{}: its rounds",
+          what
+        );
+      }
+    }
+  }
+  // Beside another row's read in its transaction, a committed read
+  // takes the lock first, whatever its value: its parts, or its unlock
+  // alone, in a second round.
+  for id in [2, 7] {
+    let length = match rows[id as usize - 1].1 {
+      Some(length) => length,
+      None => 0,
+    };
+    let rounds = conn.blob_rounds();
+    let (error, value) =
+      committed_read_beside(&mut conn, &t, &rec, id, 10, positions[0]);
+    assert!(error.is_none(), "row {}: {:?}", id, error);
+    assert!(value == Some(repeated(text, length)), "row {}", id);
+    assert_eq!(conn.blob_rounds() - rounds, 1, "row {}", id);
+  }
+  // A row not there: the read fails alone, with 626.
+  let (error, _) = read_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    99,
+    ReadKind::Committed,
+    false,
+    false,
+    &positions,
+  );
+  assert_eq!(error.map(|e| e.code), Some(626));
+  // Every transaction was let go of: none is left behind.
+  conn.poll(0);
+  assert_eq!(conn.transactions_open(), 0);
+}
+
+#[test]
+fn blob_reads_of_parts_on_disk_leave_the_padding() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let d = bind(&mut conn, "bl_disk");
+  let sizes = blob_column_of(&d, "t").sizes().expect("sizes");
+  let length = (sizes.inline + 2 * sizes.part + 5) as usize;
+  mysql(&format!(
+    "INSERT INTO {db}.bl_disk (id, b, t) VALUES
+       (1, LEFT(REPEAT(UNHEX('00FF7F80EE11'), {n}), {len}),
+        LEFT(REPEAT('abcdefg', {n}), {len}))",
+    db = IC_IT_DB,
+    n = length / 6 + 1,
+    len = length
+  ))
+  .expect("a row written by MySQL");
+  let rec = record_over(&d, &["id", "b", "t"]);
+  let positions = [position_in(&d, &rec, "b"), position_in(&d, &rec, "t")];
+  for kind in [ReadKind::Committed, ReadKind::Locked] {
+    let (error, values) =
+      read_blob_row(&mut conn, &d, &rec, 1, kind, false, false, &positions);
+    assert!(error.is_none(), "{:?}: {:?}", kind, error);
+    let b = repeated(&[0x00, 0xFF, 0x7F, 0x80, 0xEE, 0x11], length);
+    assert!(values[0] == Some(b), "{:?}: the BLOB", kind);
+    assert!(
+      values[1] == Some(repeated(b"abcdefg", length)),
+      "{:?}",
+      kind
+    );
+  }
+}
+
+/// A value that checks itself: its seed and length in its first eight
+/// bytes, then bytes the seed gives.
+fn checked_value(seed: u32, length: usize) -> Vec<u8> {
+  let mut value = Vec::with_capacity(length.max(8));
+  value.extend_from_slice(&seed.to_le_bytes());
+  value.extend_from_slice(&(length as u32).to_le_bytes());
+  let mut i: u32 = 0;
+  while value.len() < length {
+    value.push((seed.wrapping_mul(31).wrapping_add(i) >> 3) as u8);
+    i += 1;
+  }
+  value
+}
+
+/// True if a value is whole: as [`checked_value`] made it.
+fn value_checks(value: &[u8]) -> bool {
+  if value.len() < 8 {
+    return false;
+  }
+  let seed = u32::from_le_bytes([value[0], value[1], value[2], value[3]]);
+  let length = u32::from_le_bytes([value[4], value[5], value[6], value[7]]);
+  length as usize == value.len()
+    && checked_value(seed, length as usize) == value
+}
+
+#[test]
+fn blob_readers_and_writers_see_no_torn_value() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  // Five rows of MEDIUMBLOB values from inline to five parts, updated
+  // by two threads while three read them, each its own way: whatever
+  // they meet, a value read is whole, and no one deadlocks (266).
+  const ROWS: i64 = 5;
+  const ROUNDS: u32 = 60;
+  let length_of =
+    |seed: u32| 8 + (seed as usize % 6) * 3500 + seed as usize % 97;
+  let mut setup = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut setup, "bl_kinds");
+  let rec = record_over(&t, &["id", "m"]);
+  let at_m = position_in(&t, &rec, "m");
+  let mut id: i64 = 700;
+  while id < 700 + ROWS {
+    let value = checked_value(id as u32, length_of(id as u32));
+    let (state, _) = insert_blob_row(
+      &mut setup,
+      &t,
+      &rec,
+      id,
+      &[(at_m, Some(value.as_slice()))],
+      AbortOption::Default,
+    );
+    assert_eq!(state, CommitState::Committed);
+    id += 1;
+  }
+  let mut conns: Vec<ApidConnection> = Vec::new();
+  while conns.len() < 5 {
+    conns.push(cluster.global.create_connection().expect("a connection"));
+  }
+  let mut failures: Vec<String> = Vec::new();
+  std::thread::scope(|scope| {
+    let mut handles = Vec::new();
+    for (n, conn) in conns.into_iter().enumerate() {
+      handles.push(scope.spawn(move || {
+        let mut conn = conn;
+        let t = bind(&mut conn, "bl_kinds");
+        let rec = record_over(&t, &["id", "m"]);
+        let at_m = position_in(&t, &rec, "m");
+        let mut found: Vec<String> = Vec::new();
+        let mut i: u32 = 0;
+        while i < ROUNDS {
+          let id = 700 + ((i as i64 + n as i64) % ROWS);
+          if n < 2 {
+            let seed = 1000 * (n as u32 + 1) + i;
+            let value = checked_value(seed, length_of(seed));
+            let update = write_args(WriteKind::Update, AbortOption::Default);
+            let (state, error) = write_blob_row(
+              &mut conn,
+              &t,
+              &rec,
+              id,
+              &[(at_m, Some(value.as_slice()))],
+              &update,
+            );
+            if state != CommitState::Committed || error.is_some() {
+              found.push(format!("writer {}: {:?} {:?}", n, state, error));
+            }
+          } else {
+            let (kind, lock_first) = match n {
+              2 => (ReadKind::Committed, false),
+              3 => (ReadKind::Committed, true),
+              _ => (ReadKind::Locked, false),
+            };
+            let (error, values) = read_blob_row(
+              &mut conn,
+              &t,
+              &rec,
+              id,
+              kind,
+              lock_first,
+              i % 2 == 0,
+              &[at_m],
+            );
+            match (&error, &values[0]) {
+              (None, Some(value)) if value_checks(value) => {}
+              _ => found.push(format!(
+                "reader {:?}: {:?}, {} bytes",
+                kind,
+                error,
+                values[0].as_ref().map_or(0, |value| value.len())
+              )),
+            }
+          }
+          i += 1;
+        }
+        found
+      }));
+    }
+    for handle in handles {
+      failures.extend(handle.join().expect("a thread"));
+    }
+  });
+  assert!(failures.is_empty(), "{:?}", failures);
 }
 
 /// As [`finish`], giving up after `wait_ms`: `None` if the transaction

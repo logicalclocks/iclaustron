@@ -199,7 +199,7 @@ then, into the connection's staged buffer, and goes with the next send.
 - Every row size a table can hold is written: a request too large for
   one message goes as a train of fragments (05 §2.2).
 
-### Blob values (phase 12; inserts since 12.3, other writes since 12.4)
+### Blob values (phase 12; inserts since 12.3, other writes since 12.4, reads since 12.5)
 
 An attribute record may name blob fields (BLOB, TEXT, and a MySQL
 server's JSON and GEOMETRY), and a query over it holds their values
@@ -225,12 +225,12 @@ a column comment changed them, counts as LONG. A value read is held only
 to what its column keeps, so one another program wrote longer is read
 whole.
 
-Such a query writes: `write_key` with any `WriteKind`, by primary key,
-running no program. A delete by primary key from a table with blob
-columns, whether its record names blob fields or not, deletes their
-parts with the row. Reads come in 12.5 and are refused until then
-(`IC_ERROR_NOT_SUPPORTED`), as are an executor's shapes until 12.6 and
-unique queries until 12.7; scans and takeovers always refuse them. A
+Such a query reads and writes: `read_key` with any `ReadKind` and
+`write_key` with any `WriteKind`, by primary key, running no program. A
+delete by primary key from a table with blob columns, whether its
+record names blob fields or not, deletes their parts with the row. An
+executor's shapes refuse blob fields until 12.6 and unique queries
+until 12.7 (`IC_ERROR_NOT_SUPPORTED`); scans and takeovers always do. A
 delete keeps 7153 through a unique index, of a row taken over from a
 scan, on a table with a blob column that cannot be used, and through
 an executor or `key_op::write_key` until 12.6.
@@ -251,9 +251,27 @@ rounds of its own:
   past the value's length, never read. With `query.set_blob_probe(true)`
   such a write also deletes, if there, the part past its value's last,
   and the next while one is, and its commit comes a round later;
-- a delete: the heads read, locked, then the row and every part.
+- a delete: the heads read, locked, then the row and every part;
+- a locked read (`Locked`, `Exclusive`, `ExclusiveNoWait`): the row
+  read with its lock, held to the commit, then the parts, each with a
+  simple read, the lock taken and let go of in the read;
+- a committed read that is its transaction's only operation: the row
+  read committed, which is all for an inline value; a value with parts
+  is read again with a shared lock and its lock reference, then its
+  parts, and the row is unlocked, three rounds. With
+  `query.set_blob_lock_first(true)`, and always in a transaction with
+  other rows, the first read takes the lock and its lock reference, two
+  rounds whatever the value. A simple read goes so too. Once a commit
+  is asked for, the commit lets the lock go and no unlock is sent. A
+  committed read alone holds the commit back from its first round: an
+  inline value then commits at the client at no cost, and a value with
+  parts is read again with the locking reads, which begin a new
+  transaction at the data nodes under the same transaction. A part not
+  there fails the read with 4267, its transaction going on.
 
-A column with no parts table takes no head read. An update or a delete
+A column with no parts table takes no head read, and a read of only
+such columns is the program's own read, in one round. The values a
+read brings are the query's, `blob(position)`, once it completes. An update or a delete
 of a row not there fails in its first round, and sends nothing more.
 Two BLOB queries on one row in one transaction run one after the
 other, in the order they were defined. The query itself goes on no
