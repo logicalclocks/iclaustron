@@ -346,9 +346,11 @@ pub const IC_ERROR_TRANSACTION_ACTIVE: i32 = 7150;
 pub const IC_ERROR_TRANSACTION_ROLLED_BACK: i32 = 7151;
 /// The data node knows no such collation or character set.
 pub const IC_ERROR_NO_SUCH_COLLATION: i32 = 7152;
-/// A delete on a table with a blob column: the row's blob parts, kept
-/// in another table that the client looks after, would be left behind.
-/// Refused until blobs are supported.
+/// A delete on a table with a blob column that would leave the row's
+/// blob parts, kept in another table that the client looks after,
+/// behind: through a unique index, of a scanned row taken over, or by
+/// an executor or a synchronous helper, until they delete them too
+/// (chapter 06, phase 12).
 pub const IC_ERROR_DELETE_WITH_BLOBS: i32 = 7153;
 /// The index is not online: still being built, being dropped, or
 /// broken. A lookup through it would find nothing.
@@ -869,7 +871,7 @@ pub fn message(code: i32) -> &'static str {
     IC_ERROR_TRANSACTION_ROLLED_BACK => "The transaction was rolled back",
     IC_ERROR_NO_SUCH_COLLATION => "No such collation or character set",
     IC_ERROR_DELETE_WITH_BLOBS => {
-      "Deleting rows of a table with BLOB or TEXT columns is not supported yet"
+      "Deleting this row would leave its BLOB or TEXT parts behind"
     }
     IC_ERROR_INDEX_NOT_ONLINE => "The index is not online",
     IC_ERROR_INDEXED_COLUMN_UPDATE => {

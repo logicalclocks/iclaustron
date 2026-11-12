@@ -1681,6 +1681,12 @@ impl Runner {
         };
         self.conn.read_key(qid, trans, &args)
       }
+      // A delete from a table with blob columns waits for the executor
+      // to run BLOB queries (chapter 06, 12.6): it would leave the
+      // parts behind.
+      OpKind::Write(WriteKind::Delete) if op.shape.table.has_blob_columns() => {
+        Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS))
+      }
       OpKind::Write(kind) => {
         let args = WriteKeyArgs {
           kind,

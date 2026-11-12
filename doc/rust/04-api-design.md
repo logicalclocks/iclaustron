@@ -199,7 +199,7 @@ then, into the connection's staged buffer, and goes with the next send.
 - Every row size a table can hold is written: a request too large for
   one message goes as a train of fragments (05 §2.2).
 
-### Blob values (phase 12; inserts since 12.3)
+### Blob values (phase 12; inserts since 12.3, other writes since 12.4)
 
 An attribute record may name blob fields (BLOB, TEXT, and a MySQL
 server's JSON and GEOMETRY), and a query over it holds their values
@@ -225,25 +225,47 @@ a column comment changed them, counts as LONG. A value read is held only
 to what its column keeps, so one another program wrote longer is read
 whole.
 
-So far such a query inserts: `write_key` with `WriteKind::Insert`, by
-primary key, running no program. Its other operations come in 12.4 and
-12.5 and are refused until then (`IC_ERROR_NOT_SUPPORTED`; a delete
-keeps 7153), as are an executor's shapes until 12.6 and unique queries
-until 12.7; scans and takeovers always refuse them.
+Such a query writes: `write_key` with any `WriteKind`, by primary key,
+running no program. A delete by primary key from a table with blob
+columns, whether its record names blob fields or not, deletes their
+parts with the row. Reads come in 12.5 and are refused until then
+(`IC_ERROR_NOT_SUPPORTED`), as are an executor's shapes until 12.6 and
+unique queries until 12.7; scans and takeovers always refuse them. A
+delete keeps 7153 through a unique index, of a row taken over from a
+scan, on a table with a blob column that cannot be used, and through
+an executor or `key_op::write_key` until 12.6.
 
-An insert goes in rounds (chapter 06, phase 12): the main row, with the
-head and inline bytes, and the parts beside it in the first round, at
-most `GlobalOptions::blob_round_bytes` of part data (1 MiB by default)
-in a round, a longer value going on in rounds of its own. An insert
-that ignores errors (`AbortOption::IgnoreError`) sends the row alone,
-and its parts once it went in. The query stays sent until its last
-round is done, and then completes once. Each round after the first is
-sent by the poll that saw the one before it done, with whatever else is
-defined on the connection. A commit asked for waits for the last round
-of every BLOB query of its transaction and rides on it.
-`conn.blob_rounds()` counts the rounds sent after a query's first. In
-C the calls come with 12.8; until then `ic_apid_query_create` refuses a
-record naming a blob field.
+Every write goes in rounds (chapter 06, phase 12), at most
+`GlobalOptions::blob_round_bytes` (1 MiB by default) of part data in a
+round, a delete counting a whole part, a longer value going on in
+rounds of its own:
+
+- an insert: the main row, with the heads and inline bytes, and the
+  parts beside it in the first round; one that ignores errors
+  (`AbortOption::IgnoreError`) sends the row alone, and its parts once
+  it went in;
+- a write or an update: the old values' heads read, locked, beside the
+  main row's write, then the new parts written and the old ones past
+  them deleted. A write that finds no row deletes none; an insert
+  racing it, between its head read and its write, may then leave parts
+  past the value's length, never read. With `query.set_blob_probe(true)`
+  such a write also deletes, if there, the part past its value's last,
+  and the next while one is, and its commit comes a round later;
+- a delete: the heads read, locked, then the row and every part.
+
+A column with no parts table takes no head read. An update or a delete
+of a row not there fails in its first round, and sends nothing more.
+Two BLOB queries on one row in one transaction run one after the
+other, in the order they were defined. The query itself goes on no
+wire: its run's operations carry it, and it completes once, when its
+last round is done. Each round after the first is sent by the poll that
+saw the one before it done, with whatever else is defined on the
+connection. A commit asked for waits for the last round of every BLOB
+query of its transaction and rides on it, or goes alone once none has
+another. `conn.blob_rounds()` counts the rounds sent after a query's
+first. In C the calls for values come with 12.8; until then
+`ic_apid_query_create` refuses a record naming a blob field, while a
+delete by primary key from a table with blob columns goes through.
 
 ### Transactions
 

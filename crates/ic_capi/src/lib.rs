@@ -300,8 +300,9 @@ pub const IC_ERROR_NOT_SUPPORTED: i32 = 7127;
 /// Options or arguments not filled by their _init, or a struct smaller
 /// than this header's.
 pub const IC_ERROR_INCONSISTENT_DATA: i32 = 7020;
-/// A delete on a table with a blob column, refused until blobs are read
-/// and written.
+/// A delete from a table with a blob column that would leave its parts
+/// behind: through a unique index, of a scanned row taken over, or by
+/// a synchronous helper, refused until they delete the parts too.
 pub const IC_ERROR_DELETE_WITH_BLOBS: i32 = 7153;
 /// An update through a unique index that sets an indexed column.
 pub const IC_ERROR_INDEXED_COLUMN_UPDATE: i32 = 7155;
@@ -2583,9 +2584,11 @@ pub unsafe extern "C" fn ic_apid_conn_read_key(
 /// Errors: as `ic_apid_conn_read_key`; `IC_ERROR_NOT_SUPPORTED` too for an
 /// insert or a write through a unique index; `IC_ERROR_INDEXED_COLUMN_UPDATE`
 /// for an update through a unique index whose values hold an indexed column;
-/// `IC_ERROR_DELETE_WITH_BLOBS` for a delete on a table with a blob column;
-/// `IC_ERROR_RECORD_SIZE_TOO_BIG` for more column data than a request may
-/// carry. From here until the query completes its rows are the library's.
+/// `IC_ERROR_DELETE_WITH_BLOBS` for a delete through a unique index from a
+/// table with a blob column; `IC_ERROR_RECORD_SIZE_TOO_BIG` for more column
+/// data than a request may carry. A delete by primary key from a table with
+/// blob columns deletes their parts with the row, in rounds. From here until
+/// the query completes its rows are the library's.
 ///
 /// # Safety
 ///

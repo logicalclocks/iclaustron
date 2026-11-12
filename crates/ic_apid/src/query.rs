@@ -28,10 +28,12 @@
 //!
 //! **A query may hold blob values** (chapter 06, phase 12): when its
 //! attribute record names blob fields, their values are kept beside its
-//! rows, NULL until set, and its operation goes in rounds, with part
-//! operations of the driver's own (`blob_run`). Those are queries too,
-//! in the same table, so that their replies are routed as any query's
-//! are; they are the connection's, and the program never sees them.
+//! rows, NULL until set, and its operation goes in rounds, as does a
+//! delete from a table with blob columns: every request of it is an
+//! operation of the driver's own (`blob_run`), the query itself going
+//! on no wire. Those operations are queries too, in the same table, so
+//! that their replies are routed as any query's are; they are the
+//! connection's, and the program never sees them.
 
 use std::sync::Arc;
 
@@ -252,15 +254,17 @@ pub(crate) struct Execution {
   pub part_of: Option<PartOf>,
 }
 
-/// The BLOB query a part operation is for, and the round it went in:
-/// a reply to an operation of an earlier round is no longer the
-/// query's concern.
+/// The BLOB query an operation of the driver's is for, the round it
+/// went in, and its place in the round: a reply to an operation of an
+/// earlier round is no longer the query's concern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PartOf {
   /// The query.
   pub owner: QueryId,
   /// Its round, as its run counts them.
   pub round: u32,
+  /// Its place among the round's operations.
+  pub index: u32,
 }
 
 /// True if the record is over this version of the table.
@@ -345,6 +349,9 @@ pub struct ApidQuery {
   /// True for a part operation of the driver's own, which the program
   /// never sees.
   internal: bool,
+  /// A write of a BLOB query that finds no row probes for parts a
+  /// racing insert may have left ([`set_blob_probe`](Self::set_blob_probe)).
+  blob_probe: bool,
   pub(crate) execution: Execution,
 }
 
@@ -370,8 +377,8 @@ impl ApidQuery {
   /// column.
   ///
   /// The attribute record may name blob fields, whose values the query
-  /// holds ([`blob`](Self::blob)); only an insert takes them for now
-  /// (chapter 06, 12.3): reads come in 12.5, other writes in 12.4.
+  /// holds ([`blob`](Self::blob)); inserts, writes and updates take
+  /// them (chapter 06, 12.3 and 12.4), reads come in 12.5.
   pub fn new(
     table: &Arc<TableDef>,
     key_rec: &Record,
@@ -403,6 +410,7 @@ impl ApidQuery {
       blobs,
       run: None,
       internal: false,
+      blob_probe: false,
       execution: Execution::default(),
     })
   }
@@ -439,6 +447,7 @@ impl ApidQuery {
       blobs: None,
       run: None,
       internal: false,
+      blob_probe: false,
       execution: Execution::default(),
     })
   }
@@ -469,6 +478,7 @@ impl ApidQuery {
       blobs: None,
       run: None,
       internal: true,
+      blob_probe: false,
       execution: Execution::default(),
     })
   }
@@ -706,6 +716,26 @@ impl ApidQuery {
     self.values_mut()?.blob_buf_mut(position)
   }
 
+  /// Have a write that finds no row also delete, if there, the part
+  /// past its new value's last, and the next while one is, for the
+  /// executions defined from now on (chapter 06, phase 12): an insert of
+  /// the row racing the write, between its head read and its write, may
+  /// otherwise leave parts past the value's length, never read. Off by
+  /// default (the author, 2026-11-12): such a write's commit then waits
+  /// for the answer, a round later. Refused while the query is defined
+  /// or sent (`IC_ERROR_TRANSACTION_ACTIVE`).
+  pub fn set_blob_probe(&mut self, probe: bool) -> Result<(), IcError> {
+    self.check_idle()?;
+    self.blob_probe = probe;
+    Ok(())
+  }
+
+  /// True if a write that finds no row probes for parts left past its
+  /// value ([`set_blob_probe`](Self::set_blob_probe)).
+  pub fn blob_probe(&self) -> bool {
+    self.blob_probe
+  }
+
   /// The values of the attribute record's blob fields, if it names any.
   pub fn blob_values(&self) -> Option<&BlobValues> {
     self.blobs.as_ref()
@@ -780,6 +810,10 @@ impl ApidQuery {
   /// program. False if it would not unpack, for the caller to keep it
   /// and let the completion report why.
   pub(crate) fn unpack_direct(&mut self, words: &[u32]) -> bool {
+    // An operation of the driver's keeps its row for its query's run.
+    if self.internal {
+      return false;
+    }
     if self.unpack(words).is_err() {
       return false;
     }

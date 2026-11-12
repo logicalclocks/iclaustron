@@ -107,6 +107,7 @@ use crate::apid_conn::ApidConnection;
 use crate::apid_conn::CoordRecord;
 use crate::apid_conn::Staged;
 use crate::apid_global::LinkStatus;
+use crate::blob::BlobColumn;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
 use crate::hash;
@@ -225,6 +226,9 @@ pub struct Transaction {
   /// Its BLOB queries that plan a round after the one they have out: a
   /// commit asked for waits until none does (chapter 06, phase 12).
   blob_planning: u32,
+  /// Its BLOB queries whose runs go on, in the order they were defined:
+  /// one on a row another of them is on waits for it.
+  blob_runs: Vec<QueryId>,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -312,6 +316,21 @@ impl Transaction {
   /// no rollback asked for.
   pub(crate) fn takes_blob_rounds(&self) -> bool {
     self.state == CommitState::Started && !self.rolls_back()
+  }
+
+  /// Its BLOB queries whose runs go on, in the order they were defined.
+  pub(crate) fn blob_runs(&self) -> &[QueryId] {
+    &self.blob_runs
+  }
+
+  /// A BLOB query's run has started on it.
+  pub(crate) fn add_blob_run(&mut self, qid: QueryId) {
+    self.blob_runs.push(qid);
+  }
+
+  /// A BLOB query's run has ended.
+  pub(crate) fn remove_blob_run(&mut self, qid: QueryId) {
+    self.blob_runs.retain(|other| *other != qid);
   }
 
   /// True once a rollback has been asked for, or has happened: a scan
@@ -574,6 +593,7 @@ impl ApidConnection {
       queued_for_send: false,
       last_sent: 0,
       blob_planning: 0,
+      blob_runs: Vec::new(),
     };
     let id = TransId(self.transactions.insert(trans)?);
     self.active_insert(coord.index, id);
@@ -791,36 +811,57 @@ impl ApidConnection {
       Some(trans) if trans.is_open() => (trans.trans_id, trans.coord),
       _ => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
     };
-    let query = match self.query(query_id) {
-      Some(query) => query,
-      None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    // The field alone is borrowed, so that the scratch buffers can be
+    // taken while the query is read; a run's operation is named by none.
+    let query = match self.queries.get(query_id.0) {
+      Some(query) if !query.is_internal() => query,
+      _ => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
     let state = query.state();
     if state == QueryState::Defined || state == QueryState::Sent {
       return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE));
     }
     // The blobs' parts are rows of another table that the client keeps
-    // in step; a delete of the row alone would leave them behind. A
-    // unique query's table is the base table, so this covers both.
-    if flags.operation == key_ops::IC_OP_DELETE
-      && query.table().has_blob_columns()
-    {
-      return Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS));
+    // in step: a delete by primary key deletes them with the row, in
+    // rounds (chapter 06, 12.4). Through a unique index (12.7), as a
+    // scanned row taken over, or with a blob column that cannot be used,
+    // a delete would leave them behind. A unique query's table is the
+    // base table, so this covers both.
+    let delete = flags.operation == key_ops::IC_OP_DELETE;
+    let blob_table = query.table().has_blob_columns();
+    if delete && blob_table {
+      let usable = query
+        .table()
+        .blob_columns()
+        .iter()
+        .all(BlobColumn::is_usable);
+      if query.index().is_some() || takeover.is_some() || !usable {
+        return Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS));
+      }
     }
     // A takeover names the scanned row of the base table.
     if takeover.is_some() && query.index().is_some() {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
-    // A query with blob values goes in rounds (chapter 06, phase 12):
-    // so far an insert by primary key, running no program, and never a
-    // takeover, which is a scan's.
-    let has_blobs = query.blob_values().is_some();
-    if has_blobs {
-      let insert = flags.operation == key_ops::IC_OP_INSERT;
+    // A query with blob values goes in rounds, as such a delete does
+    // (chapter 06, phase 12): a write by primary key, running no
+    // program, and never a takeover, which is a scan's. Reads come in
+    // 12.5.
+    if query.blob_values().is_some() || (delete && blob_table) {
+      let writes = matches!(
+        flags.operation,
+        key_ops::IC_OP_INSERT
+          | key_ops::IC_OP_WRITE
+          | key_ops::IC_OP_UPDATE
+          | key_ops::IC_OP_DELETE
+      );
       let plain = query.program().is_none() && query.after_record().is_none();
-      if !insert || !plain || query.index().is_some() || takeover.is_some() {
+      if !writes || !plain || query.index().is_some() || takeover.is_some() {
         return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
       }
+      return self.define_blob_query(
+        query_id, trans_id, flags, user_ref, callback, binding,
+      );
     }
     // A program, or reads after one, makes the operation interpreted:
     // a read, an update or a delete by primary key, assigning and
@@ -843,15 +884,6 @@ impl ApidConnection {
       }
       flags.interpreted = true;
     }
-    // Whatever a BLOB query's run would refuse is refused now, before
-    // anything is packed; its first round is planned.
-    if has_blobs {
-      self.prepare_blob_run(query_id, &flags)?;
-    }
-    let query = match self.queries.get(query_id.0) {
-      Some(query) => query,
-      None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
-    };
     // A unique query names the index's own table and goes as a
     // UNIQUE_OP_REQ; the coordinator looks the row up through the index.
     let (signal, table_id, table_version) = match query.index() {
@@ -966,12 +998,50 @@ impl ApidConnection {
       trans.defined.push(query_id);
     }
     self.queue_for_send(trans_id);
-    // A BLOB query's first round: its part operations after it.
-    if has_blobs {
-      if let Err(e) = self.start_blob_run(query_id, trans_id) {
-        self.undefine(query_id, trans_id);
-        return Err(e);
+    Ok(())
+  }
+
+  /// Define a BLOB query (chapter 06, phase 12): its run made ready,
+  /// refusing what it would refuse before anything is defined; the
+  /// query defined with nothing packed, since its run's operations
+  /// carry it; and its first round started.
+  fn define_blob_query(
+    &mut self,
+    query_id: QueryId,
+    trans_id: TransId,
+    flags: KeyOpFlags,
+    user_ref: usize,
+    callback: Option<QueryCallback>,
+    binding: usize,
+  ) -> Result<(), IcError> {
+    let id = match self.transactions.get(trans_id.0) {
+      Some(trans) => trans.trans_id,
+      None => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
+    };
+    self.prepare_blob_run(query_id, &flags)?;
+    if let Some(query) = self.queries.get_mut(query_id.0) {
+      if query.state() == QueryState::Completed && query.callback().is_none() {
+        self.executed.retain(|done| *done != query_id);
       }
+      query.begin(
+        Execution {
+          trans: Some(trans_id),
+          trans_id: id,
+          flags,
+          ..Execution::default()
+        },
+        user_ref,
+        callback,
+        binding,
+      );
+    }
+    if let Some(trans) = self.transactions.get_mut(trans_id.0) {
+      trans.defined.push(query_id);
+    }
+    self.queue_for_send(trans_id);
+    if let Err(e) = self.start_blob_run(query_id, trans_id) {
+      self.undefine(query_id, trans_id);
+      return Err(e);
     }
     Ok(())
   }
@@ -1172,13 +1242,31 @@ impl ApidConnection {
         None => return Ok(()),
       };
     let commit_now = end_wanted == Some(CommitState::CommitRequested) && !held;
+    // A BLOB query goes on no wire: its run's operations carry it, and
+    // the batch's flags go on theirs.
+    let mut last_packed: Option<usize> = None;
+    for (index, qid) in defined.iter().enumerate() {
+      if self.is_packed(*qid) {
+        last_packed = Some(index);
+      }
+    }
     let mut begun = begun;
     let mut i: usize = 0;
     while i < defined.len() {
       let qid = defined[i];
-      let last = i + 1 == defined.len();
-      let sent = self.send_query(qid, !begun, last, last && commit_now);
+      let last = Some(i) == last_packed;
       i += 1;
+      if !self.is_packed(qid) {
+        if let Some(query) = self.queries.get_mut(qid.0) {
+          query.set_state(QueryState::Sent);
+        }
+        if let Some(trans) = self.transactions.get_mut(id.0) {
+          trans.sent.push(qid);
+          trans.ops_sent += 1;
+        }
+        continue;
+      }
+      let sent = self.send_query(qid, !begun, last, last && commit_now);
       match sent {
         Ok(()) => {
           begun = true;
@@ -1224,6 +1312,15 @@ impl ApidConnection {
       }
     }
     Ok(())
+  }
+
+  /// True if the query has a request packed: false for a BLOB query,
+  /// whose run's operations carry it.
+  fn is_packed(&self, qid: QueryId) -> bool {
+    match self.queries.get(qid.0) {
+      Some(query) => query.execution.staged.len > 0,
+      None => false,
+    }
   }
 
   /// A query's staged request is not to go.
@@ -1762,18 +1859,15 @@ impl ApidConnection {
     if !done {
       return;
     }
-    // A BLOB query's own operation: its run completes the query once
-    // its round is done and no further round is due.
-    if self.blob_main_done(qid) {
-      return;
-    }
     if let Some(query) = self.queries.get_mut(qid.0) {
-      if is_read {
+      // An operation of a BLOB query's run keeps the row it read for
+      // the run to take.
+      if !is_read {
+        query.set_result_len(0);
+      } else if !query.is_internal() {
         if let Err(e) = query.take_row() {
           query.fail(e);
         }
-      } else {
-        query.set_result_len(0);
       }
       query.set_state(QueryState::Completed);
     }
@@ -1836,13 +1930,17 @@ impl ApidConnection {
         None => (None, None, 0, None, None, None),
       };
     if let Some(of) = part_of {
+      let mut error_data: u32 = 0;
+      if let Some(query) = self.queries.get_mut(qid.0) {
+        error_data = query.error_data();
+      }
       if let Some(tid) = tid {
         self.leave_transaction(qid, tid);
       }
       if let Some(query) = self.queries.get_mut(qid.0) {
         query.set_state(QueryState::Idle);
       }
-      self.blob_op_done(of, error);
+      self.blob_op_done(qid, of, error, error_data);
       return;
     }
     self.end_blob_run(qid);
@@ -2420,6 +2518,7 @@ mod tests {
       queued_for_send: false,
       last_sent: 0,
       blob_planning: 0,
+      blob_runs: Vec::new(),
     };
     assert!(!trans.is_done());
     trans.state = CommitState::Committed;
@@ -2447,6 +2546,7 @@ mod tests {
       queued_for_send: false,
       last_sent,
       blob_planning: 0,
+      blob_runs: Vec::new(),
     }
   }
 

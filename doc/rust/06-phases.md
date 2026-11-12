@@ -2424,10 +2424,14 @@ commits; *n* is the new value's number of parts, *old* the old value's.
 - A column with no parts table (part size 0, MySQL's TINYBLOB and
   TINYTEXT) is a plain column: its operations take one round with no
   head read, and a value past the inline size is refused with 4266.
-- A write whose head read found no row deletes part *n* in round 2 as
-  well, ignoring the error: a row inserted between the head read and
-  the write would otherwise leave its parts behind. If that part was
-  there, the deletes go on in further rounds until one is missing.
+- A write whose head read found no row deletes no part: a row
+  inserted between the head read and the write may then leave its
+  parts past the value's length, never read (the author, 2026-11-12;
+  chapter 10). With the query's `blob_probe` flag such a write deletes
+  part *n* in round 2 as well, ignoring the error, and if that part was
+  there, the deletes go on in further rounds until one is missing; a
+  round with such a probe is not the last, so its commit comes a round
+  later.
 - An update or a delete of a row not there fails in round 1, as it
   would without blobs, and sends nothing more.
 - A committed read's commit rides on round 1 only when no other BLOB
@@ -2524,10 +2528,12 @@ belongs to its query, as rows do.
 - On a query: `blob(field)`, which gives `Option<&[u8]>`, `None` for
   NULL; `set_blob(field, &[u8])`, `set_blob_null(field)`, and
   `blob_buf_mut(field)` to fill the buffer in place;
-  `set_blob_lock_first(bool)` for a committed read (item 4). In C,
-  `ic_apid_query_blob`, `ic_apid_query_set_blob`,
-  `ic_apid_query_set_blob_null`, `ic_apid_query_blob_buffer` and
-  `ic_apid_query_set_blob_lock_first`.
+  `set_blob_lock_first(bool)` for a committed read (item 4);
+  `set_blob_probe(bool)` for a write that finds no row to probe for a
+  racing insert's parts (12.4). In C, `ic_apid_query_blob`,
+  `ic_apid_query_set_blob`, `ic_apid_query_set_blob_null`,
+  `ic_apid_query_blob_buffer`, `ic_apid_query_set_blob_lock_first` and
+  `ic_apid_query_set_blob_probe`.
 - On an executor's `KeyOp`, the same calls. `define_op` swaps its
   buffers into the pooled query and `complete_op` swaps them back, so
   nothing is copied, and a buffer keeps its capacity, so that a run
@@ -2702,6 +2708,57 @@ none; writes racing inserts of the same keys leave no part past any
 value's length; an update of a missing row fails and sends nothing
 more; a data node stopped during large writes leaves no part past any
 value's length.
+
+Done 2026-11-12, every test passing, with the probe always on and
+again once it became the query's flag:
+
+- **Every request is the driver's.** A BLOB query's main row goes as
+  an operation of the connection's own, as its head read and parts do;
+  the query itself is defined and sent with its transaction but goes
+  on no wire, taking no place in the batch, and completes when its run
+  does (ours to choose: a delete's main row goes in its second round,
+  and a query waiting behind another on its row sends nothing in its
+  first, which the query's own request could not do). The inserts of
+  12.3 go the same way.
+- **Write and update**: round 1 the heads of the values whose columns
+  have parts, read exclusive, a write's ignoring a row not there, an
+  update's with its abort option, beside the main row's write; then the
+  new parts written and the old ones past them deleted. Old and new
+  inline: no round 2, a commit asked for goes alone.
+- **Delete**, by a query whether its record names blob fields or not:
+  round 1 the heads of every blob column of the table, with the
+  delete's abort option; round 2 the main row and every part. A delete
+  through a unique index (12.7), of a row taken over from a scan, or on
+  a table with a blob column that cannot be used, keeps 7153, and so do
+  an executor's (12.6) and `key_op::write_key` (12.6). In C a delete by
+  primary key now goes through, the header's text changed with it.
+- **A missing row**: an update or a delete aborting on error rolls the
+  transaction back in round 1, with 626; one ignoring errors fails
+  alone there; neither sends more.
+- **Deletes in the budget**: a delete or a probe costs a whole part of
+  the round's `blob_round_bytes` (ours to choose: a round holds no more
+  operations than a round of writes, whatever is deleted).
+- **The probe** of a write that found no row, as chapter 06 says
+  above, only with the query's `blob_probe` flag (the author, the same
+  day, after the tests had passed with it always on); a probe round is
+  never the last.
+- **Two BLOB queries on one row** (one table, the same key words) in
+  one transaction: the later waits for the earlier's end before its
+  first round, and holds the commit meanwhile.
+- **The head read's reply** is taken by the run from the operation's
+  row (`blob::parse_heads`); a head that disagrees with its column is
+  4267.
+- Tests: unit tests of the planner (writes, deletes, probes, first
+  rounds of each kind) and of the heads' read and parse; integration
+  tests in the `blob` group: a value grown, shrunk, set NULL, empty,
+  inline and grown again by writes and by updates, with the rounds
+  each takes, and a write of a row not there, with the probe and
+  without; deletes by records with and without blob fields; an update
+  and a delete of a missing row, aborting and ignoring errors; two
+  queries on each of two rows in one transaction; two threads racing
+  deletes and inserts against writes that probe; and, with
+  `IC_TEST_NDB_MGM`, a data node restarted during large writes. Each counts the parts by a scan of the parts table against
+  the lengths MySQL reads.
 
 ### 12.5 Locked and committed reads, the lock reference, the unlock (1 week)
 

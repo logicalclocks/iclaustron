@@ -51,7 +51,7 @@
 //!
 //! **A BLOB query goes in rounds** (chapter 06, phase 12): its own
 //! operation on the main row, and the part operations beside it, which
-//! the driver plans round by round ([`plan_part_writes`]) and runs on
+//! the driver plans round by round ([`plan_part_ops`]) and runs on
 //! the connection (`blob_run`).
 //!
 //! The functions here are pure: they work out sizes, check
@@ -881,88 +881,300 @@ pub enum RunKind {
   /// round, and its parts once it went in, so that a row that was
   /// there already keeps its own parts.
   InsertIgnoring,
+  /// A write: the old values' heads read, with an exclusive lock and
+  /// errors ignored, beside the main row's write in the first round;
+  /// the new parts written and the old ones past them deleted after.
+  Write,
+  /// An update: as a write, the heads read with the update's abort
+  /// option, on a row that must be there.
+  Update,
+  /// A delete: the heads read first, then the main row and every part
+  /// deleted.
+  Delete,
 }
 
-/// One blob value's parts, as the rounds write them.
+impl RunKind {
+  /// True when the first round reads the old values' heads, for the
+  /// values whose columns have parts.
+  pub fn reads_heads(self) -> bool {
+    matches!(self, RunKind::Write | RunKind::Update | RunKind::Delete)
+  }
+}
+
+/// One blob value's parts, as the rounds write and delete them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValueParts {
   /// Its column's sizes.
   pub sizes: BlobSizes,
-  /// Its length; 0 for NULL.
+  /// The new value's length; 0 for NULL, and for a delete.
   pub length: u64,
-  /// The next part to write.
+  /// The next of its parts to write.
   pub next: u64,
+  /// How many parts the old value has, once its head has been read.
+  pub old_parts: u64,
+  /// The next of the old value's parts to delete.
+  pub next_delete: u64,
+  /// A part to delete, there or not, past the new value's last: when
+  /// the row was not there as its head was read, a row inserted before
+  /// the write reached it may have left parts the write did not write
+  /// over (chapter 06, phase 12).
+  pub probe: Option<u64>,
 }
 
 impl ValueParts {
-  /// A value of `length` bytes, none of its parts written yet.
+  /// A new value of `length` bytes, none of its parts written yet, and
+  /// no old value.
   pub fn new(sizes: BlobSizes, length: u64) -> ValueParts {
     ValueParts {
       sizes,
       length,
       next: 0,
+      old_parts: 0,
+      next_delete: 0,
+      probe: None,
     }
   }
 
-  /// True once every part is planned.
+  /// How many parts the new value has.
+  pub fn parts(&self) -> u64 {
+    self.sizes.part_count(self.length)
+  }
+
+  /// The old value as its head gave it, `old_length` bytes: its parts
+  /// past the new value's last are to be deleted.
+  pub fn old_value(&mut self, old_length: u64) {
+    self.old_parts = self.sizes.part_count(old_length);
+    self.next_delete = self.parts();
+  }
+
+  /// The row was not there as the head was read: the part past the new
+  /// value's last is probed.
+  pub fn no_row(&mut self) {
+    if self.sizes.has_parts() {
+      self.probe = Some(self.parts());
+    }
+  }
+
+  /// A probed part was there, and is deleted: the next is probed too,
+  /// until one is not.
+  pub fn probe_found(&mut self, part: u64) {
+    self.probe = Some(part + 1);
+  }
+
+  /// True once every write, delete and probe is planned.
   pub fn planned(&self) -> bool {
-    self.next >= self.sizes.part_count(self.length)
+    self.next >= self.parts()
+      && self.next_delete >= self.old_parts
+      && self.probe.is_none()
   }
 }
 
-/// A part to write in a round: the value's place among the query's
-/// values, and the part's number.
+/// What is done to a part.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PartWrite {
+pub enum PartOpKind {
+  /// Written, with the write operation.
+  Write,
+  /// Deleted: it is there.
+  Delete,
+  /// Deleted if it is there, its absence ignored.
+  Probe,
+}
+
+/// A part operation of a round: the value's place among the query's
+/// values, the part's number, and what is done to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartOp {
   /// The value, by its place among the query's values.
   pub value: usize,
   /// The part.
   pub part: u64,
+  /// What is done to it.
+  pub kind: PartOpKind,
 }
 
-/// Plan the next round's part writes into `out`, emptied first: value
-/// by value, part by part, while the round's part data stays within
-/// `budget` bytes, and at least one part. True when no part is left to
-/// plan after them.
-pub fn plan_part_writes(
+/// Plan the next round's part operations into `out`, emptied first:
+/// value by value, its writes, then its deletes, then its probe, while
+/// the round stays within `budget` bytes, at least one operation. A
+/// write costs its part's bytes, a delete or a probe a whole part's
+/// (ours to choose: the operations of a round stay as few as a round of
+/// writes has, whatever is deleted). True when the round is the run's
+/// last: nothing is left after it, and it probes nothing, since a part
+/// found calls for another.
+pub fn plan_part_ops(
   values: &mut [ValueParts],
   budget: u64,
-  out: &mut Vec<PartWrite>,
+  out: &mut Vec<PartOp>,
 ) -> bool {
   out.clear();
   let mut bytes: u64 = 0;
+  let mut probes = false;
   for (index, value) in values.iter_mut().enumerate() {
-    while !value.planned() {
-      let len = value.sizes.part_len(value.length, value.next) as u64;
-      if !out.is_empty() && bytes + len > budget {
+    let parts = value.parts();
+    while value.next < parts {
+      let cost = value.sizes.part_len(value.length, value.next) as u64;
+      if !out.is_empty() && bytes + cost > budget {
         return false;
       }
-      out.push(PartWrite {
+      out.push(PartOp {
         value: index,
         part: value.next,
+        kind: PartOpKind::Write,
       });
-      bytes += len;
+      bytes += cost;
       value.next += 1;
     }
+    let whole = value.sizes.part as u64;
+    while value.next_delete < value.old_parts {
+      if !out.is_empty() && bytes + whole > budget {
+        return false;
+      }
+      out.push(PartOp {
+        value: index,
+        part: value.next_delete,
+        kind: PartOpKind::Delete,
+      });
+      bytes += whole;
+      value.next_delete += 1;
+    }
+    if let Some(part) = value.probe {
+      if !out.is_empty() && bytes + whole > budget {
+        return false;
+      }
+      out.push(PartOp {
+        value: index,
+        part,
+        kind: PartOpKind::Probe,
+      });
+      bytes += whole;
+      value.probe = None;
+      probes = true;
+    }
   }
-  true
+  !probes
 }
 
-/// Plan a run's first round into `out`: the part writes that go beside
-/// the main row's operation. True when it is the run's last round.
+/// Plan a run's first round into `out`: the part operations that go
+/// beside the main row's operation, which only an insert that aborts
+/// on error has. True when it is the run's last round: an insert's
+/// whose parts all fit it, one that ignores errors with no parts, and
+/// any other with no head to read, as for a column without parts.
 pub fn plan_first_round(
   kind: RunKind,
   values: &mut [ValueParts],
   budget: u64,
-  out: &mut Vec<PartWrite>,
+  out: &mut Vec<PartOp>,
 ) -> bool {
-  match kind {
-    RunKind::Insert => plan_part_writes(values, budget, out),
-    RunKind::InsertIgnoring => {
-      out.clear();
-      values.iter().all(ValueParts::planned)
-    }
+  if kind == RunKind::Insert {
+    return plan_part_ops(values, budget, out);
   }
+  out.clear();
+  if kind.reads_heads() {
+    return !reads_any_head(values);
+  }
+  values.iter().all(ValueParts::planned)
+}
+
+/// True when some value's column has parts, whose old value's head is
+/// then read.
+pub fn reads_any_head(values: &[ValueParts]) -> bool {
+  values.iter().any(|value| value.sizes.has_parts())
+}
+
+/// The column section of a read of the blob columns `ids`, asked for
+/// by bitmask, into `out`, emptied first: the read of the old values'
+/// heads.
+pub fn heads_read_info(ids: &[u32], out: &mut Vec<u32>) {
+  out.clear();
+  let mut max_id: u32 = 0;
+  for id in ids {
+    max_id = max_id.max(*id);
+  }
+  let mask_words = (max_id / 32 + 1) as usize;
+  out.push(column_header::column_header(
+    crate::row_codec::IC_COL_READ_MASKED,
+    4 * mask_words as u32,
+  ));
+  out.resize(1 + mask_words, 0);
+  for id in ids {
+    out[1 + (*id / 32) as usize] |= 1 << (*id % 32);
+  }
+}
+
+/// The heads a read of blob columns of `table` brought, a packed row as
+/// a read by bitmask gets it back: each column read, by its id, with
+/// its value's length, `None` for NULL, into `out`, emptied first. A
+/// head that disagrees with its column's sizes is a damaged value
+/// (4267); a row not as asked for is `IC_ERROR_INCONSISTENT_DATA`.
+pub fn parse_heads(
+  table: &TableDef,
+  words: &[u32],
+  out: &mut Vec<(u32, Option<u64>)>,
+) -> Result<(), IcError> {
+  let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
+  out.clear();
+  let header = match words.first() {
+    Some(header) => *header,
+    None => return Err(bad),
+  };
+  if column_header::column_id(header) != crate::row_codec::IC_COL_READ_MASKED {
+    return Err(bad);
+  }
+  let mask_words = (column_header::byte_size(header) / 4) as usize;
+  if words.len() < 1 + mask_words {
+    return Err(bad);
+  }
+  let mask = &words[1..1 + mask_words];
+  let data = crate::node_connect::words_as_bytes(&words[1 + mask_words..]);
+  let total_bits = 32 * mask_words;
+  let mut pos: usize = 0;
+  let mut bit: usize = 0;
+  let mut attr_id: u32 = 0;
+  while bit < total_bits {
+    let rest = mask[bit / 32] >> (bit % 32);
+    if rest == 0 {
+      let skip = 32 - bit % 32;
+      bit += skip;
+      attr_id += skip as u32;
+      continue;
+    }
+    let zeros = rest.trailing_zeros() as usize;
+    bit += zeros + 1;
+    let id = attr_id + zeros as u32;
+    attr_id = id + 1;
+    let attr = match table.field(id) {
+      Some(attr) => attr,
+      None => return Err(bad),
+    };
+    let sizes = match table.blob_column(id).and_then(BlobColumn::sizes) {
+      Some(sizes) => sizes,
+      None => return Err(bad),
+    };
+    // After a nullable column read, one more bit: set for NULL.
+    if attr.nullable {
+      let null = bit < total_bits && (mask[bit / 32] >> (bit % 32)) & 1 != 0;
+      bit += 1;
+      if null {
+        out.push((id, None));
+        continue;
+      }
+    }
+    // As any value is placed: a wide type on a word, a byte array, as
+    // a blob's column is, on the next byte.
+    if attr.size_bits_log2 >= table_props::IC_COLUMN_SIZE_32 {
+      pos = pos.next_multiple_of(4);
+    }
+    if pos + 2 > data.len() {
+      return Err(bad);
+    }
+    let len = 2 + data[pos] as usize + 256 * data[pos + 1] as usize;
+    if pos + len > data.len() {
+      return Err(bad);
+    }
+    let (length, _) = decode_main_value(sizes, &data[pos..pos + len])?;
+    out.push((id, Some(length)));
+    pos += len;
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -1585,7 +1797,7 @@ mod tests {
     let mut last = plan_first_round(kind, &mut values, budget, &mut out);
     let mut rounds = vec![out.len()];
     while !last {
-      last = plan_part_writes(&mut values, budget, &mut out);
+      last = plan_part_ops(&mut values, budget, &mut out);
       assert!(!out.is_empty(), "a round writes a part at least");
       rounds.push(out.len());
     }
@@ -1626,6 +1838,11 @@ mod tests {
     assert_eq!(rounds_of(insert, text, &[inline + 3 * part], 1), [1, 1, 1]);
   }
 
+  /// A part operation, for comparing plans.
+  fn op(value: usize, part: u64, kind: PartOpKind) -> PartOp {
+    PartOp { value, part, kind }
+  }
+
   #[test]
   fn blob_round_writes_value_by_value_part_by_part() {
     let text = sizes_of(&main_table(), "t");
@@ -1636,15 +1853,124 @@ mod tests {
       ValueParts::new(text, inline + 1),
     ];
     let mut out = Vec::new();
-    assert!(plan_part_writes(&mut values, 1 << 20, &mut out));
-    let want = [
-      PartWrite { value: 0, part: 0 },
-      PartWrite { value: 0, part: 1 },
-      PartWrite { value: 2, part: 0 },
-    ];
-    assert_eq!(out, want);
+    assert!(plan_part_ops(&mut values, 1 << 20, &mut out));
+    let write = PartOpKind::Write;
+    assert_eq!(out, [op(0, 0, write), op(0, 1, write), op(2, 0, write)]);
     // Nothing is left: a further round plans nothing.
-    assert!(plan_part_writes(&mut values, 1 << 20, &mut out));
+    assert!(plan_part_ops(&mut values, 1 << 20, &mut out));
     assert!(out.is_empty());
+  }
+
+  #[test]
+  fn blob_a_value_grown_shrunk_or_gone_deletes_the_old_parts_past_it() {
+    let text = sizes_of(&main_table(), "t");
+    let (inline, part) = (text.inline as u64, text.part as u64);
+    let (write, delete) = (PartOpKind::Write, PartOpKind::Delete);
+    let mut out = Vec::new();
+    // Shrunk from three parts to one: one written, two deleted.
+    let mut shrunk = [ValueParts::new(text, inline + 1)];
+    shrunk[0].old_value(inline + 3 * part);
+    assert!(plan_part_ops(&mut shrunk, 1 << 20, &mut out));
+    assert_eq!(out, [op(0, 0, write), op(0, 1, delete), op(0, 2, delete)]);
+    // Grown from one to two: both written, nothing deleted.
+    let mut grown = [ValueParts::new(text, inline + part + 1)];
+    grown[0].old_value(inline + 5);
+    assert!(plan_part_ops(&mut grown, 1 << 20, &mut out));
+    assert_eq!(out, [op(0, 0, write), op(0, 1, write)]);
+    // Set NULL or empty, or deleted: every old part deleted.
+    let mut gone = [ValueParts::new(text, 0)];
+    gone[0].old_value(inline + part + 1);
+    assert!(plan_part_ops(&mut gone, 1 << 20, &mut out));
+    assert_eq!(out, [op(0, 0, delete), op(0, 1, delete)]);
+    // Inline before and after: nothing to do.
+    let mut inline_only = [ValueParts::new(text, 10)];
+    inline_only[0].old_value(20);
+    assert!(plan_part_ops(&mut inline_only, 1 << 20, &mut out));
+    assert!(out.is_empty());
+    // A delete costs a whole part: two parts' worth a round.
+    let mut many = [ValueParts::new(text, 0)];
+    many[0].old_value(inline + 5 * part);
+    assert!(!plan_part_ops(&mut many, 2 * part, &mut out));
+    assert_eq!(out, [op(0, 0, delete), op(0, 1, delete)]);
+    assert!(!plan_part_ops(&mut many, 2 * part, &mut out));
+    assert!(plan_part_ops(&mut many, 2 * part, &mut out));
+    assert_eq!(out, [op(0, 4, delete)]);
+  }
+
+  #[test]
+  fn blob_a_write_that_found_no_row_probes_until_a_part_is_missing() {
+    let text = sizes_of(&main_table(), "t");
+    let (inline, part) = (text.inline as u64, text.part as u64);
+    let (write, probe) = (PartOpKind::Write, PartOpKind::Probe);
+    let mut out = Vec::new();
+    let mut values = [ValueParts::new(text, inline + part)];
+    values[0].no_row();
+    // The new part, and a probe past it: not the last round.
+    assert!(!plan_part_ops(&mut values, 1 << 20, &mut out));
+    assert_eq!(out, [op(0, 0, write), op(0, 1, probe)]);
+    // The probed part was there: the next is probed.
+    values[0].probe_found(1);
+    assert!(!plan_part_ops(&mut values, 1 << 20, &mut out));
+    assert_eq!(out, [op(0, 2, probe)]);
+    // It was not: nothing is left.
+    assert!(plan_part_ops(&mut values, 1 << 20, &mut out));
+    assert!(out.is_empty());
+    // A column without parts probes nothing.
+    let tiny = sizes_of(&main_table(), "tiny");
+    let mut plain = [ValueParts::new(tiny, 10)];
+    plain[0].no_row();
+    assert!(plan_part_ops(&mut plain, 1 << 20, &mut out));
+    assert!(out.is_empty());
+  }
+
+  #[test]
+  fn blob_first_rounds_of_each_kind() {
+    let text = sizes_of(&main_table(), "t");
+    let tiny = sizes_of(&main_table(), "tiny");
+    let mut out = Vec::new();
+    for kind in [RunKind::Write, RunKind::Update, RunKind::Delete] {
+      // Heads to read: the first round is never the last, and has no
+      // part operation.
+      let mut values = [ValueParts::new(text, 5000), ValueParts::new(tiny, 1)];
+      assert!(!plan_first_round(kind, &mut values, 1 << 20, &mut out));
+      assert!(out.is_empty());
+      assert!(reads_any_head(&values));
+      // Only columns without parts: one round, no head read.
+      let mut plain = [ValueParts::new(tiny, 1)];
+      assert!(plan_first_round(kind, &mut plain, 1 << 20, &mut out));
+      assert!(!reads_any_head(&plain));
+    }
+  }
+
+  #[test]
+  fn blob_heads_are_read_by_bitmask_and_parsed() {
+    let def = bound_main_table();
+    let mut info = Vec::new();
+    heads_read_info(&[1, 3], &mut info);
+    let masked = crate::row_codec::IC_COL_READ_MASKED;
+    assert_eq!(info, [column_header::column_header(masked, 4), 0b1010]);
+    // t, read and not NULL; tiny, read and NULL. A column takes a bit,
+    // read or not, and a nullable one read its NULL bit after it: t at
+    // bit 1, its NULL bit 2, b, not read, at bit 3, tiny at bit 4, its
+    // NULL bit 5, set.
+    let sizes = def.blob_column(1).and_then(BlobColumn::sizes);
+    let sizes = sizes.expect("t's sizes");
+    let mut value = Vec::new();
+    encode_main_value(sizes, &value_of(5000), &mut value).expect("t");
+    let mut words = vec![column_header::column_header(masked, 4)];
+    words.push(0b11_0010);
+    words.extend_from_slice(&padded(&value));
+    let mut heads = Vec::new();
+    parse_heads(&def, &words, &mut heads).expect("parsed");
+    assert_eq!(heads, [(1, Some(5000)), (3, None)]);
+    // A head that disagrees with its column is a damaged value: a
+    // length of 100, which would leave 100 bytes inline, not 256.
+    let mut bad = words.clone();
+    bad[4] = 100;
+    let refused = parse_heads(&def, &bad, &mut heads).expect_err("damaged");
+    assert_eq!(refused.code, IC_NDB_ERROR_BLOB_DAMAGED);
+    // A row not read by bitmask is not ours.
+    let refused = parse_heads(&def, &[7], &mut heads).expect_err("not ours");
+    assert_eq!(refused.code, err::IC_ERROR_INCONSISTENT_DATA);
   }
 }
