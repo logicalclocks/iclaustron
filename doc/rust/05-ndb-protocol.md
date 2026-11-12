@@ -1125,12 +1125,17 @@ fail the node, if they fail it at all.
   time when the connection let go of its records, and the node stopped
   with error 2343 (17.10).
 
-### 6.10 BLOB, TEXT and JSON (phase 12; read 2026-11-11, to be seen live in 12.1)
+### 6.10 BLOB, TEXT and JSON (phase 12; read 2026-11-11, seen 2026-11-12)
 
 From the author's model of how the reference keeps a blob column
-(2026-11-11), and the reference read the same day; none of it is seen
-on the wire yet. A blob is the client's work: the data node stores a
-main row and the rows of a parts table, and knows nothing joining them.
+(2026-11-11) and the reference read the same day, then seen on the wire
+on 2026-11-12: a MySQL server inserting, reading, updating, replacing
+and deleting TEXT, JSON, LONGBLOB and TINYBLOB values and a TEXT stored
+on disk, by primary key and through a unique index, captured with
+`tools/blob_capture.sh` and read with our dissector. What was seen, and
+what was not, is listed at the end of this section. A blob is the
+client's work: the data node stores a main row and the rows of a parts
+table, and knows nothing joining them.
 
 - **Which columns.** Types Blob (20) and Text (21); MySQL's BLOB, TEXT,
   JSON and GEOMETRY are all one of the two. In the main row the column
@@ -1174,7 +1179,7 @@ main row and the rows of a parts table, and knows nothing joining them.
   table is refused with 4266.
 - **How the reference runs an operation.** It reads the head with a
   shared lock before an update, a write or a delete, ignoring its error
-  for a write, and writes the parts in the next batch, once the head is
+  each time, and writes the parts in the next batch, once the head is
   back; an insert writes its parts in its first batch, unless it
   ignores errors, when it waits for the main insert to succeed. It
   reads parts with a simple read, not committed: the main row's lock
@@ -1198,8 +1203,8 @@ main row and the rows of a parts table, and knows nothing joining them.
   its key section is the lock reference's other two words. The data
   node finds the locking operation by them within the transaction,
   checks it, and lets its lock go; a key of other than two words is
-  refused with 4109. The reference sends it as a committed read that
-  aborts on error.
+  refused with 4109. It aborts on error, has one section, its key, and
+  asks for no columns; it carries neither the dirty nor the simple flag.
 - **Asked of the author (2026-11-11).** How we run each operation, the
   rounds, and why, are in chapter 06, phase 12: part writes in the
   second round (1), parts read with a simple read (2), the commit on
@@ -1207,7 +1212,59 @@ main row and the rows of a parts table, and knows nothing joining them.
   lock first (4), 1 MiB of parts per query in a round (5), an insert
   ignoring errors only when its abort option asks, its parts then in
   the second round (6), unique keys by the primary key read through the
-  index (7).
+  index (7); and, on 2026-11-12, every part written with the write
+  operation, an insert's too, as the reference does.
+- **Seen on the wire (2026-11-12)**, as described above unless said
+  here:
+  - the head, its size the column's 2-byte length, and the inline
+    bytes, for TEXT (inline 256, parts of 2 000), JSON (4 000, 8 100),
+    LONGBLOB (256, 13 948) and TINYBLOB (256, part size 0, no parts
+    table); NULL as a NULL column; stripe 0;
+  - the parts tables' names; a part's key, the main key's words and
+    then the part number; its columns, the key copied, `NDB$PART`,
+    `NDB$PKID` 0 and `NDB$DATA`, with a 2-byte length in memory and,
+    for a TEXT stored on disk, of exactly *P* bytes, the last part
+    padded with 0x20; the part arithmetic, the last part short;
+  - parts written with operation type write (4), for an insert too,
+    never insert or update; parts past a shrunk value's last deleted,
+    and all of them for a value set NULL, in the batch that writes the
+    head;
+  - the head read: a shared read of the blob column, asked for by
+    bitmap, the whole column coming back; one per blob column before a
+    write or a delete, only the column set before an update; its error
+    ignored each time. A write whose head read found no row deletes,
+    ignoring 626, the part after the new value's last, and part 0 of a
+    column it sets NULL;
+  - a part read: a simple read asking by bitmap for `NDB$DATA` alone;
+    a part stored on disk comes back whole, padding and all;
+  - the committed read: a shared read with bit 20, asking for the
+    columns by bitmap, then the lock reference, then each blob column;
+    the lock reference's three words; the parts in the next batch; the
+    unlock, as described, in a batch of its own after them, and only
+    while the transaction stays open: a MySQL server ending the
+    transaction with the statement rolls it back instead and sends no
+    unlock. With a shared or an exclusive lock asked for, the main read
+    has neither bit 20 nor the lock reference, and the lock is held to
+    the commit;
+  - through a unique index: the main table's primary key read through
+    the index, in the batch with the read of the columns, both with bit
+    20 and neither with the lock reference; the parts then by the
+    primary key;
+  - an insert that ignores errors, as a MySQL server's single-row insert
+    does, sends the main insert alone and its parts once it succeeded;
+    one that aborts on error sends its parts in its first batch, as the
+    last three rows of a ten-row insert did;
+  - the reference writes the head and inline bytes by an update of the
+    main row, after the parts in their batch and for an inline value
+    too, its insert carrying every blob column NULL; we write them in
+    the main insert (chapter 06, phase 12);
+  - about 64 KiB of part data in a batch: five LONGBLOB parts written,
+    then three; four read at a time. Deletes go all at once.
+- **Not seen**: an empty value; the sizes of MEDIUMBLOB and GEOMETRY; a
+  binary column on disk padded with 0x00; a stripe other than 0, and
+  `NDB$DIST`; the parts table's settings past its columns, which the
+  dictionary gives (12.2); 4109; and 4266 and 4267, which are the
+  client's own and never on the wire.
 
 ## 7. Scans
 

@@ -98,6 +98,12 @@
 | Inserts that ignore errors (was Q14) | an insert has a flag for it, its abort option, which by default does not ignore them: one round. One that ignores them sends the main insert alone in round 1, and its parts with the commit in round 2 only if the row went in |
 | The API's shape | ours to choose: each value belongs to its query, a blob field takes no room in a row, the executor swaps buffers, new synchronous helpers; the C ABI only grows (chapter 06, phase 12, "The API") |
 
+## Decided (2026-11-12), for phase 12
+
+| Topic | Decision |
+|---|---|
+| How a part is written | always with the write operation (type 4), an insert's parts too, as the reference does, seen on the wire the same day: it costs what an insert costs, and an orphan part left by a write racing an insert is written over, where inserting it would fail with 630 and roll the transaction back (chapter 06, phase 12) |
+
 ## Still open
 
 The recommendation is the default and the plan proceeds on it unless

@@ -2401,8 +2401,8 @@ commits; *n* is the new value's number of parts, *old* the old value's.
 
 | Operation | Round 1 | Round 2 | Round 3 | Open transaction | Committing |
 |---|---|---|---|---|---|
-| Insert | main insert (head and inline) and every part insert, +C | | | 1 | 1 |
-| Insert that ignores errors | main insert (head and inline) | every part insert, if the row went in, +C | | 2 | 2 |
+| Insert | main insert (head and inline) and every part written, +C | | | 1 | 1 |
+| Insert that ignores errors | main insert (head and inline) | every part written, if the row went in, +C | | 2 | 2 |
 | Write | head read, exclusive, errors ignored; main write | parts 0..n−1 written, n..old−1 deleted, +C | | 1–2 | 2 |
 | Update | as a write, the head read with the update's abort option | as a write, +C | | 1–2 | 2 |
 | Delete | head read, exclusive, of every blob column | main delete, every part deleted, +C | | 2 | 2 |
@@ -2410,6 +2410,12 @@ commits; *n* is the new value's number of parts, *old* the old value's.
 | Committed read | main read, committed, +C | main read, shared, with its lock reference | parts read; unlock, or +C | 1 or 3 | 1 or 3 |
 | Committed read, `blob_lock_first` | main read, shared, with its lock reference | parts read; unlock, or +C | | 1–2 | 2 |
 
+- **A part is always written with the write operation** (type 4), an
+  insert's parts too, as the reference does (seen 2026-11-12; the
+  author, the same day). It costs what an insert costs, and a part left
+  behind as an orphan, by a write racing an insert (below), is written
+  over, where inserting it would fail with 630 and roll the
+  transaction back.
 - Where the old and the new value both fit inline, a write has nothing
   for round 2 while the transaction stays open; a committing one sends
   its commit alone there. So does a locked read whose value is inline.
@@ -2436,10 +2442,10 @@ commits; *n* is the new value's number of parts, *old* the old value's.
   waited for: the query completes with its parts. Once the commit is
   asked for, the commit unlocks.
 - **An insert that ignores errors** (item 6) may find its row there
-  already, and then its parts must not go in: inserting a part of a row
-  that is there fails, and a part operation aborts on error, so the
-  transaction the program asked to keep would roll back; and parts
-  numbered past the old value's would stay behind as orphans. So, as
+  already, and then its parts must not go in: written over that row's
+  own parts, they would change a value whose head still gives the old
+  length, and parts numbered past the old value's would stay behind as
+  orphans. So, as
   the reference does it, round 1 sends the main insert alone, and round
   2 its parts, +C, only if the row went in. An inline value has no
   parts, and its insert needs no round 2 while the transaction stays
@@ -2554,6 +2560,18 @@ reads with a shared lock and then unlocks) and with a shared lock, read
 with our dissector, which learns the parts tables' requests and the
 unlock. Chapter 05 §6.10 completed from them. Exit: every fact of
 §6.10 seen on the wire, or marked as not.
+
+Done 2026-11-12. `tools/blob_capture.sh` runs 33 statements against a
+cluster started by MTR on fixed ports, each two seconds apart. It
+first checks that every data node is started and that the MySQL server
+is that cluster's, since a stale management server, and then another
+MTR run's on port 13000, had spoiled the first attempts. The dissector
+decodes the lock reference and the unlock, and splits a reply's blob
+columns from those asked for by bitmap. Every fact of §6.10 was seen
+but those listed there as not seen. Two corrections came of it:
+the unlock carries neither the dirty nor the simple flag, and the
+reference ignores the head read's error before an update and a delete
+too, not only before a write.
 
 ### 12.2 Dictionary, records, `BlobValues` (3 days)
 
