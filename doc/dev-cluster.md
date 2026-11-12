@@ -48,6 +48,13 @@ ports. What runs, as `var/my.cnf` describes it:
 | MySQL server 2 | 1600, with 322 and 483 in its pool | 13002, socket `var/tmp/mysqld-13002.sock` |
 | free API slots | 192, 228, 255, and five without a fixed id | — |
 
+MTR fixes only the cluster's ports. Its MySQL servers take 13000 and
+13002 when no other MTR run on the machine holds that range, and the
+next free range when one does (13270 and 13272, say); `var/my.cnf`
+says which, under `[mysqld.1.1]` and `[mysqld.2.1]`. Port 13000 may
+then be another run's management server, which a MySQL client waits
+on without end.
+
 `var/` is `debug_build/mysql-test/var`. The data nodes' and the
 management server's files and logs are in `var/mysql_cluster.1/`, the
 MySQL servers' in `var/log/`. The connectstring for iClaustron is
