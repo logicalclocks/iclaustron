@@ -482,6 +482,17 @@ const IC_NDB_ERRORS: &[ErrorEntry] = &[
     class: ErrorClass::Application,
     text: "A key column cannot be NULL",
   },
+  // Blob columns (chapter 05 §6.10).
+  ErrorEntry {
+    code: 4266,
+    class: ErrorClass::Application,
+    text: "The value is longer than a blob column without parts holds",
+  },
+  ErrorEntry {
+    code: 4267,
+    class: ErrorClass::Internal,
+    text: "The blob value is damaged: its head and its parts disagree",
+  },
   // Interpreted programs. The data node's own refusals of a program
   // are the application's error, as NDB classes them; 6000 is ours,
   // the code our programs refuse with where a missed condition is to
