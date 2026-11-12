@@ -42,7 +42,8 @@ the management server chooses, `bind-address=host` for the local
 address. `GlobalOptions`, fixed for the life of the global:
 `receive_threads` (1), `reply_wait_ms` (0: six minutes, the longest
 it ever waits; less to give up sooner; see 05 §6.9), `mgm_timeout_ms`
-(30 000). Stopping or dropping the global
+(30 000), `blob_round_bytes` (1 MiB of part data a BLOB query sends in a
+round; "Blob values" below). Stopping or dropping the global
 stops every thread and waits for each.
 
 One cluster per global (Q3, applied 2026-10-14): an application that
@@ -140,9 +141,10 @@ ret = ic_record_create(table, specs, 3, sizeof(struct my_row), &rec);
   kept apart, in a `blob::BlobValues` (phase 12; chapter 06). Only a
   blob column the table was bound with as usable may be named
   (`TableDef::blob_column`, `BlobColumn::is_usable`); another is refused
-  (`IC_ERROR_NOT_SUPPORTED`). Until phase 12's key operations take them
-  (12.3), every operation refuses a record naming a blob field, as
-  scans, takeovers and key records always will.
+  (`IC_ERROR_NOT_SUPPORTED`). A query's insert takes a record naming
+  blob fields since 12.3 ("Blob values", below); the other operations
+  refuse one until phase 12 brings them, and scans, takeovers and key
+  records always will.
 - A record over the key fields serves as a key record; one covering
   every key field serves as key and attribute record alike.
 - `text_row::put_value` and `value_text` put a value given as text into
@@ -187,7 +189,7 @@ then, into the connection's staged buffer, and goes with the next send.
 - `WriteKind`: `Update`, `Write`, `Insert`, `Delete`. An insert or write
   through a unique index is refused, and so is an update through one
   whose values hold an indexed column (Q12). A delete on a table with a
-  blob column is refused until blobs are built (phase 12).
+  blob column is refused (7153) until 12.4 deletes the parts with it.
 - `AbortOption`: `Default` (abort on error for a write, ignore it for a
   read), `AbortOnError`, `IgnoreError`; a committed read only ignores.
 - `BatchHint`: `None`, `Safe`, `Unsafe` (bits 22 and 23 of the request).
@@ -196,6 +198,52 @@ then, into the connection's staged buffer, and goes with the next send.
   ABI keeps the C callback there. Rust callers leave it 0.
 - Every row size a table can hold is written: a request too large for
   one message goes as a train of fragments (05 §2.2).
+
+### Blob values (phase 12; inserts since 12.3)
+
+An attribute record may name blob fields (BLOB, TEXT, and a MySQL
+server's JSON and GEOMETRY), and a query over it holds their values
+beside its rows, NULL until set: `query.set_blob(position, &[u8])`,
+`set_blob_null(position)`, `blob_buf_mut(position)` to fill a value's
+buffer in place, and `blob(position)`, `None` for NULL, where a position
+is the field's in the record. A value too long for a column with no
+parts table (MySQL's TINYBLOB and TINYTEXT) is refused with 4266, when
+it is set or when the query is defined. The values cannot change while
+the query is defined or sent (`IC_ERROR_TRANSACTION_ACTIVE`), as its
+rounds read them as they go. A JSON or GEOMETRY value is MySQL's own
+binary form, which the application gives and takes as bytes.
+
+A value written is held to its MySQL type's limit (the author,
+2026-11-12; chapter 10), `BlobSizes::max_length`, which can be narrower
+than its column's: a TINYBLOB's column takes 256 bytes inline where
+MySQL's type holds 255, and a MySQL server reads such a value as its
+first 255 (seen 2026-11-12). TEXT and BLOB hold 65 535 bytes, the
+MEDIUM types 16 MiB less a byte, the LONG types, JSON and GEOMETRY 4 GiB
+less a byte. The type is told by the column's sizes, which a MySQL
+server gives each type; a column whose sizes are none of those, as when
+a column comment changed them, counts as LONG. A value read is held only
+to what its column keeps, so one another program wrote longer is read
+whole.
+
+So far such a query inserts: `write_key` with `WriteKind::Insert`, by
+primary key, running no program. Its other operations come in 12.4 and
+12.5 and are refused until then (`IC_ERROR_NOT_SUPPORTED`; a delete
+keeps 7153), as are an executor's shapes until 12.6 and unique queries
+until 12.7; scans and takeovers always refuse them.
+
+An insert goes in rounds (chapter 06, phase 12): the main row, with the
+head and inline bytes, and the parts beside it in the first round, at
+most `GlobalOptions::blob_round_bytes` of part data (1 MiB by default)
+in a round, a longer value going on in rounds of its own. An insert
+that ignores errors (`AbortOption::IgnoreError`) sends the row alone,
+and its parts once it went in. The query stays sent until its last
+round is done, and then completes once. Each round after the first is
+sent by the poll that saw the one before it done, with whatever else is
+defined on the connection. A commit asked for waits for the last round
+of every BLOB query of its transaction and rides on it.
+`conn.blob_rounds()` counts the rounds sent after a query's first. In
+C the calls come with 12.8; until then `ic_apid_query_create` refuses a
+record naming a blob field.
 
 ### Transactions
 

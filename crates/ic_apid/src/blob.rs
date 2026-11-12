@@ -26,6 +26,11 @@
 //!   data column must agree with the part size, or the column is not
 //!   used. A part size of 0 means no parts table: the value must fit
 //!   inline, or it is refused with 4266.
+//! - **The longest value** a write takes is its MySQL type's (the
+//!   author, 2026-11-12), refused with 4266 past it: the type is told
+//!   by the sizes, which a MySQL server gives each type, and a column
+//!   of other sizes counts as LONG ([`BlobSizes::max_length`]). A value
+//!   read is held only to what its column can keep.
 //! - **Part k** holds the bytes from `inline + k * part`, a whole part
 //!   of them but the last. A value of length `L` past the inline size
 //!   has `(L - inline) / part` parts, rounded up.
@@ -44,14 +49,20 @@
 //! record takes no room in the row and has no null bit, and
 //! [`BlobValues`] holds each blob field's value apart from the row.
 //!
+//! **A BLOB query goes in rounds** (chapter 06, phase 12): its own
+//! operation on the main row, and the part operations beside it, which
+//! the driver plans round by round ([`plan_part_writes`]) and runs on
+//! the connection (`blob_run`).
+//!
 //! The functions here are pure: they work out sizes, check
-//! descriptions, encode and decode, and are tested on their own.
+//! descriptions, encode and decode, plan, and are tested on their own.
 //! Verify: chapter 05 §6.10.
 
 use std::sync::Arc;
 
 use ic_port::err;
 use ic_port::IcError;
+use ic_signals::column_header;
 use ic_signals::table_props;
 use ic_signals::table_props::ColumnProps;
 use ic_signals::table_props::TableProps;
@@ -59,11 +70,32 @@ use ic_signals::table_props::TableProps;
 use crate::dict_cache::TableDef;
 use crate::dict_client;
 use crate::record::Record;
+use crate::row_codec::push_padded;
 
-/// A value longer than its blob column holds without a parts table.
+/// A value longer than a write takes: its MySQL type's limit, or what a
+/// column without a parts table holds inline ([`BlobSizes::holds`]).
 pub const IC_NDB_ERROR_BLOB_TOO_LONG: i32 = 4266;
 /// A blob value whose head and parts disagree, or a part missing.
 pub const IC_NDB_ERROR_BLOB_DAMAGED: i32 = 4267;
+
+/// The longest value of each MySQL blob type, in bytes: TINYBLOB and
+/// TINYTEXT, behind a 1-byte length.
+pub const IC_MYSQL_TINY_MAX: u64 = 255;
+/// BLOB and TEXT, behind a 2-byte length.
+pub const IC_MYSQL_BLOB_MAX: u64 = 65_535;
+/// MEDIUMBLOB and MEDIUMTEXT, behind a 3-byte length.
+pub const IC_MYSQL_MEDIUM_MAX: u64 = 16_777_215;
+/// LONGBLOB and LONGTEXT, JSON and GEOMETRY, behind a 4-byte length.
+pub const IC_MYSQL_LONG_MAX: u64 = 4_294_967_295;
+
+/// The inline size a MySQL server gives every blob type but JSON, and
+/// the part sizes by which it tells them apart: none for the TINY
+/// types, 2 000 for TEXT and BLOB, 4 000 for the MEDIUM types. These
+/// tell a column's type; they are never taken for its sizes, which are
+/// always read from its description.
+const IC_MYSQL_INLINE: u32 = 256;
+const IC_MYSQL_BLOB_PART: u32 = 2000;
+const IC_MYSQL_MEDIUM_PART: u32 = 4000;
 
 /// Bytes of the head, before the inline bytes.
 pub const IC_BLOB_HEAD_BYTES: usize = 16;
@@ -121,8 +153,42 @@ impl BlobSizes {
     self.part > 0
   }
 
-  /// True when a value of this length can be stored.
+  /// The longest value a MySQL server holds in a column of these sizes
+  /// (the author, 2026-11-12): the TINY types' 255 bytes for the sizes
+  /// a MySQL server gives them, the TEXT and BLOB types' 65 535 for
+  /// theirs, the MEDIUM types' 16 MiB less a byte for theirs, and LONG's
+  /// 4 GiB less a byte for any other sizes, LONG's, JSON's and those a
+  /// column comment changed among them.
+  pub fn mysql_max_length(self) -> u64 {
+    if self.inline != IC_MYSQL_INLINE || self.stripe != 0 {
+      return IC_MYSQL_LONG_MAX;
+    }
+    match self.part {
+      0 => IC_MYSQL_TINY_MAX,
+      IC_MYSQL_BLOB_PART => IC_MYSQL_BLOB_MAX,
+      IC_MYSQL_MEDIUM_PART => IC_MYSQL_MEDIUM_MAX,
+      _ => IC_MYSQL_LONG_MAX,
+    }
+  }
+
+  /// The longest value a write takes: its MySQL type's, and for a
+  /// column without parts no more than its inline size.
+  pub fn max_length(self) -> u64 {
+    let mysql = self.mysql_max_length();
+    if !self.has_parts() && (self.inline as u64) < mysql {
+      return self.inline as u64;
+    }
+    mysql
+  }
+
+  /// True when a write takes a value of this length.
   pub fn holds(self, length: u64) -> bool {
+    length <= self.max_length()
+  }
+
+  /// True when the column can keep a value of this length, whatever its
+  /// MySQL type: what a value read is held to.
+  fn keeps(self, length: u64) -> bool {
     self.has_parts() || length <= self.inline as u64
   }
 
@@ -168,7 +234,7 @@ impl BlobSizes {
 
 /// The main row's value of a blob column, the head and the inline
 /// bytes, into `out`, which is emptied first. Refused with 4266 when
-/// the column has no parts table and the value does not fit inline.
+/// the value is longer than a write takes ([`BlobSizes::holds`]).
 pub fn encode_main_value(
   sizes: BlobSizes,
   value: &[u8],
@@ -194,7 +260,9 @@ pub fn encode_main_value(
 
 /// A main row's value of a blob column, as read: the value's whole
 /// length and its inline bytes. Damaged (4267) when the head's sizes
-/// disagree with each other or with the column's.
+/// disagree with each other or with what the column can keep; a value
+/// longer than its MySQL type, which another program may have written,
+/// is read whole.
 pub fn decode_main_value(
   sizes: BlobSizes,
   value: &[u8],
@@ -210,10 +278,41 @@ pub fn decode_main_value(
   if size != value.len() - 2 {
     return Err(IcError::new(IC_NDB_ERROR_BLOB_DAMAGED));
   }
-  if inline.len() != sizes.inline_len(length) || !sizes.holds(length) {
+  if inline.len() != sizes.inline_len(length) || !sizes.keeps(length) {
     return Err(IcError::new(IC_NDB_ERROR_BLOB_DAMAGED));
   }
   Ok((length, inline))
+}
+
+/// The main row's value of a blob column, as a write carries it in its
+/// column section: the column's header, then the head and the inline
+/// bytes padded to words, appended to `out`. The head is four whole
+/// words, so the inline bytes are packed straight from the value. Refused
+/// with 4266 as [`encode_main_value`] is.
+pub fn push_main_value(
+  sizes: BlobSizes,
+  column_id: u32,
+  value: &[u8],
+  out: &mut Vec<u32>,
+) -> Result<(), IcError> {
+  let length = value.len() as u64;
+  if !sizes.holds(length) {
+    return Err(IcError::new(IC_NDB_ERROR_BLOB_TOO_LONG));
+  }
+  let inline_len = sizes.inline_len(length);
+  let size = match u16::try_from(IC_BLOB_HEAD_REST + inline_len) {
+    Ok(size) => size,
+    Err(_) => return Err(IcError::new(IC_NDB_ERROR_BLOB_TOO_LONG)),
+  };
+  // The column's length is its 2-byte length and what that counts.
+  out.push(column_header::column_header(column_id, 2 + size as u32));
+  let mut head = [0u8; IC_BLOB_HEAD_BYTES];
+  head[0..2].copy_from_slice(&size.to_le_bytes());
+  // The reserved field and the part key id stay 0.
+  head[8..IC_BLOB_HEAD_BYTES].copy_from_slice(&length.to_le_bytes());
+  push_padded(out, &head);
+  push_padded(out, &value[..inline_len]);
+  Ok(())
 }
 
 /// How a parts table keeps a part's bytes, from its data column.
@@ -310,6 +409,25 @@ pub fn decode_part(
   }
 }
 
+/// A part's value for its data column, as a write carries it: the
+/// column's header, then the value [`encode_part`] makes, padded to
+/// words, appended to `out`. `scratch` is where the value is made, kept
+/// by the caller for its allocation.
+pub fn push_part_value(
+  column: PartColumn,
+  column_id: u32,
+  bytes: &[u8],
+  scratch: &mut Vec<u8>,
+  out: &mut Vec<u32>,
+) {
+  encode_part(column, bytes, scratch);
+  out.push(column_header::column_header(
+    column_id,
+    scratch.len() as u32,
+  ));
+  push_padded(out, scratch);
+}
+
 /// A part's key: the main row's key words, then the part number, as the
 /// parts table's key is the main table's key columns copied and the
 /// part number after them (for a stripe of 0). Into `out`, which is
@@ -401,7 +519,8 @@ pub fn column_sizes(column: &ColumnProps) -> Result<BlobSizes, BlobRefusal> {
 /// main table's key columns, copied in order, then the part number as
 /// a key, the part key id, and a data column of the column's kind
 /// (binary for a BLOB, characters for a TEXT) holding exactly the part
-/// size the column's description gives.
+/// size the column's description gives; each column's id is its place,
+/// as a MySQL server makes it.
 pub fn check_parts_table(
   main: &TableProps,
   column: &ColumnProps,
@@ -419,6 +538,7 @@ pub fn check_parts_table(
       None => return Err(differs),
     };
     let same = copy.primary_key
+      && copy.column_id == keys as u32
       && copy.type_code == main_key.type_code
       && copy.length == main_key.length
       && copy.precision == main_key.precision
@@ -435,13 +555,17 @@ pub fn check_parts_table(
   let part = &parts.attributes[keys];
   let pkid = &parts.attributes[keys + 1];
   let data = &parts.attributes[keys + 2];
+  // Each column's id is its place, as the part operations name them.
+  let ids_ok = part.column_id == keys as u32
+    && pkid.column_id == keys as u32 + 1
+    && data.column_id == keys as u32 + 2;
   let part_ok = part.name == IC_PARTS_COLUMN_PART
     && part.primary_key
     && part.type_code == table_props::IC_TYPE_UNSIGNED;
   let pkid_ok = pkid.name == IC_PARTS_COLUMN_PKID
     && !pkid.primary_key
     && pkid.type_code == table_props::IC_TYPE_UNSIGNED;
-  if !part_ok || !pkid_ok || data.name != IC_PARTS_COLUMN_DATA {
+  if !ids_ok || !part_ok || !pkid_ok || data.name != IC_PARTS_COLUMN_DATA {
     return Err(differs);
   }
   let part_column = match PartColumn::of(data) {
@@ -552,6 +676,8 @@ impl BlobColumn {
 /// One blob field's value.
 #[derive(Clone, Debug)]
 struct BlobSlot {
+  /// Its column's id.
+  field_id: u32,
   /// The column's sizes, from the table's description.
   sizes: BlobSizes,
   /// The bytes, when not NULL; kept, with their capacity, when the
@@ -595,6 +721,7 @@ impl BlobValues {
       slot_by_position.resize(position as usize + 1, u32::MAX);
       slot_by_position[position as usize] = slots.len() as u32;
       slots.push(BlobSlot {
+        field_id: field.field_id(),
         sizes,
         value: Vec::new(),
         null: true,
@@ -653,8 +780,8 @@ impl BlobValues {
   }
 
   /// Set the field at `position` to a copy of `value`. Refused with
-  /// 4266 when the column has no parts table and the value is longer
-  /// than its inline size.
+  /// 4266 when the value is longer than a write takes: its MySQL
+  /// type's limit, or a column without parts' inline size.
   pub fn set_blob(
     &mut self,
     position: u32,
@@ -681,8 +808,7 @@ impl BlobValues {
   /// The buffer of the field at `position`, to fill in place; the field
   /// is no longer NULL, and holds what the buffer holds when it is
   /// written. The buffer holds the last value set or read, or nothing.
-  /// A value too long for a column without parts is refused when it is
-  /// written.
+  /// A value longer than a write takes is refused when it is written.
   pub fn blob_buf_mut(
     &mut self,
     position: u32,
@@ -706,6 +832,135 @@ impl BlobValues {
     match self.slot_by_position.get(position as usize) {
       Some(&index) if index != u32::MAX => Ok(index as usize),
       _ => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    }
+  }
+
+  /// The sizes of the blob field at `position`.
+  pub(crate) fn sizes_at(&self, position: u32) -> Result<BlobSizes, IcError> {
+    Ok(self.slots[self.slot(position)?].sizes)
+  }
+
+  /// The `index`th blob field, in record order: its column's id and
+  /// sizes, and its value, `None` for NULL.
+  pub(crate) fn nth(&self, index: usize) -> Option<BlobField<'_>> {
+    let slot = self.slots.get(index)?;
+    let mut value: Option<&[u8]> = None;
+    if !slot.null {
+      value = Some(slot.value.as_slice());
+    }
+    Some(BlobField {
+      field_id: slot.field_id,
+      sizes: slot.sizes,
+      value,
+    })
+  }
+}
+
+/// One blob field of a [`BlobValues`], as [`BlobValues::nth`] gives it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BlobField<'a> {
+  /// Its column's id.
+  pub field_id: u32,
+  /// Its column's sizes.
+  pub sizes: BlobSizes,
+  /// Its value; `None` for NULL.
+  pub value: Option<&'a [u8]>,
+}
+
+// ---- The planner ----
+
+/// What a BLOB query does, as its rounds are planned (chapter 06,
+/// phase 12, "How each operation goes").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunKind {
+  /// An insert that aborts on error: its parts in its first round,
+  /// beside the main row, since no one else can lock a row that is not
+  /// there yet.
+  Insert,
+  /// An insert that ignores errors: the main row alone in its first
+  /// round, and its parts once it went in, so that a row that was
+  /// there already keeps its own parts.
+  InsertIgnoring,
+}
+
+/// One blob value's parts, as the rounds write them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValueParts {
+  /// Its column's sizes.
+  pub sizes: BlobSizes,
+  /// Its length; 0 for NULL.
+  pub length: u64,
+  /// The next part to write.
+  pub next: u64,
+}
+
+impl ValueParts {
+  /// A value of `length` bytes, none of its parts written yet.
+  pub fn new(sizes: BlobSizes, length: u64) -> ValueParts {
+    ValueParts {
+      sizes,
+      length,
+      next: 0,
+    }
+  }
+
+  /// True once every part is planned.
+  pub fn planned(&self) -> bool {
+    self.next >= self.sizes.part_count(self.length)
+  }
+}
+
+/// A part to write in a round: the value's place among the query's
+/// values, and the part's number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartWrite {
+  /// The value, by its place among the query's values.
+  pub value: usize,
+  /// The part.
+  pub part: u64,
+}
+
+/// Plan the next round's part writes into `out`, emptied first: value
+/// by value, part by part, while the round's part data stays within
+/// `budget` bytes, and at least one part. True when no part is left to
+/// plan after them.
+pub fn plan_part_writes(
+  values: &mut [ValueParts],
+  budget: u64,
+  out: &mut Vec<PartWrite>,
+) -> bool {
+  out.clear();
+  let mut bytes: u64 = 0;
+  for (index, value) in values.iter_mut().enumerate() {
+    while !value.planned() {
+      let len = value.sizes.part_len(value.length, value.next) as u64;
+      if !out.is_empty() && bytes + len > budget {
+        return false;
+      }
+      out.push(PartWrite {
+        value: index,
+        part: value.next,
+      });
+      bytes += len;
+      value.next += 1;
+    }
+  }
+  true
+}
+
+/// Plan a run's first round into `out`: the part writes that go beside
+/// the main row's operation. True when it is the run's last round.
+pub fn plan_first_round(
+  kind: RunKind,
+  values: &mut [ValueParts],
+  budget: u64,
+  out: &mut Vec<PartWrite>,
+) -> bool {
+  match kind {
+    RunKind::Insert => plan_part_writes(values, budget, out),
+    RunKind::InsertIgnoring => {
+      out.clear();
+      values.iter().all(ValueParts::planned)
     }
   }
 }
@@ -963,15 +1218,56 @@ mod tests {
 
   #[test]
   fn blob_too_long_without_parts_table() {
+    // A MySQL TINYBLOB holds 255 bytes, though its column has 256
+    // inline.
     let tiny = sizes_of(&main_table(), "tiny");
-    let inline = tiny.inline as usize;
+    assert_eq!(tiny.inline, 256);
     let mut out = Vec::new();
-    encode_main_value(tiny, &value_of(inline), &mut out).expect("fits");
-    let refused = encode_main_value(tiny, &value_of(inline + 1), &mut out);
+    encode_main_value(tiny, &value_of(255), &mut out).expect("fits");
+    let refused = encode_main_value(tiny, &value_of(256), &mut out);
     assert_eq!(
       refused.expect_err("refused").code,
       IC_NDB_ERROR_BLOB_TOO_LONG
     );
+    // A value read is held only to what its column keeps: one of 256
+    // bytes, which another program may have written, reads whole.
+    let mut written = Vec::new();
+    written.extend_from_slice(&(14u16 + 256).to_le_bytes());
+    written.extend_from_slice(&[0u8; 6]);
+    written.extend_from_slice(&256u64.to_le_bytes());
+    written.extend_from_slice(&value_of(256));
+    let (length, inline) = decode_main_value(tiny, &written).expect("read");
+    assert_eq!((length, inline.len()), (256, 256));
+  }
+
+  #[test]
+  fn blob_longest_values_are_their_mysql_types() {
+    let sizes = |inline: u32, part: u32| BlobSizes {
+      inline,
+      part,
+      stripe: 0,
+    };
+    // As a MySQL server sizes each type (chapter 05 §6.10).
+    assert_eq!(sizes(256, 0).max_length(), IC_MYSQL_TINY_MAX);
+    assert_eq!(sizes(256, 2000).max_length(), IC_MYSQL_BLOB_MAX);
+    assert_eq!(sizes(256, 4000).max_length(), IC_MYSQL_MEDIUM_MAX);
+    assert_eq!(sizes(256, 13948).max_length(), IC_MYSQL_LONG_MAX);
+    // JSON, and sizes a column comment changed, count as LONG; without
+    // parts, no more than the inline size.
+    assert_eq!(sizes(4000, 8100).max_length(), IC_MYSQL_LONG_MAX);
+    assert_eq!(sizes(512, 2000).max_length(), IC_MYSQL_LONG_MAX);
+    assert_eq!(sizes(256, 13948).mysql_max_length(), IC_MYSQL_LONG_MAX);
+    assert_eq!(sizes(100, 0).max_length(), 100);
+    // Each limit is taken, and a byte past it refused.
+    for (inline, part, most) in [
+      (256, 0, IC_MYSQL_TINY_MAX),
+      (256, 2000, IC_MYSQL_BLOB_MAX),
+      (256, 4000, IC_MYSQL_MEDIUM_MAX),
+      (256, 13948, IC_MYSQL_LONG_MAX),
+    ] {
+      assert!(sizes(inline, part).holds(most));
+      assert!(!sizes(inline, part).holds(most + 1));
+    }
   }
 
   #[test]
@@ -1143,9 +1439,9 @@ mod tests {
     let text = value_of(5000);
     values.set_blob(1, &text).expect("set t");
     assert_eq!(values.blob(1).expect("t"), Some(&text[..]));
-    // tiny has no parts table: no more than its inline size.
-    let inline = def.blob_column(3).expect("tiny").sizes().expect("sizes");
-    let too_long = value_of(inline.inline as usize + 1);
+    // tiny has no parts table: no more than its MySQL type's 255 bytes.
+    let tiny = def.blob_column(3).expect("tiny").sizes().expect("sizes");
+    let too_long = value_of(tiny.max_length() as usize + 1);
     let refused = values.set_blob(2, &too_long).expect_err("too long");
     assert_eq!(refused.code, IC_NDB_ERROR_BLOB_TOO_LONG);
     values.set_blob(2, &too_long[1..]).expect("fits");
@@ -1168,6 +1464,47 @@ mod tests {
   }
 
   #[test]
+  fn blob_values_go_in_a_write_as_the_main_row_keeps_them() {
+    let def = bound_main_table();
+    // id, t, tiny: positions 0, 1 and 2.
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let mut row = vec![0u8; rec.row_size() as usize];
+    let at = rec.field(0).expect("id").offset() as usize;
+    row[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
+    let mut values = BlobValues::new(&rec);
+    let text = value_of(300);
+    values.set_blob(1, &text).expect("t");
+    let mut out = Vec::new();
+    crate::row_codec::write_attr_info_append(
+      &rec,
+      &row,
+      false,
+      Some(&values),
+      &mut out,
+    )
+    .expect("written");
+    // id; t's head and inline bytes; tiny NULL.
+    let mut want = vec![column_header::column_header(0, 4)];
+    want.extend_from_slice(&padded(&7u32.to_le_bytes()));
+    let sizes = values.sizes_at(1).expect("t's sizes");
+    push_main_value(sizes, 1, &text, &mut want).expect("t");
+    want.push(column_header::column_header(3, 0));
+    assert_eq!(out, want);
+    // Without the values, a blob field cannot be written.
+    let refused = crate::row_codec::write_attr_info(&rec, &row, false);
+    assert_eq!(
+      refused.expect_err("no values").code,
+      err::IC_ERROR_NOT_SUPPORTED
+    );
+    // Each field as the run walks them.
+    let t = values.nth(0).expect("t");
+    assert_eq!((t.field_id, t.value), (1, Some(&text[..])));
+    let tiny = values.nth(1).expect("tiny");
+    assert_eq!((tiny.field_id, tiny.value), (3, None));
+    assert!(values.nth(2).is_none());
+  }
+
+  #[test]
   fn blob_parts_table_name() {
     assert_eq!(parts_table_name("ic_it", 13, 1), "ic_it/def/NDB$BLOB_13_1");
   }
@@ -1177,5 +1514,137 @@ mod tests {
     let mut key = Vec::new();
     part_key(&[7, 8], 3, &mut key);
     assert_eq!(key, [7, 8, 3]);
+  }
+
+  /// `bytes` padded to words, as a request carries them.
+  fn padded(bytes: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    push_padded(&mut out, bytes);
+    out
+  }
+
+  #[test]
+  fn blob_main_value_as_a_write_carries_it() {
+    let text = sizes_of(&main_table(), "t");
+    let inline = text.inline as usize;
+    let mut bytes = Vec::new();
+    for length in [0, 1, 3, inline - 1, inline, inline + 1, 5000] {
+      let value = value_of(length);
+      encode_main_value(text, &value, &mut bytes).expect("encodes");
+      let mut out = vec![99];
+      push_main_value(text, 5, &value, &mut out).expect("pushed");
+      // The column's length is the head and the inline bytes.
+      let mut want =
+        vec![99, column_header::column_header(5, bytes.len() as u32)];
+      want.extend_from_slice(&padded(&bytes));
+      assert_eq!(out, want, "length {length}");
+    }
+    let tiny = sizes_of(&main_table(), "tiny");
+    let mut out = Vec::new();
+    let refused = push_main_value(tiny, 3, &value_of(inline + 1), &mut out);
+    assert_eq!(refused.expect_err("4266").code, IC_NDB_ERROR_BLOB_TOO_LONG);
+  }
+
+  #[test]
+  fn blob_part_value_as_a_write_carries_it() {
+    let var = PartColumn {
+      data: PartData::Var,
+      size: 2000,
+    };
+    let mut scratch = Vec::new();
+    let mut out = Vec::new();
+    push_part_value(var, 3, b"abcde", &mut scratch, &mut out);
+    // A 2-byte length, then the bytes: 7 bytes in two words.
+    let mut want = vec![column_header::column_header(3, 7)];
+    want.extend_from_slice(&padded(b"\x05\x00abcde"));
+    assert_eq!(out, want);
+    let fixed = PartColumn {
+      data: PartData::FixedText,
+      size: 8,
+    };
+    out.clear();
+    push_part_value(fixed, 3, b"abc", &mut scratch, &mut out);
+    let mut want = vec![column_header::column_header(3, 8)];
+    want.extend_from_slice(&padded(b"abc     "));
+    assert_eq!(out, want);
+  }
+
+  /// The rounds a run of `kind` takes for values of these lengths, and
+  /// the parts each round writes.
+  fn rounds_of(
+    kind: RunKind,
+    sizes: BlobSizes,
+    lengths: &[u64],
+    budget: u64,
+  ) -> Vec<usize> {
+    let mut values: Vec<ValueParts> = Vec::new();
+    for length in lengths {
+      values.push(ValueParts::new(sizes, *length));
+    }
+    let mut out = Vec::new();
+    let mut last = plan_first_round(kind, &mut values, budget, &mut out);
+    let mut rounds = vec![out.len()];
+    while !last {
+      last = plan_part_writes(&mut values, budget, &mut out);
+      assert!(!out.is_empty(), "a round writes a part at least");
+      rounds.push(out.len());
+    }
+    for value in &values {
+      assert!(value.planned());
+    }
+    rounds
+  }
+
+  #[test]
+  fn blob_rounds_of_an_insert() {
+    let text = sizes_of(&main_table(), "t");
+    let (inline, part) = (text.inline as u64, text.part as u64);
+    let mib: u64 = 1 << 20;
+    let insert = RunKind::Insert;
+    let ignoring = RunKind::InsertIgnoring;
+    // An inline value, or none: one round with no parts.
+    for length in [0, 1, inline - 1, inline] {
+      assert_eq!(rounds_of(insert, text, &[length], mib), [0]);
+      assert_eq!(rounds_of(ignoring, text, &[length], mib), [0]);
+    }
+    // Parts beside the main row; once it went in when ignoring errors.
+    assert_eq!(rounds_of(insert, text, &[inline + 1], mib), [1]);
+    assert_eq!(rounds_of(insert, text, &[inline + part], mib), [1]);
+    assert_eq!(rounds_of(insert, text, &[inline + part + 1], mib), [2]);
+    assert_eq!(rounds_of(ignoring, text, &[inline + 1], mib), [0, 1]);
+    // 1 MiB: 525 parts, the last of 320 bytes, within one round.
+    assert_eq!(rounds_of(insert, text, &[mib], mib), [525]);
+    // 10 MiB: 5 243 parts, 524 a round, the last round three.
+    let mut want = vec![524; 10];
+    want.push(3);
+    assert_eq!(rounds_of(insert, text, &[10 * mib], mib), want);
+    // Values in order; a round shared between them.
+    let two =
+      rounds_of(insert, text, &[inline + 3 * part, inline + part], 5000);
+    assert_eq!(two, [2, 2]);
+    // A round smaller than a part still writes one.
+    assert_eq!(rounds_of(insert, text, &[inline + 3 * part], 1), [1, 1, 1]);
+  }
+
+  #[test]
+  fn blob_round_writes_value_by_value_part_by_part() {
+    let text = sizes_of(&main_table(), "t");
+    let (inline, part) = (text.inline as u64, text.part as u64);
+    let mut values = [
+      ValueParts::new(text, inline + 2 * part),
+      ValueParts::new(text, 0),
+      ValueParts::new(text, inline + 1),
+    ];
+    let mut out = Vec::new();
+    assert!(plan_part_writes(&mut values, 1 << 20, &mut out));
+    let want = [
+      PartWrite { value: 0, part: 0 },
+      PartWrite { value: 0, part: 1 },
+      PartWrite { value: 2, part: 0 },
+    ];
+    assert_eq!(out, want);
+    // Nothing is left: a further round plans nothing.
+    assert!(plan_part_writes(&mut values, 1 << 20, &mut out));
+    assert!(out.is_empty());
   }
 }

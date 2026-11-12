@@ -68,6 +68,11 @@
 //! so that a missed condition aborts the transaction only where the
 //! abort option says (§9.4).
 //!
+//! **A BLOB query** (chapter 06, phase 12) goes in rounds, with part
+//! operations of the connection's own beside it (`blob_run`): it stays
+//! sent until its last round is done, and a commit asked for waits for
+//! the last round of the transaction's last BLOB query, and rides on it.
+//!
 //! A unique query is placed by the index's own hash map:
 //! `hint_for_unique_key` gives the partition of the index's own table
 //! that the key is in, and a transaction started on it, with
@@ -217,6 +222,9 @@ pub struct Transaction {
   /// When it last sent, by the high-resolution clock, or zero if it
   /// never has: the wait for its replies runs from here.
   last_sent: u64,
+  /// Its BLOB queries that plan a round after the one they have out: a
+  /// commit asked for waits until none does (chapter 06, phase 12).
+  blob_planning: u32,
 }
 
 impl std::fmt::Debug for Transaction {
@@ -280,9 +288,30 @@ impl Transaction {
     self.state == CommitState::Started && self.end_wanted.is_none()
   }
 
-  fn ended(&self) -> bool {
+  pub(crate) fn ended(&self) -> bool {
     self.state == CommitState::Committed
       || self.state == CommitState::RolledBack
+  }
+
+  /// Count a BLOB query that plans a round after the one it has out: a
+  /// commit asked for waits for it.
+  pub(crate) fn hold_commit(&mut self) {
+    self.blob_planning += 1;
+  }
+
+  /// A BLOB query plans no further round. True when that lets a commit
+  /// asked for go: no other holds it, and it has not gone.
+  pub(crate) fn release_commit(&mut self) -> bool {
+    self.blob_planning = self.blob_planning.saturating_sub(1);
+    self.blob_planning == 0
+      && self.state == CommitState::Started
+      && self.end_wanted == Some(CommitState::CommitRequested)
+  }
+
+  /// True while its BLOB queries may send further rounds: started, and
+  /// no rollback asked for.
+  pub(crate) fn takes_blob_rounds(&self) -> bool {
+    self.state == CommitState::Started && !self.rolls_back()
   }
 
   /// True once a rollback has been asked for, or has happened: a scan
@@ -396,7 +425,10 @@ impl ApidConnection {
 
   /// A query into the object map, its id kept below the tag that marks
   /// a scan's receiver.
-  fn insert_query(&mut self, query: ApidQuery) -> Result<QueryId, IcError> {
+  pub(crate) fn insert_query(
+    &mut self,
+    query: ApidQuery,
+  ) -> Result<QueryId, IcError> {
     let id = self.queries.insert(query)?;
     if !crate::scan::fits_below_tag(id) {
       self.queries.remove(id);
@@ -426,19 +458,27 @@ impl ApidConnection {
     self.insert_query(query)
   }
 
-  /// A query, if the id names one.
+  /// A query, if the id names one. A BLOB query's part operations are
+  /// the connection's own, and named by none.
   pub fn query(&self, id: QueryId) -> Option<&ApidQuery> {
-    self.queries.get(id.0)
+    match self.queries.get(id.0) {
+      Some(query) if !query.is_internal() => Some(query),
+      _ => None,
+    }
   }
 
   /// A query to fill or read, if the id names one.
   pub fn query_mut(&mut self, id: QueryId) -> Option<&mut ApidQuery> {
-    self.queries.get_mut(id.0)
+    match self.queries.get_mut(id.0) {
+      Some(query) if !query.is_internal() => Some(query),
+      _ => None,
+    }
   }
 
-  /// Free a query that is idle or completed (`ic_apid_query_free`).
+  /// Free a query that is idle or completed (`ic_apid_query_free`), and
+  /// with it, for a BLOB query, the part operations it has made.
   pub fn free_query(&mut self, id: QueryId) -> Result<(), IcError> {
-    let query = match self.queries.get(id.0) {
+    let query = match self.query(id) {
       Some(query) => query,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
@@ -446,7 +486,9 @@ impl ApidConnection {
     if state == QueryState::Defined || state == QueryState::Sent {
       return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE));
     }
-    if state == QueryState::Completed && query.callback().is_none() {
+    let consumed = state == QueryState::Completed && query.callback().is_none();
+    self.free_blob_ops(id)?;
+    if consumed {
       // Do not leave a completion naming a freed query.
       self.executed.retain(|done| *done != id);
     }
@@ -531,6 +573,7 @@ impl ApidConnection {
       gci: 0,
       queued_for_send: false,
       last_sent: 0,
+      blob_planning: 0,
     };
     let id = TransId(self.transactions.insert(trans)?);
     self.active_insert(coord.index, id);
@@ -748,7 +791,7 @@ impl ApidConnection {
       Some(trans) if trans.is_open() => (trans.trans_id, trans.coord),
       _ => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
     };
-    let query = match self.queries.get(query_id.0) {
+    let query = match self.query(query_id) {
       Some(query) => query,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
@@ -767,6 +810,17 @@ impl ApidConnection {
     // A takeover names the scanned row of the base table.
     if takeover.is_some() && query.index().is_some() {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+    }
+    // A query with blob values goes in rounds (chapter 06, phase 12):
+    // so far an insert by primary key, running no program, and never a
+    // takeover, which is a scan's.
+    let has_blobs = query.blob_values().is_some();
+    if has_blobs {
+      let insert = flags.operation == key_ops::IC_OP_INSERT;
+      let plain = query.program().is_none() && query.after_record().is_none();
+      if !insert || !plain || query.index().is_some() || takeover.is_some() {
+        return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+      }
     }
     // A program, or reads after one, makes the operation interpreted:
     // a read, an update or a delete by primary key, assigning and
@@ -789,6 +843,15 @@ impl ApidConnection {
       }
       flags.interpreted = true;
     }
+    // Whatever a BLOB query's run would refuse is refused now, before
+    // anything is packed; its first round is planned.
+    if has_blobs {
+      self.prepare_blob_run(query_id, &flags)?;
+    }
+    let query = match self.queries.get(query_id.0) {
+      Some(query) => query,
+      None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    };
     // A unique query names the index's own table and goes as a
     // UNIQUE_OP_REQ; the coordinator looks the row up through the index.
     let (signal, table_id, table_version) = match query.index() {
@@ -892,6 +955,7 @@ impl ApidConnection {
           row_words: 0,
           unpacked: false,
           takeover: takeover.map(|over| over.of),
+          part_of: None,
         },
         user_ref,
         callback,
@@ -902,11 +966,38 @@ impl ApidConnection {
       trans.defined.push(query_id);
     }
     self.queue_for_send(trans_id);
+    // A BLOB query's first round: its part operations after it.
+    if has_blobs {
+      if let Err(e) = self.start_blob_run(query_id, trans_id) {
+        self.undefine(query_id, trans_id);
+        return Err(e);
+      }
+    }
     Ok(())
   }
 
+  /// Take back a query defined on a transaction and not yet sent, as if
+  /// it had never been: for a BLOB query whose first round could not be
+  /// defined whole.
+  pub(crate) fn undefine(&mut self, qid: QueryId, tid: TransId) {
+    self.unstage_query(qid);
+    if let Some(trans) = self.transactions.get_mut(tid.0) {
+      let mut i: usize = 0;
+      while i < trans.defined.len() {
+        if trans.defined[i] == qid {
+          trans.defined.remove(i);
+        } else {
+          i += 1;
+        }
+      }
+    }
+    if let Some(query) = self.queries.get_mut(qid.0) {
+      query.set_state(QueryState::Idle);
+    }
+  }
+
   /// Put a transaction on the list for the next send, once.
-  fn queue_for_send(&mut self, id: TransId) {
+  pub(crate) fn queue_for_send(&mut self, id: TransId) {
     if let Some(trans) = self.transactions.get_mut(id.0) {
       if !trans.queued_for_send {
         trans.queued_for_send = true;
@@ -956,6 +1047,8 @@ impl ApidConnection {
     }
     for qid in dropped {
       self.unstage_query(qid);
+      // A BLOB query that never went plans no rounds.
+      self.end_blob_run(qid);
       let mut takeover = None;
       if let Some(query) = self.queries.get_mut(qid.0) {
         query.set_state(QueryState::Idle);
@@ -971,6 +1064,20 @@ impl ApidConnection {
       self.stop_closing_scans_of(id);
     }
     Ok(())
+  }
+
+  /// Roll a transaction back, whatever end had been asked for, unless
+  /// it has gone to the coordinator: for a BLOB query whose next round
+  /// could not be defined, so that its value is not committed without
+  /// its parts.
+  pub(crate) fn force_rollback(&mut self, id: TransId) {
+    match self.transactions.get_mut(id.0) {
+      Some(trans) if trans.state == CommitState::Started => {
+        trans.end_wanted = None;
+      }
+      _ => return,
+    }
+    let _ = self.ask_to_end(id, CommitState::RollbackRequested);
   }
 
   /// Send every query defined on this connection, and every commit or
@@ -1047,9 +1154,11 @@ impl ApidConnection {
   }
 
   /// The queries of one transaction, with the flags of their place in
-  /// the batch, then its commit or rollback if one is due.
+  /// the batch, then its commit or rollback if one is due. A commit
+  /// waits while a BLOB query of the transaction plans a further round:
+  /// it goes on that query's last round.
   fn send_transaction(&mut self, id: TransId) -> Result<(), IcError> {
-    let (defined, end_wanted, begun, coord, trans_id) =
+    let (defined, end_wanted, begun, coord, trans_id, held) =
       match self.transactions.get_mut(id.0) {
         Some(trans) if trans.ended() => return Ok(()),
         Some(trans) => (
@@ -1058,10 +1167,11 @@ impl ApidConnection {
           trans.begun,
           trans.coord,
           trans.trans_id,
+          trans.blob_planning > 0,
         ),
         None => return Ok(()),
       };
-    let commit_now = end_wanted == Some(CommitState::CommitRequested);
+    let commit_now = end_wanted == Some(CommitState::CommitRequested) && !held;
     let mut begun = begun;
     let mut i: usize = 0;
     while i < defined.len() {
@@ -1084,14 +1194,11 @@ impl ApidConnection {
         }
         Err(e) => {
           // The rest of the batch is not sent; the queries fail here.
-          self.unstage_query(qid);
-          self.fail_query(qid, e);
-          let mut j = i;
-          while j < defined.len() {
-            self.unstage_query(defined[j]);
-            self.fail_query(defined[j], e);
-            j += 1;
+          let rest = &defined[i - 1..];
+          for qid in rest {
+            self.unstage_query(*qid);
           }
+          self.fail_in_order(rest, e, 0);
           return Err(e);
         }
       }
@@ -1110,7 +1217,11 @@ impl ApidConnection {
       None => None,
     };
     if let Some(how) = end {
-      self.send_end(id, how, &coord, trans_id, begun)?;
+      // A commit held goes on the last round of the last BLOB query.
+      let waits = how == CommitState::CommitRequested && held;
+      if !waits {
+        self.send_end(id, how, &coord, trans_id, begun)?;
+      }
     }
     Ok(())
   }
@@ -1554,18 +1665,25 @@ impl ApidConnection {
     }
     // The failed coordinator's record must never go back into the pool.
     self.lose_coord_record(&coord);
-    for qid in sent {
-      let query = match self.queries.get_mut(qid.0) {
-        Some(query) => query,
-        None => continue,
-      };
-      query.set_result_len(0);
-      if query.execution.is_read || query.execution.reads_after {
-        query.fail(lost_read);
-      } else {
-        query.set_state(QueryState::Completed);
+    // A BLOB query's part operations before any query, as a rollback
+    // fails them (`fail_in_order`).
+    for internal_first in [true, false] {
+      for qid in &sent {
+        let query = match self.queries.get_mut(qid.0) {
+          Some(query) if query.is_internal() == internal_first => query,
+          _ => continue,
+        };
+        if query.state() != QueryState::Sent {
+          continue;
+        }
+        query.set_result_len(0);
+        if query.execution.is_read || query.execution.reads_after {
+          query.fail(lost_read);
+        } else {
+          query.set_state(QueryState::Completed);
+        }
+        self.finish_query(*qid);
       }
-      self.finish_query(qid);
     }
     self.release_if_done(tid);
     true
@@ -1644,6 +1762,11 @@ impl ApidConnection {
     if !done {
       return;
     }
+    // A BLOB query's own operation: its run completes the query once
+    // its round is done and no further round is due.
+    if self.blob_main_done(qid) {
+      return;
+    }
     if let Some(query) = self.queries.get_mut(qid.0) {
       if is_read {
         if let Err(e) = query.take_row() {
@@ -1675,23 +1798,54 @@ impl ApidConnection {
     self.finish_query(qid);
   }
 
+  /// Fail queries of one transaction, the part operations of its BLOB
+  /// queries first: a query's callback then finds its transaction as it
+  /// would without them, done once its last query is.
+  fn fail_in_order(&mut self, qids: &[QueryId], error: IcError, data: u32) {
+    for internal_first in [true, false] {
+      for qid in qids {
+        let internal = match self.queries.get(qid.0) {
+          Some(query) => query.is_internal(),
+          None => false,
+        };
+        if internal == internal_first {
+          self.fail_query_with(*qid, error, data);
+        }
+      }
+    }
+  }
+
   /// A completed query off its transaction's list, the transaction
   /// closed out if that was its last, and then the query's callback
   /// called, or the query put on the executed list if it has none.
   /// The callback sees the transaction settled as far as this query
   /// decides it, and runs with the poll marked, so that a poll from
-  /// inside it does nothing.
-  fn finish_query(&mut self, qid: QueryId) {
-    let (tid, callback, user_ref, takeover) = match self.queries.get_mut(qid.0)
-    {
-      Some(query) => (
-        query.execution.trans,
-        query.callback(),
-        query.user_ref(),
-        query.execution.takeover.take(),
-      ),
-      None => (None, None, 0, None),
-    };
+  /// inside it does nothing. A BLOB query's part operation goes to its
+  /// query instead, and is idle again; a BLOB query's run ends with it.
+  pub(crate) fn finish_query(&mut self, qid: QueryId) {
+    let (tid, callback, user_ref, takeover, part_of, error) =
+      match self.queries.get_mut(qid.0) {
+        Some(query) => (
+          query.execution.trans,
+          query.callback(),
+          query.user_ref(),
+          query.execution.takeover.take(),
+          query.execution.part_of,
+          query.error(),
+        ),
+        None => (None, None, 0, None, None, None),
+      };
+    if let Some(of) = part_of {
+      if let Some(tid) = tid {
+        self.leave_transaction(qid, tid);
+      }
+      if let Some(query) = self.queries.get_mut(qid.0) {
+        query.set_state(QueryState::Idle);
+      }
+      self.blob_op_done(of, error);
+      return;
+    }
+    self.end_blob_run(qid);
     if callback.is_none() {
       self.executed.push_back(qid);
     }
@@ -1779,12 +1933,9 @@ impl ApidConnection {
     for qid in &defined {
       self.unstage_query(*qid);
     }
-    for qid in sent {
-      self.fail_query_with(qid, why, error_data);
-    }
-    for qid in defined {
-      self.fail_query_with(qid, why, error_data);
-    }
+    let mut all = sent;
+    all.extend_from_slice(&defined);
+    self.fail_in_order(&all, why, error_data);
     self.release_if_done(tid);
   }
 
@@ -1969,9 +2120,7 @@ impl ApidConnection {
         None => continue,
       };
       if ended {
-        for qid in sent {
-          self.fail_query(qid, error);
-        }
+        self.fail_in_order(&sent, error, 0);
         continue;
       }
       ic_port::debug_print!(
@@ -2041,11 +2190,13 @@ fn build_attr_section(
   if is_read {
     row_codec::read_attr_info_into(query.attr_record(), attr_info);
   } else if flags.operation != key_ops::IC_OP_DELETE {
+    // A blob field's value is the query's: the head and inline bytes.
     let skip_keys = flags.operation == key_ops::IC_OP_UPDATE;
-    row_codec::write_attr_info_into(
+    row_codec::write_attr_info_append(
       query.attr_record(),
       query.attr_row(),
       skip_keys,
+      query.blob_values(),
       attr_info,
     )?;
   }
@@ -2091,6 +2242,7 @@ fn build_interpreted_section(
       query.attr_record(),
       query.attr_row(),
       true,
+      None,
       section.out(),
     )?;
   }
@@ -2267,6 +2419,7 @@ mod tests {
       gci: 0,
       queued_for_send: false,
       last_sent: 0,
+      blob_planning: 0,
     };
     assert!(!trans.is_done());
     trans.state = CommitState::Committed;
@@ -2293,6 +2446,7 @@ mod tests {
       gci: 0,
       queued_for_send: false,
       last_sent,
+      blob_planning: 0,
     }
   }
 
@@ -2326,6 +2480,36 @@ mod tests {
     let mut idle = sent_at(0);
     idle.state = CommitState::CommitRequested;
     assert!(!idle.waited_too_long(AT + 10 * LIMIT, LIMIT));
+  }
+
+  #[test]
+  fn a_commit_waits_for_the_last_blob_round() {
+    let mut trans = sent_at(1);
+    // Two BLOB queries plan a further round; the commit is asked for.
+    trans.hold_commit();
+    trans.hold_commit();
+    trans.end_wanted = Some(CommitState::CommitRequested);
+    assert!(trans.takes_blob_rounds());
+    // The first plans its last: the other still holds the commit.
+    assert!(!trans.release_commit());
+    // The second: the commit may go.
+    assert!(trans.release_commit());
+    // Never below none.
+    assert!(trans.release_commit());
+    // With no commit asked for, a release lets nothing go.
+    let mut open = sent_at(1);
+    open.hold_commit();
+    assert!(!open.release_commit());
+    // Nor once the commit has gone, or a rollback is asked for, when no
+    // round goes on either.
+    let mut gone = sent_at(1);
+    gone.hold_commit();
+    gone.state = CommitState::CommitRequested;
+    assert!(!gone.release_commit());
+    assert!(!gone.takes_blob_rounds());
+    let mut back = sent_at(1);
+    back.end_wanted = Some(CommitState::RollbackRequested);
+    assert!(!back.takes_blob_rounds());
   }
 
   #[test]

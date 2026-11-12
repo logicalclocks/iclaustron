@@ -52,7 +52,9 @@
 //! updates and deletes on one of twin tables while MySQL runs them on
 //! the other, and compares the twins (chapter 06 §9.1); `blob`, which
 //! binds tables with every kind of blob column a MySQL server makes,
-//! with their parts tables (chapter 06, phase 12). The `big_rows` and
+//! with their parts tables, and inserts values of every length that
+//! matters, in memory and on disk, for MySQL to read back, counting
+//! the rounds they take (chapter 06, phase 12). The `big_rows` and
 //! `blob` groups make a log file group and a tablespace if the cluster
 //! has none, and keep them.
 //! Each test is its own program against the cluster, as an application
@@ -73,6 +75,7 @@ use ic_apid::apid_conn::ApidConnection;
 use ic_apid::apid_conn::IC_COORD_ALLOC_WAIT_MS;
 use ic_apid::apid_global::ApidGlobal;
 use ic_apid::apid_global::GlobalOptions;
+use ic_apid::apid_global::IC_DEFAULT_BLOB_ROUND_BYTES;
 use ic_apid::blob;
 use ic_apid::blob::BlobColumn;
 use ic_apid::blob::BlobRefusal;
@@ -2742,17 +2745,18 @@ fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
   }
   let mut conn = cluster.global.create_connection().expect("a connection");
   let t = bind(&mut conn, "bl_kinds");
-  // (column, inline size, part size), as a MySQL server sizes each
-  // type (chapter 05 §6.10); the bound table read them from the
-  // dictionary.
-  let kinds: [(&str, u32, u32); 5] = [
-    ("t", 256, 2000),
-    ("j", 4000, 8100),
-    ("b", 256, 13948),
-    ("m", 256, 4000),
-    ("tiny", 256, 0),
+  // (column, inline size, part size, the longest value its MySQL type
+  // holds), as a MySQL server sizes each type (chapter 05 §6.10); the
+  // bound table read the sizes from the dictionary and told the type
+  // by them (chapter 10).
+  let kinds: [(&str, u32, u32, u64); 5] = [
+    ("t", 256, 2000, 65_535),
+    ("j", 4000, 8100, 4_294_967_295),
+    ("b", 256, 13948, 4_294_967_295),
+    ("m", 256, 4000, 16_777_215),
+    ("tiny", 256, 0, 255),
   ];
-  for (column, inline, part) in kinds {
+  for (column, inline, part, most) in kinds {
     let blob = blob_column_of(&t, column);
     assert!(blob.is_usable(), "{} can be used: {:?}", column, blob);
     let sizes = blob.sizes().expect("its sizes");
@@ -2762,6 +2766,7 @@ fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
       "{}'s sizes",
       column
     );
+    assert_eq!(sizes.max_length(), most, "{}'s longest value", column);
     if part == 0 {
       assert!(blob.parts_table().is_none(), "{} has no parts", column);
       continue;
@@ -2807,15 +2812,47 @@ fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
   let parts = blob.parts_table().expect("its parts table");
   assert_eq!(parts.num_fields(), 5);
 
-  // A record may name a blob column; until phase 12 reads and writes
-  // them (12.3), every operation refuses it, as a scan always will.
+  // A record may name a blob column. A query takes it, and inserts
+  // with it (12.3); its other operations are refused until 12.4 and
+  // 12.5, an executor's until 12.6, and a scan's always.
   let id = t.def.field_id("id").expect("id");
   let text = t.def.field_id("t").expect("t");
   let rec = Record::default_for(&t.def, Some(&[id, text])).expect("a record");
   assert!(rec.has_blob_fields());
   let key_rec = Record::default_for(&t.def, Some(&[id])).expect("its key");
-  match conn.create_query(&t.def, &key_rec, &rec) {
-    Ok(_) => panic!("a query naming a blob field was taken"),
+  let qid = conn.create_query(&t.def, &key_rec, &rec).expect("a query");
+  let tid = conn
+    .start_transaction(TransactionHint::Any, Some(&t.def))
+    .expect("a transaction");
+  let read = ReadKeyArgs::default();
+  assert_eq!(
+    refused_with(conn.read_key(qid, tid, &read)),
+    err::IC_ERROR_NOT_SUPPORTED
+  );
+  for kind in [WriteKind::Update, WriteKind::Write] {
+    let write = WriteKeyArgs {
+      kind,
+      ..WriteKeyArgs::default()
+    };
+    assert_eq!(
+      refused_with(conn.write_key(qid, tid, &write)),
+      err::IC_ERROR_NOT_SUPPORTED
+    );
+  }
+  let delete = WriteKeyArgs {
+    kind: WriteKind::Delete,
+    ..WriteKeyArgs::default()
+  };
+  assert_eq!(
+    refused_with(conn.write_key(qid, tid, &delete)),
+    err::IC_ERROR_DELETE_WITH_BLOBS
+  );
+  conn.rollback_transaction(tid).expect("ask to roll back");
+  assert_eq!(finish(&mut conn, tid), CommitState::RolledBack);
+  conn.close_transaction(tid).expect("close");
+  conn.free_query(qid).expect("free the query");
+  match OpShape::new(&t.def, &key_rec, &rec) {
+    Ok(_) => panic!("a shape naming a blob field was taken"),
     Err(e) => assert_eq!(e.code, err::IC_ERROR_NOT_SUPPORTED),
   }
   match conn.create_scan(&t.def, &rec) {
@@ -2847,6 +2884,662 @@ fn blob_columns_that_cannot_be_used_are_refused_by_name() {
   // The rest of the table is used as before.
   assert!(r.rec.position_of(text).is_none());
   assert!(r.rec.position_of(id).is_some());
+}
+
+/// The CRC-32 a MySQL server's `CRC32()` gives, the IEEE one.
+fn crc32(bytes: &[u8]) -> u32 {
+  let mut table = [0u32; 256];
+  for (i, entry) in table.iter_mut().enumerate() {
+    let mut c = i as u32;
+    for _ in 0..8 {
+      if c & 1 != 0 {
+        c = 0xEDB8_8320 ^ (c >> 1);
+      } else {
+        c >>= 1;
+      }
+    }
+    *entry = c;
+  }
+  let mut crc: u32 = 0xFFFF_FFFF;
+  for byte in bytes {
+    crc = table[((crc ^ *byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+  }
+  crc ^ 0xFFFF_FFFF
+}
+
+/// A value of `length` bytes that differs from `seed` to `seed`: every
+/// byte for a blob, ASCII letters for a TEXT, whose characters are then
+/// its bytes.
+fn blob_value(length: usize, seed: u32, text: bool) -> Vec<u8> {
+  let mut value = Vec::with_capacity(length);
+  let mut i: u32 = 0;
+  while (i as usize) < length {
+    let n = i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13;
+    if text {
+      value.push(b'a' + (n % 26) as u8);
+    } else {
+      value.push(n as u8);
+    }
+    i += 1;
+  }
+  value
+}
+
+/// What MySQL reads of a blob column: its length and CRC-32, tab
+/// separated, `NULL\tNULL` for NULL.
+fn mysql_blob(table: &str, column: &str, id: i64) -> String {
+  mysql(&format!(
+    "SELECT LENGTH({c}), CRC32({c}) FROM {db}.{t} WHERE id = {id}",
+    c = column,
+    db = IC_IT_DB,
+    t = table,
+    id = id
+  ))
+  .expect("a MySQL client")
+}
+
+/// What [`mysql_blob`] gives for a value.
+fn read_back(value: Option<&[u8]>) -> String {
+  match value {
+    Some(bytes) => format!("{}\t{}", bytes.len(), crc32(bytes)),
+    None => "NULL\tNULL".to_string(),
+  }
+}
+
+/// A query over `t` keyed by `id`, writing the columns of `rec`, with
+/// the key and the `id` field of the row set to `id` and each blob
+/// value set by its position in `rec`.
+fn blob_query(
+  conn: &mut ApidConnection,
+  t: &Table,
+  rec: &Record,
+  id: i64,
+  values: &[(u32, Option<&[u8]>)],
+) -> QueryId {
+  let key_rec = record_over(t, &["id"]);
+  let qid = conn.create_query(&t.def, &key_rec, rec).expect("a query");
+  set_blob_row(conn, t, qid, id, values);
+  qid
+}
+
+/// Set a BLOB query's key, its row's `id` and its blob values.
+fn set_blob_row(
+  conn: &mut ApidConnection,
+  t: &Table,
+  qid: QueryId,
+  id: i64,
+  values: &[(u32, Option<&[u8]>)],
+) {
+  let query = conn.query_mut(qid).expect("the query");
+  let key_rec = query.key_record().clone();
+  let rec = query.attr_record().clone();
+  let mut key = vec![0; key_rec.row_size() as usize];
+  put_into(t, &key_rec, &mut key, "id", &id.to_string());
+  let mut row = vec![0; rec.row_size() as usize];
+  put_into(t, &rec, &mut row, "id", &id.to_string());
+  query.key_row_mut().copy_from_slice(&key);
+  query.attr_row_mut().copy_from_slice(&row);
+  for (position, value) in values {
+    match value {
+      Some(bytes) => query.set_blob(*position, bytes).expect("set the value"),
+      None => query.set_blob_null(*position).expect("set it NULL"),
+    }
+  }
+}
+
+/// A transaction for the row of `t` whose key the query holds.
+fn start_for_query(
+  conn: &mut ApidConnection,
+  t: &Table,
+  qid: QueryId,
+) -> TransId {
+  let query = conn.query(qid).expect("the query");
+  let hint = conn.hint_for_key(&t.def, query.key_record(), query.key_row());
+  conn
+    .start_transaction(hint, Some(&t.def))
+    .expect("start a transaction")
+}
+
+/// The rounds an insert that aborts on error takes after its first for a
+/// value of `length`, with the default round, as the driver plans them.
+fn rounds_after_first(sizes: blob::BlobSizes, length: u64) -> u64 {
+  let budget = IC_DEFAULT_BLOB_ROUND_BYTES as u64;
+  let mut values = [blob::ValueParts::new(sizes, length)];
+  let mut writes = Vec::new();
+  let kind = blob::RunKind::Insert;
+  let mut last = blob::plan_first_round(kind, &mut values, budget, &mut writes);
+  let mut more: u64 = 0;
+  while !last {
+    last = blob::plan_part_writes(&mut values, budget, &mut writes);
+    more += 1;
+  }
+  more
+}
+
+fn insert_args(abort_option: AbortOption) -> WriteKeyArgs {
+  WriteKeyArgs {
+    kind: WriteKind::Insert,
+    abort_option,
+    ..WriteKeyArgs::default()
+  }
+}
+
+/// Insert a row of `t` by its `id` with these blob values, by their
+/// position in `rec`, as a transaction of its own that commits: how it
+/// ended, and how the insert did.
+fn insert_blob_row(
+  conn: &mut ApidConnection,
+  t: &Table,
+  rec: &Record,
+  id: i64,
+  values: &[(u32, Option<&[u8]>)],
+  abort_option: AbortOption,
+) -> (CommitState, Option<IcError>) {
+  let qid = blob_query(conn, t, rec, id, values);
+  let tid = start_for_query(conn, t, qid);
+  conn
+    .write_key(qid, tid, &insert_args(abort_option))
+    .expect("define the insert");
+  conn.commit_transaction(tid).expect("ask to commit");
+  let state = finish(conn, tid);
+  let error = conn.query(qid).expect("the query").error();
+  conn.close_transaction(tid).expect("close");
+  conn.free_query(qid).expect("free the query");
+  (state, error)
+}
+
+/// The position of a column in a record.
+fn position_in(t: &Table, rec: &Record, column: &str) -> u32 {
+  let id = t.def.field_id(column).expect("no such column");
+  rec.position_of(id).expect("column not in the record")
+}
+
+#[test]
+fn blob_inserts_at_every_boundary_are_read_back_by_mysql() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let rec = record_over(&t, &["id", "t", "b", "tiny"]);
+  let at_t = position_in(&t, &rec, "t");
+  let at_b = position_in(&t, &rec, "b");
+  let at_tiny = position_in(&t, &rec, "tiny");
+  let mib: usize = 1 << 20;
+  // The sizes the table was bound with, as MySQL gave them.
+  let mut id: i64 = 0;
+  for (column, at, text) in [("t", at_t, true), ("b", at_b, false)] {
+    let sizes = blob_column_of(&t, column).sizes().expect("sizes");
+    let (inline, part) = (sizes.inline as usize, sizes.part as usize);
+    let mut lengths = vec![
+      0,
+      1,
+      inline - 1,
+      inline,
+      inline + 1,
+      inline + part,
+      inline + part + 1,
+      inline + 3 * part + 7,
+    ];
+    if text {
+      // The most a MySQL TEXT holds.
+      assert_eq!(sizes.max_length(), 65_535);
+      lengths.push(sizes.max_length() as usize);
+    } else {
+      lengths.push(mib);
+      lengths.push(10 * mib);
+    }
+    for length in lengths {
+      id += 1;
+      let value = blob_value(length, id as u32, text);
+      let rounds = conn.blob_rounds();
+      let (state, error) = insert_blob_row(
+        &mut conn,
+        &t,
+        &rec,
+        id,
+        &[(at, Some(value.as_slice())), (at_tiny, None)],
+        AbortOption::Default,
+      );
+      assert_eq!(state, CommitState::Committed, "{} of {}", column, length);
+      assert!(error.is_none(), "{} of {}: {:?}", column, length, error);
+      // Parts beside the main row in its first round, and as many
+      // rounds more as the parts past the first megabyte take: for a
+      // LONGBLOB, 76 parts of 1 MiB fit one round, 752 of 10 MiB go 75
+      // a round.
+      let more = rounds_after_first(sizes, length as u64);
+      if !text && length == mib {
+        assert_eq!(more, 0);
+      }
+      if !text && length == 10 * mib {
+        assert_eq!(more, 10);
+      }
+      assert_eq!(
+        conn.blob_rounds() - rounds,
+        more,
+        "{} of {}",
+        column,
+        length
+      );
+      assert_eq!(
+        mysql_blob("bl_kinds", column, id),
+        read_back(Some(value.as_slice())),
+        "{} of {} bytes",
+        column,
+        length
+      );
+      assert_eq!(mysql_blob("bl_kinds", "tiny", id), read_back(None));
+    }
+  }
+
+  // NULL, and the most a MySQL TINYBLOB holds, 255 bytes behind its
+  // 1-byte length, though its column has 256 inline (chapter 10).
+  let tiny = blob_column_of(&t, "tiny").sizes().expect("sizes");
+  assert_eq!(tiny.max_length(), 255);
+  let most = blob_value(tiny.max_length() as usize, 7, false);
+  id += 1;
+  let (state, _) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    id,
+    &[(at_t, None), (at_b, None), (at_tiny, Some(most.as_slice()))],
+    AbortOption::Default,
+  );
+  assert_eq!(state, CommitState::Committed);
+  assert_eq!(mysql_blob("bl_kinds", "t", id), read_back(None));
+  assert_eq!(
+    mysql_blob("bl_kinds", "tiny", id),
+    read_back(Some(most.as_slice()))
+  );
+  // A byte more is refused when it is set, a TINYBLOB's as a TEXT's.
+  let key_rec = record_over(&t, &["id"]);
+  let qid = conn.create_query(&t.def, &key_rec, &rec).expect("a query");
+  let longer = blob_value(tiny.max_length() as usize + 1, 7, false);
+  let text = blob_column_of(&t, "t").sizes().expect("sizes");
+  let long_text = blob_value(text.max_length() as usize + 1, 8, true);
+  let query = conn.query_mut(qid).expect("the query");
+  match query.set_blob(at_t, &long_text) {
+    Ok(()) => panic!("a TEXT took more than MySQL's holds"),
+    Err(e) => assert_eq!(e.code, blob::IC_NDB_ERROR_BLOB_TOO_LONG),
+  }
+  match query.set_blob(at_tiny, &longer) {
+    Ok(()) => panic!("a TINYBLOB took more than MySQL's holds"),
+    Err(e) => assert_eq!(e.code, blob::IC_NDB_ERROR_BLOB_TOO_LONG),
+  }
+  // Or when the query is defined, filled in place.
+  let buf = query.blob_buf_mut(at_tiny).expect("its buffer");
+  buf.clear();
+  buf.extend_from_slice(&longer);
+  set_blob_row(&mut conn, &t, qid, id + 1, &[]);
+  let tid = start_for_query(&mut conn, &t, qid);
+  match conn.write_key(qid, tid, &insert_args(AbortOption::Default)) {
+    Ok(()) => panic!("a TINYBLOB took more than it holds"),
+    Err(e) => assert_eq!(e.code, blob::IC_NDB_ERROR_BLOB_TOO_LONG),
+  }
+  conn.rollback_transaction(tid).expect("ask to roll back");
+  assert_eq!(finish(&mut conn, tid), CommitState::RolledBack);
+  conn.close_transaction(tid).expect("close");
+  conn.free_query(qid).expect("free the query");
+  let seen = mysql(&format!(
+    "SELECT COUNT(*) FROM {}.bl_kinds WHERE id = {}",
+    IC_IT_DB,
+    id + 1
+  ));
+  assert_eq!(seen, Some("0".to_string()));
+}
+
+#[test]
+fn blob_parts_on_disk_are_padded_and_read_back_right() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let d = bind(&mut conn, "bl_disk");
+  let rec = record_over(&d, &["id", "b", "t"]);
+  let at_b = position_in(&d, &rec, "b");
+  let at_t = position_in(&d, &rec, "t");
+  let b_sizes = blob_column_of(&d, "b").sizes().expect("sizes");
+  let t_sizes = blob_column_of(&d, "t").sizes().expect("sizes");
+  // Each last part short: one byte, then five.
+  let b_long = (b_sizes.inline + b_sizes.part + 1) as usize;
+  let t_long = (t_sizes.inline + 2 * t_sizes.part + 5) as usize;
+  let mut id: i64 = 0;
+  for (b_len, t_len) in [(b_long, t_long), (b_long + 100, 3), (1, t_long + 1)] {
+    id += 1;
+    let b = blob_value(b_len, id as u32, false);
+    let t = blob_value(t_len, id as u32 + 50, true);
+    let (state, error) = insert_blob_row(
+      &mut conn,
+      &d,
+      &rec,
+      id,
+      &[(at_b, Some(b.as_slice())), (at_t, Some(t.as_slice()))],
+      AbortOption::Default,
+    );
+    assert_eq!(state, CommitState::Committed, "{:?}", error);
+    assert_eq!(
+      mysql_blob("bl_disk", "b", id),
+      read_back(Some(b.as_slice()))
+    );
+    assert_eq!(
+      mysql_blob("bl_disk", "t", id),
+      read_back(Some(t.as_slice()))
+    );
+  }
+}
+
+#[test]
+fn blob_texts_inserted_together_go_in_one_round() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let rec = record_over(&t, &["id", "t"]);
+  let at_t = position_in(&t, &rec, "t");
+  let sizes = blob_column_of(&t, "t").sizes().expect("sizes");
+  // A hundred rows in one transaction: half inline, half in two parts.
+  let mut values: Vec<Vec<u8>> = Vec::new();
+  let mut queries: Vec<QueryId> = Vec::new();
+  let mut id: i64 = 1000;
+  while values.len() < 100 {
+    id += 1;
+    let mut length = 100;
+    if id % 2 == 0 {
+      length = (sizes.inline + sizes.part + 9) as usize;
+    }
+    let value = blob_value(length, id as u32, true);
+    queries.push(blob_query(
+      &mut conn,
+      &t,
+      &rec,
+      id,
+      &[(at_t, Some(value.as_slice()))],
+    ));
+    values.push(value);
+  }
+  let rounds = conn.blob_rounds();
+  let tid = start_for_query(&mut conn, &t, queries[0]);
+  for qid in &queries {
+    conn
+      .write_key(*qid, tid, &insert_args(AbortOption::Default))
+      .expect("define an insert");
+  }
+  conn.commit_transaction(tid).expect("ask to commit");
+  assert_eq!(finish(&mut conn, tid), CommitState::Committed);
+  conn.close_transaction(tid).expect("close");
+  // Every part went in the first round, with the commit.
+  assert_eq!(conn.blob_rounds(), rounds);
+  for qid in queries {
+    conn.free_query(qid).expect("free a query");
+  }
+  let mut want = String::new();
+  let mut id: i64 = 1000;
+  for value in &values {
+    id += 1;
+    if !want.is_empty() {
+      want.push('\n');
+    }
+    want.push_str(&format!("{}\t{}", id, read_back(Some(value.as_slice()))));
+  }
+  let seen = mysql(&format!(
+    "SELECT id, LENGTH(t), CRC32(t) FROM {}.bl_kinds
+       WHERE id > 1000 ORDER BY id",
+    IC_IT_DB
+  ));
+  assert_eq!(seen, Some(want));
+}
+
+#[test]
+fn blob_an_insert_ignoring_errors_writes_its_parts_once_the_row_went_in() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let rec = record_over(&t, &["id", "t"]);
+  let at_t = position_in(&t, &rec, "t");
+  let sizes = blob_column_of(&t, "t").sizes().expect("sizes");
+  let long = (sizes.inline + 2 * sizes.part + 1) as usize;
+  let first = blob_value(long, 1, true);
+  let second = blob_value(long + 3 * sizes.part as usize, 2, true);
+
+  // The row goes in, then its parts, in a round of their own.
+  let rounds = conn.blob_rounds();
+  let (state, error) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    2000,
+    &[(at_t, Some(first.as_slice()))],
+    AbortOption::IgnoreError,
+  );
+  assert_eq!(state, CommitState::Committed);
+  assert!(error.is_none(), "{:?}", error);
+  assert_eq!(conn.blob_rounds(), rounds + 1);
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 2000),
+    read_back(Some(first.as_slice()))
+  );
+
+  // The row is there: the insert fails alone, its parts are not
+  // written, the commit it held goes alone, and the value is whole.
+  let (state, error) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    2000,
+    &[(at_t, Some(second.as_slice()))],
+    AbortOption::IgnoreError,
+  );
+  assert_eq!(state, CommitState::Committed);
+  assert_eq!(error.map(|e| e.code), Some(630));
+  assert_eq!(conn.blob_rounds(), rounds + 1);
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 2000),
+    read_back(Some(first.as_slice()))
+  );
+
+  // Aborting on error, the transaction rolls back.
+  let (state, error) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    2000,
+    &[(at_t, Some(second.as_slice()))],
+    AbortOption::Default,
+  );
+  assert_eq!(state, CommitState::RolledBack);
+  assert_eq!(error.map(|e| e.code), Some(630));
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 2000),
+    read_back(Some(first.as_slice()))
+  );
+
+  // An inline value ignoring errors takes one round.
+  let short = blob_value(10, 3, true);
+  let (state, _) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    2001,
+    &[(at_t, Some(short.as_slice()))],
+    AbortOption::IgnoreError,
+  );
+  assert_eq!(state, CommitState::Committed);
+  assert_eq!(conn.blob_rounds(), rounds + 1);
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 2001),
+    read_back(Some(short.as_slice()))
+  );
+}
+
+#[test]
+fn blob_rounds_go_on_in_an_open_transaction_and_hold_its_commit() {
+  // Two parts a round, so that a short value takes several.
+  let options = GlobalOptions {
+    blob_round_bytes: 4000,
+    ..GlobalOptions::default()
+  };
+  let cluster = match cluster_with_options(&options, 30_000) {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let rec = record_over(&t, &["id", "t"]);
+  let at_t = position_in(&t, &rec, "t");
+  let sizes = blob_column_of(&t, "t").sizes().expect("sizes");
+  assert_eq!(sizes.part, 2000, "two parts a round");
+  // Five parts: rounds of two, two and one.
+  let value = blob_value((sizes.inline + 5 * sizes.part) as usize, 9, true);
+
+  // The commit asked for at once rides on the last round.
+  let rounds = conn.blob_rounds();
+  let (state, error) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    3000,
+    &[(at_t, Some(value.as_slice()))],
+    AbortOption::Default,
+  );
+  assert_eq!(state, CommitState::Committed, "{:?}", error);
+  assert_eq!(conn.blob_rounds(), rounds + 2);
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 3000),
+    read_back(Some(value.as_slice()))
+  );
+
+  // In a transaction left open, the query completes after its last
+  // round, and a commit asked for then goes alone.
+  let qid =
+    blob_query(&mut conn, &t, &rec, 3001, &[(at_t, Some(value.as_slice()))]);
+  let tid = start_for_query(&mut conn, &t, qid);
+  conn
+    .write_key(qid, tid, &insert_args(AbortOption::Default))
+    .expect("define the insert");
+  complete(&mut conn, qid);
+  assert!(conn.query(qid).expect("the query").error().is_none());
+  assert_eq!(conn.blob_rounds(), rounds + 4);
+  conn.commit_transaction(tid).expect("ask to commit");
+  assert_eq!(finish(&mut conn, tid), CommitState::Committed);
+  conn.close_transaction(tid).expect("close");
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 3001),
+    read_back(Some(value.as_slice()))
+  );
+
+  // The same query again, on another row with a shorter value, then
+  // rolled back once its rounds are done: nothing of it stays.
+  let short = blob_value((sizes.inline + sizes.part + 1) as usize, 10, true);
+  set_blob_row(&mut conn, &t, qid, 3002, &[(at_t, Some(short.as_slice()))]);
+  let tid = start_for_query(&mut conn, &t, qid);
+  conn
+    .write_key(qid, tid, &insert_args(AbortOption::Default))
+    .expect("define the insert again");
+  complete(&mut conn, qid);
+  conn.rollback_transaction(tid).expect("ask to roll back");
+  assert_eq!(finish(&mut conn, tid), CommitState::RolledBack);
+  conn.close_transaction(tid).expect("close");
+  let seen = mysql(&format!(
+    "SELECT COUNT(*) FROM {}.bl_kinds WHERE id = 3002",
+    IC_IT_DB
+  ));
+  assert_eq!(seen, Some("0".to_string()));
+  // And once more, committed.
+  set_blob_row(&mut conn, &t, qid, 3003, &[(at_t, Some(short.as_slice()))]);
+  let tid = start_for_query(&mut conn, &t, qid);
+  conn
+    .write_key(qid, tid, &insert_args(AbortOption::Default))
+    .expect("define the insert once more");
+  conn.commit_transaction(tid).expect("ask to commit");
+  assert_eq!(finish(&mut conn, tid), CommitState::Committed);
+  conn.close_transaction(tid).expect("close");
+  conn.free_query(qid).expect("free the query");
+  assert_eq!(
+    mysql_blob("bl_kinds", "t", 3003),
+    read_back(Some(short.as_slice()))
+  );
+}
+
+#[test]
+fn blob_parts_take_a_key_of_two_columns() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let k = bind(&mut conn, "bl_key2");
+  let key_rec = record_over(&k, &["a", "s"]);
+  let rec = record_over(&k, &["a", "s", "t"]);
+  let at_t = position_in(&k, &rec, "t");
+  let sizes = blob_column_of(&k, "t").sizes().expect("sizes");
+  let mut want = String::new();
+  // In the order MySQL sorts them by.
+  for (a, s) in [(1, "abcdefghij"), (1, "x"), (2, "x")] {
+    let length = (sizes.inline + 2 * sizes.part + a * 17) as usize;
+    let value = blob_value(length, a + s.len() as u32, true);
+    let qid = conn.create_query(&k.def, &key_rec, &rec).expect("a query");
+    let mut key = vec![0; key_rec.row_size() as usize];
+    put_into(&k, &key_rec, &mut key, "a", &a.to_string());
+    put_into(&k, &key_rec, &mut key, "s", s);
+    let mut row = vec![0; rec.row_size() as usize];
+    put_into(&k, &rec, &mut row, "a", &a.to_string());
+    put_into(&k, &rec, &mut row, "s", s);
+    let query = conn.query_mut(qid).expect("the query");
+    query.key_row_mut().copy_from_slice(&key);
+    query.attr_row_mut().copy_from_slice(&row);
+    query.set_blob(at_t, &value).expect("set the value");
+    let hint = conn.hint_for_key(&k.def, &key_rec, &key);
+    let tid = conn
+      .start_transaction(hint, Some(&k.def))
+      .expect("a transaction");
+    conn
+      .write_key(qid, tid, &insert_args(AbortOption::Default))
+      .expect("define the insert");
+    conn.commit_transaction(tid).expect("ask to commit");
+    assert_eq!(finish(&mut conn, tid), CommitState::Committed);
+    conn.close_transaction(tid).expect("close");
+    conn.free_query(qid).expect("free the query");
+    if !want.is_empty() {
+      want.push('\n');
+    }
+    want.push_str(&format!(
+      "{}\t{}\t{}",
+      a,
+      s,
+      read_back(Some(value.as_slice()))
+    ));
+  }
+  let seen = mysql(&format!(
+    "SELECT a, s, LENGTH(t), CRC32(t) FROM {}.bl_key2 ORDER BY a, s",
+    IC_IT_DB
+  ));
+  assert_eq!(seen, Some(want));
 }
 
 // ---- timeout ----

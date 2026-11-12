@@ -30,9 +30,9 @@
 //! phase 12). Naming one says that the operation reads or writes it.
 //! Only a column the table was bound with as usable may be named
 //! ([`BlobColumn`](crate::blob::BlobColumn)); another is refused with
-//! `IC_ERROR_NOT_SUPPORTED`. Until the operations that take them are
-//! there, every operation refuses a record naming a blob field, as
-//! scans, takeovers and key records always will.
+//! `IC_ERROR_NOT_SUPPORTED`. A query's insert takes a record naming
+//! blob fields (12.3); the other operations refuse one until phase 12
+//! brings them, and scans, takeovers and key records always will.
 //!
 //! **Checked when made, as the reference checks a record:** every field
 //! exists, no field comes twice, every value and null bit lies inside
@@ -358,7 +358,7 @@ impl Record {
 
   /// Refuse a record naming a blob field (`IC_ERROR_NOT_SUPPORTED`),
   /// where the operation takes none: scans, takeovers and key records,
-  /// and, until phase 12 brings them, the key operations.
+  /// and, until phase 12 brings them, the executor and the helpers.
   pub(crate) fn refuse_blob_fields(&self) -> Result<(), IcError> {
     if self.has_blob_fields {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));

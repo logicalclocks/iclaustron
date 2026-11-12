@@ -75,8 +75,10 @@
 //!   column uses it.
 //! - [`record`]: how a table's fields lie in a row the application owns.
 //! - [`row_codec`]: rows to and from the words of a key operation.
-//! - [`blob`]: a blob column's head, and where each byte of a value
-//!   lies in its parts.
+//! - [`blob`]: a blob column's head, where each byte of a value lies in
+//!   its parts, its parts table, and the plan of a BLOB query's rounds.
+//! - `blob_run`: the driver that runs a BLOB query's rounds on a
+//!   connection.
 //! - [`key_op`]: the first key operations, by primary key.
 //! - [`hash`]: where a key belongs, hashed as the data nodes hash it.
 //! - [`query`]: the query object, one key operation defined once and
@@ -109,6 +111,7 @@ pub mod apid_conn;
 pub mod apid_global;
 pub mod auto_increment;
 pub mod blob;
+mod blob_run;
 pub mod collation_client;
 pub mod collation_map;
 pub mod connect_thread;

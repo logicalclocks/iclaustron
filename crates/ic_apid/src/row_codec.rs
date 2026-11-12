@@ -38,6 +38,8 @@ use ic_signals::column_header;
 use ic_signals::table_props;
 use ic_signals::table_props::ColumnProps;
 
+use crate::blob;
+use crate::blob::BlobValues;
 use crate::dict_cache::IndexDef;
 use crate::node_connect::words_as_bytes;
 use crate::record::Record;
@@ -88,6 +90,41 @@ pub fn key_info_into(
     let start = field.offset() as usize;
     let len = value_len(attr, field, &key_row[start..])?;
     push_padded(out, &key_row[start..start + len]);
+  }
+  Ok(())
+}
+
+/// The main row's key as the columns of a blob column's parts table
+/// carry it in a write (chapter 05 §6.10): each primary key column of
+/// the key record's row, in attribute order, behind the header of the
+/// parts table's column at the same place, the first key column being
+/// column 0. Into a buffer the caller keeps, cleared first.
+pub(crate) fn parts_key_attr_info_into(
+  key_rec: &Record,
+  key_row: &[u8],
+  out: &mut Vec<u32>,
+) -> Result<(), IcError> {
+  out.clear();
+  if key_row.len() < key_rec.row_size() as usize {
+    return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
+  }
+  let mut place: u32 = 0;
+  for attr in &key_rec.table().info().attributes {
+    if !attr.primary_key {
+      continue;
+    }
+    let field = match key_rec.position_of(attr.column_id) {
+      Some(position) => match key_rec.field(position) {
+        Some(field) => field,
+        None => return Err(IcError::new(err::IC_ERROR_KEY_RECORD)),
+      },
+      None => return Err(IcError::new(err::IC_ERROR_KEY_RECORD)),
+    };
+    let start = field.offset() as usize;
+    let len = value_len(attr, field, &key_row[start..])?;
+    out.push(column_header::column_header(place, len as u32));
+    push_padded(out, &key_row[start..start + len]);
+    place += 1;
   }
   Ok(())
 }
@@ -199,6 +236,10 @@ pub(crate) fn read_attr_info_append(rec: &Record, out: &mut Vec<u32>) {
 /// may not change the key. An insert sends them, and then the row must
 /// hold the same key as the key section does, as the reference makes
 /// sure of by taking them from the key row.
+///
+/// A blob field's value is not in the row: a record naming one is
+/// refused with `IC_ERROR_NOT_SUPPORTED`, and a query writes it from
+/// its blob values (`blob::BlobValues`).
 pub fn write_attr_info(
   rec: &Record,
   row: &[u8],
@@ -218,15 +259,19 @@ pub fn write_attr_info_into(
   out: &mut Vec<u32>,
 ) -> Result<(), IcError> {
   out.clear();
-  write_attr_info_append(rec, row, skip_keys, out)
+  write_attr_info_append(rec, row, skip_keys, None, out)
 }
 
 /// As [`write_attr_info`], appended to `out`: the updates after an
-/// interpreted operation's program.
+/// interpreted operation's program, or a query's write. With `blobs`,
+/// each blob field's value is taken from there, as the head and inline
+/// bytes the main row keeps (`blob::push_main_value`), or NULL; without,
+/// a blob field is refused with `IC_ERROR_NOT_SUPPORTED`.
 pub(crate) fn write_attr_info_append(
   rec: &Record,
   row: &[u8],
   skip_keys: bool,
+  blobs: Option<&BlobValues>,
   out: &mut Vec<u32>,
 ) -> Result<(), IcError> {
   if row.len() < rec.row_size() as usize {
@@ -238,12 +283,27 @@ pub(crate) fn write_attr_info_append(
       Some(found) => found,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
-    let is_null = rec.is_null(row, position);
+    let at = position;
+    let is_null = rec.is_null(row, at);
     position += 1;
     if skip_keys && attr.primary_key {
       continue;
     }
     let id = field.field_id();
+    if field.is_blob() {
+      let values = match blobs {
+        Some(values) => values,
+        None => return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED)),
+      };
+      match values.blob(at)? {
+        Some(value) => {
+          let sizes = values.sizes_at(at)?;
+          blob::push_main_value(sizes, id, value, out)?;
+        }
+        None => out.push(column_header::column_header(id, 0)),
+      }
+      continue;
+    }
     if is_null {
       out.push(column_header::column_header(id, 0));
       continue;
@@ -630,6 +690,29 @@ mod tests {
     row[at..at + 4].copy_from_slice(&[3, b'a', b'b', b'c']);
     let key = key_info(&rec, &row).expect("key");
     // Four bytes of id, then four of name: the length and three bytes.
+    assert_eq!(key, padded(&[7, 0, 0, 0, 3, b'a', b'b', b'c']));
+  }
+
+  #[test]
+  fn a_parts_table_takes_the_key_as_its_first_columns() {
+    let t = table();
+    // A key record whose fields lie in another order than the columns.
+    let rec = Record::default_for(&t, Some(&[1, 0])).expect("record");
+    let mut row = vec![0u8; rec.row_size() as usize];
+    let id = rec.field(1).expect("id");
+    let at = id.offset() as usize;
+    row[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
+    let name = rec.field(0).expect("name");
+    let at = name.offset() as usize;
+    row[at..at + 4].copy_from_slice(&[3, b'a', b'b', b'c']);
+    let mut out = vec![99];
+    parts_key_attr_info_into(&rec, &row, &mut out).expect("columns");
+    // id as column 0, name as column 1, in the main table's order.
+    let mut want = vec![head(0, 4), 7, head(1, 4)];
+    want.extend_from_slice(&padded(&[3, b'a', b'b', b'c']));
+    assert_eq!(out, want);
+    // The key section is the same values without their headers.
+    let key = key_info(&rec, &row).expect("key");
     assert_eq!(key, padded(&[7, 0, 0, 0, 3, b'a', b'b', b'c']));
   }
 

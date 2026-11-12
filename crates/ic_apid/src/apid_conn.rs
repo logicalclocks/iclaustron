@@ -724,6 +724,16 @@ pub struct ApidConnection {
   pub(crate) scan_bounds: Vec<u32>,
   /// A takeover's key, kept for its allocation.
   pub(crate) takeover_key: Vec<u32>,
+  /// BLOB queries whose round is done and whose next round the poll is
+  /// to plan and send at its end (`blob_run`).
+  pub(crate) blob_due: Vec<QueryId>,
+  /// The poll is to send at its end: a BLOB query's round, or a commit
+  /// it held, is waiting.
+  pub(crate) blob_send_due: bool,
+  /// Where a part's value is made, kept for its allocation.
+  pub(crate) blob_bytes: Vec<u8>,
+  /// Rounds BLOB queries have sent after their first.
+  pub(crate) blob_rounds: u64,
 }
 
 /// Records for scans at one node and coordinator instance.
@@ -853,6 +863,10 @@ impl ApidConnection {
       scan_receiver_ids: Vec::new(),
       scan_bounds: Vec::new(),
       takeover_key: Vec::new(),
+      blob_due: Vec::new(),
+      blob_send_due: false,
+      blob_bytes: Vec::new(),
+      blob_rounds: 0,
     })
   }
 
@@ -925,6 +939,14 @@ impl ApidConnection {
       None => format!("signal {}", sig_no),
     };
     Some((name, node_id))
+  }
+
+  /// How many rounds the BLOB queries on this connection have sent after
+  /// their first (chapter 06, phase 12): none for an inline value, nor
+  /// for an insert whose parts fit its first round; one for each round
+  /// a longer value, or an insert that ignores errors, goes on in.
+  pub fn blob_rounds(&self) -> u64 {
+    self.blob_rounds
   }
 
   /// Signals of scan runs that had ended when they came, dropped as
@@ -1426,6 +1448,9 @@ impl ApidConnection {
     // coordinator's link went fail, and what the scans called for goes
     // now rather than with the next send.
     self.drive_scans(check_links);
+    // BLOB queries whose round is done send their next, and a commit
+    // they held goes once none holds it.
+    self.drive_blobs();
     // Transactions and scans whose replies never came while their link
     // stayed up end with 4012, after the replies just taken have had
     // their say.

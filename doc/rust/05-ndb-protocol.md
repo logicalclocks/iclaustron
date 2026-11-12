@@ -1176,7 +1176,12 @@ table, and knows nothing joining them.
   *L ≤ I* has none.
 - **Errors.** A part read that finds no row (626) is a corrupted value,
   4267. A value longer than the inline size in a column with no parts
-  table is refused with 4266.
+  table is refused with 4266, and so, by our choice, is one longer than
+  its MySQL type holds: 255 bytes for the TINY types, though their
+  column takes 256 inline, 65 535 for TEXT and BLOB, 16 MiB less a byte
+  for the MEDIUM types, 4 GiB less a byte for the rest, the type told by
+  the sizes above (chapter 10, 2026-11-12). A MySQL server reads a
+  TINYBLOB of 256 bytes as its first 255 (seen 2026-11-12).
 - **How the reference runs an operation.** It reads the head with a
   shared lock before an update, a write or a delete, ignoring its error
   each time, and writes the parts in the next batch, once the head is

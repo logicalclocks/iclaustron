@@ -25,6 +25,13 @@
 //! assignments"): kept beside its records until changed, with its
 //! inputs beside its rows, and for an update a record of the columns
 //! read after the program, into a row of their own.
+//!
+//! **A query may hold blob values** (chapter 06, phase 12): when its
+//! attribute record names blob fields, their values are kept beside its
+//! rows, NULL until set, and its operation goes in rounds, with part
+//! operations of the driver's own (`blob_run`). Those are queries too,
+//! in the same table, so that their replies are routed as any query's
+//! are; they are the connection's, and the program never sees them.
 
 use std::sync::Arc;
 
@@ -34,6 +41,8 @@ use ic_signals::key_ops;
 use ic_util::ptr_array::PtrId;
 
 use crate::apid_conn::ApidConnection;
+use crate::blob::BlobValues;
+use crate::blob_run::BlobRun;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
 use crate::program;
@@ -238,6 +247,20 @@ pub(crate) struct Execution {
   /// For a takeover of a scanned row, the receiver whose batch it is,
   /// which asks for more only once every takeover of the batch is done.
   pub takeover: Option<crate::scan::TakeoverOf>,
+  /// For a part operation, the BLOB query it is for and that query's
+  /// round.
+  pub part_of: Option<PartOf>,
+}
+
+/// The BLOB query a part operation is for, and the round it went in:
+/// a reply to an operation of an earlier round is no longer the
+/// query's concern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PartOf {
+  /// The query.
+  pub owner: QueryId,
+  /// Its round, as its run counts them.
+  pub round: u32,
 }
 
 /// True if the record is over this version of the table.
@@ -248,9 +271,9 @@ pub(crate) fn over_table(rec: &Record, table: &TableDef) -> bool {
 
 /// Refuse records that do not fit a key operation over `table`: both
 /// must be over this version of it, and the key record must hold every
-/// primary key column. Neither may name a blob field: a key record
-/// never, an attribute record not until phase 12 reads and writes them
-/// (chapter 06, 12.3).
+/// primary key column. A key record may name no blob field; which
+/// operations take an attribute record naming one is for each to say
+/// (chapter 06, phase 12).
 pub(crate) fn check_records(
   table: &TableDef,
   key_rec: &Record,
@@ -262,14 +285,14 @@ pub(crate) fn check_records(
   if !fits {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  key_rec.refuse_blob_fields()?;
-  attr_rec.refuse_blob_fields()
+  key_rec.refuse_blob_fields()
 }
 
 /// As [`check_records`], for an operation through a unique index: the
 /// index must be unique and the records over its table. That the key
 /// record holds every indexed column is checked when the operation is
-/// defined.
+/// defined. Neither record may name a blob field until phase 12 goes
+/// through unique indexes (chapter 06, 12.7).
 pub(crate) fn check_unique_records(
   index: &IndexDef,
   key_rec: &Record,
@@ -314,6 +337,14 @@ pub struct ApidQuery {
   /// they come into.
   after_rec: Option<Record>,
   after_row: Vec<u8>,
+  /// The values of the attribute record's blob fields, if it names any.
+  blobs: Option<BlobValues>,
+  /// The run of its rounds, made at its first execution with blob
+  /// values and kept, with its part operations, for the next.
+  pub(crate) run: Option<Box<BlobRun>>,
+  /// True for a part operation of the driver's own, which the program
+  /// never sees.
+  internal: bool,
   pub(crate) execution: Execution,
 }
 
@@ -337,12 +368,20 @@ impl ApidQuery {
   /// attributes it reads or writes. Both must be over the same version
   /// of the table, and the key record must hold every primary key
   /// column.
+  ///
+  /// The attribute record may name blob fields, whose values the query
+  /// holds ([`blob`](Self::blob)); only an insert takes them for now
+  /// (chapter 06, 12.3): reads come in 12.5, other writes in 12.4.
   pub fn new(
     table: &Arc<TableDef>,
     key_rec: &Record,
     attr_rec: &Record,
   ) -> Result<ApidQuery, IcError> {
     check_records(table, key_rec, attr_rec)?;
+    let mut blobs: Option<BlobValues> = None;
+    if attr_rec.has_blob_fields() {
+      blobs = Some(BlobValues::new(attr_rec));
+    }
     Ok(ApidQuery {
       table: Arc::clone(table),
       index: None,
@@ -361,6 +400,9 @@ impl ApidQuery {
       inputs: [0; IC_PROGRAM_INPUTS as usize],
       after_rec: None,
       after_row: Vec::new(),
+      blobs,
+      run: None,
+      internal: false,
       execution: Execution::default(),
     })
   }
@@ -394,8 +436,46 @@ impl ApidQuery {
       inputs: [0; IC_PROGRAM_INPUTS as usize],
       after_rec: None,
       after_row: Vec::new(),
+      blobs: None,
+      run: None,
+      internal: false,
       execution: Execution::default(),
     })
+  }
+
+  /// A part operation of the driver's own, over a blob column's parts
+  /// table: its sections are built by the driver, so its rows are left
+  /// empty, and its records are the parts table's every column.
+  pub(crate) fn internal(parts: &Arc<TableDef>) -> Result<ApidQuery, IcError> {
+    let rec = Record::default_for(parts, None)?;
+    Ok(ApidQuery {
+      table: Arc::clone(parts),
+      index: None,
+      key_rec: rec.clone(),
+      attr_rec: rec,
+      key_row: Vec::new(),
+      attr_row: Vec::new(),
+      state: QueryState::Idle,
+      error: None,
+      error_data: 0,
+      user_ref: 0,
+      callback: None,
+      binding: 0,
+      result_len: 0,
+      program: None,
+      inputs: [0; IC_PROGRAM_INPUTS as usize],
+      after_rec: None,
+      after_row: Vec::new(),
+      blobs: None,
+      run: None,
+      internal: true,
+      execution: Execution::default(),
+    })
+  }
+
+  /// True for a part operation of the driver's own.
+  pub(crate) fn is_internal(&self) -> bool {
+    self.internal
   }
 
   /// The table the query is over.
@@ -576,6 +656,76 @@ impl ApidQuery {
   /// [`after_record`](Self::after_record); empty without one.
   pub fn after_row(&self) -> &[u8] {
     &self.after_row
+  }
+
+  /// The value of the blob field at `position` of the attribute record
+  /// (`ic_apid_query_blob`): `None` for NULL. What a write is to send,
+  /// or once a read has completed, what it read. Every value is NULL
+  /// until set. `IC_ERROR_NO_SUCH_FIELD` when the position names no
+  /// blob field.
+  pub fn blob(&self, position: u32) -> Result<Option<&[u8]>, IcError> {
+    match &self.blobs {
+      Some(values) => values.blob(position),
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    }
+  }
+
+  /// Set the blob field at `position` to a copy of `value`, for the
+  /// executions defined from now on (`ic_apid_query_set_blob`). Refused
+  /// with 4266 when the value is longer than its column's MySQL type
+  /// holds, or than a column without parts holds inline
+  /// ([`BlobSizes::holds`](crate::blob::BlobSizes::holds)), and while
+  /// the query is defined or sent (`IC_ERROR_TRANSACTION_ACTIVE`), since
+  /// its rounds read the value as they go.
+  pub fn set_blob(
+    &mut self,
+    position: u32,
+    value: &[u8],
+  ) -> Result<(), IcError> {
+    self.check_idle()?;
+    self.values_mut()?.set_blob(position, value)
+  }
+
+  /// Set the blob field at `position` NULL
+  /// (`ic_apid_query_set_blob_null`).
+  pub fn set_blob_null(&mut self, position: u32) -> Result<(), IcError> {
+    self.check_idle()?;
+    self.values_mut()?.set_blob_null(position)
+  }
+
+  /// The buffer of the blob field at `position`, to fill in place
+  /// (`ic_apid_query_blob_buffer`): the field is no longer NULL, and
+  /// holds what the buffer holds when the query is defined. It holds
+  /// the last value set or read, with its capacity. A value longer than
+  /// a write takes is refused with 4266 when the query is defined.
+  pub fn blob_buf_mut(
+    &mut self,
+    position: u32,
+  ) -> Result<&mut Vec<u8>, IcError> {
+    self.check_idle()?;
+    self.values_mut()?.blob_buf_mut(position)
+  }
+
+  /// The values of the attribute record's blob fields, if it names any.
+  pub fn blob_values(&self) -> Option<&BlobValues> {
+    self.blobs.as_ref()
+  }
+
+  fn values_mut(&mut self) -> Result<&mut BlobValues, IcError> {
+    match &mut self.blobs {
+      Some(values) => Ok(values),
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    }
+  }
+
+  /// The blob values taken out while the driver plans a round, and put
+  /// back after.
+  pub(crate) fn take_blob_values(&mut self) -> Option<BlobValues> {
+    self.blobs.take()
+  }
+
+  pub(crate) fn put_blob_values(&mut self, values: BlobValues) {
+    self.blobs = Some(values);
   }
 
   fn check_idle(&self) -> Result<(), IcError> {

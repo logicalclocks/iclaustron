@@ -2632,6 +2632,68 @@ through MySQL; a disk-stored BLOB's last part padded and read back
 right; many TEXT rows inserted in one transaction in one round, seen in
 a capture.
 
+Done 2026-11-12, every test passing; the hundred rows' one round is
+counted by the test, and the capture of it is still the author's to
+take:
+
+- **The planner** (`blob.rs`), pure: a run's first round, and each
+  next, part by part and value by value while the round's part data
+  stays within `GlobalOptions::blob_round_bytes`, at least one part a
+  round; an insert that ignores errors plans no part in its first.
+- **The driver** (`blob_run.rs`): part operations are queries of the
+  connection's own, over the parts tables, a set per blob field made
+  at the query's first execution and kept for the next, never seen by
+  the program; a part is written with the write operation, aborting on
+  error, packed straight from the value. The query stays sent until
+  its last round is done. A round done is planned by the poll at its
+  end and sent there, which sends whatever else is defined on the
+  connection with it (ours to choose: the staged requests of every
+  transaction go together, and a round left for the program's next
+  send would stall one that only polls). The query's last round done,
+  or an operation failed, it completes at once, as any query does.
+- **The commit held**: a transaction counts its BLOB queries that plan
+  a round after the one out; a commit asked for goes on the last round
+  of the last of them, or alone once none plans one, as when an insert
+  that ignores errors finds its row there. A round that cannot be
+  defined rolls the transaction back, so that no head is committed
+  without its parts. Failures reach the part operations before the
+  queries, so that a callback sees its transaction as it would without
+  them.
+- **The query** holds its blob values (`blob`, `set_blob`,
+  `set_blob_null`, `blob_buf_mut`); the main row's head and inline
+  bytes go in its insert's column section. Only inserts by primary key
+  take blob values; the rest is refused as chapter 04 lists. C refuses
+  a record naming a blob field in `ic_apid_query_create` until 12.8
+  brings the C calls, and an executor's shape refuses one until 12.6.
+- **`conn.blob_rounds()`** counts the rounds sent after a query's first
+  (ours to choose: a test can then see that a value takes the rounds
+  it should, and an application what its values cost).
+- Two BLOB queries on one row in one transaction are not yet put one
+  after the other: for inserts it does not matter, since the second
+  fails with 630 and its parts never go without its row; 12.4 orders
+  them.
+- Tests: unit tests of the planner, the head and a part as a write
+  carries them, the main key as the parts table's columns, blob values
+  in a write, and the commit held; the integration group `blob`, with
+  TEXT and LONGBLOB values at every boundary, 1 MiB and 10 MiB, a
+  TINYBLOB at its most and a byte over, disk-stored BLOB and TEXT
+  with short last parts, a hundred TEXT rows in one transaction and one
+  round, inserts that ignore errors with the row there and not, rounds
+  in a transaction left open, committed and rolled back, and a TEXT
+  under a key of two columns; each read back by MySQL by its length
+  and CRC-32. The capture of the hundred rows is the author's to take.
+- First run (2026-11-12): every value read back whole, 10 MiB too, but
+  a TINYBLOB of 256 bytes, its column's inline size, which MySQL read
+  as its first 255: MySQL's type holds 255. The test now writes 255
+  for MySQL to read back, and checks that 256 is taken and read cut.
+  The author decided the same day that the MySQL type's limit holds,
+  the type told by the column's sizes and any sizes MySQL does not give
+  a type counting as LONG (chapter 10): `BlobSizes::max_length`, the
+  limit of every write, 4266 past it; a value read is held only to what
+  its column keeps. The tests write the most a TINYBLOB and a TEXT hold,
+  and are refused a byte more, and the bound columns' limits are
+  checked against MySQL's types.
+
 ### 12.4 Write, update, delete (1 week)
 
 Exit: a value grown, shrunk, set NULL and set empty leaves exactly the

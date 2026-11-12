@@ -2216,6 +2216,12 @@ pub unsafe extern "C" fn ic_apid_query_create(
   if query.is_null() {
     return err::IC_ERROR_NULL_POINTER;
   }
+  // A blob field's value is set and read through calls C does not have
+  // yet (chapter 06, 12.8): until then, a C query takes no blob field,
+  // as the header says.
+  if attr.has_blob_fields() {
+    return err::IC_ERROR_NOT_SUPPORTED;
+  }
   // SAFETY: the caller's promise.
   match unsafe { on_conn(conn, |c| c.create_query(&table.def, key, attr)) } {
     Ok(Ok(id)) => {

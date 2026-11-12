@@ -781,6 +781,12 @@ pub struct GlobalOptions {
   /// `auto_increment_offset`; zero, or one above the step, counts as
   /// one.
   pub auto_increment_offset: u32,
+  /// How many bytes of part data a BLOB query sends in one round at
+  /// most (chapter 06, phase 12): a longer value goes on in further
+  /// rounds, the commit with the last. Each round has at least one part,
+  /// so 1 sends one part a round; zero counts as the default, 1 MiB
+  /// ([`IC_DEFAULT_BLOB_ROUND_BYTES`]).
+  pub blob_round_bytes: u32,
 }
 
 /// How long a management server has to answer, unless the options say.
@@ -797,6 +803,10 @@ pub const IC_MAX_REPLY_WAIT_MS: u32 = 360_000;
 /// options or the table say: eight times a MySQL server's default.
 pub const IC_DEFAULT_AUTO_INCREMENT_PREFETCH: u32 = 4096;
 
+/// How many bytes of part data a BLOB query sends in a round, unless
+/// the options say (the author, 2026-11-11).
+pub const IC_DEFAULT_BLOB_ROUND_BYTES: u32 = 1 << 20;
+
 impl Default for GlobalOptions {
   fn default() -> GlobalOptions {
     GlobalOptions {
@@ -806,6 +816,7 @@ impl Default for GlobalOptions {
       auto_increment_prefetch: IC_DEFAULT_AUTO_INCREMENT_PREFETCH,
       auto_increment_step: 1,
       auto_increment_offset: 1,
+      blob_round_bytes: IC_DEFAULT_BLOB_ROUND_BYTES,
     }
   }
 }
@@ -884,6 +895,9 @@ pub(crate) struct ApidShared {
   /// The prefetch, step and offset of AUTO_INCREMENT values, fixed at
   /// start from the options.
   pub(crate) auto_increment: CounterOptions,
+  /// Bytes of part data a BLOB query sends in a round at most; see
+  /// [`GlobalOptions::blob_round_bytes`].
+  pub(crate) blob_round_bytes: u64,
   /// The connection the AUTO_INCREMENT counters are updated on, made
   /// at first use; taken out when the global goes, as it holds the
   /// global's shared part in turn.
@@ -1394,6 +1408,7 @@ impl ApidGlobal {
       scan_batch_bytes,
       scan_batch_bytes_total,
       auto_increment: CounterOptions::from_options(options),
+      blob_round_bytes: blob_round_bytes_of(options.blob_round_bytes),
       counter: IcMutex::new(IC_MUTEX_LEVEL_COUNTER, CounterSlot::new()),
     });
 
@@ -1643,9 +1658,27 @@ fn reply_wait_of(asked: u32) -> u32 {
   IC_MAX_REPLY_WAIT_MS
 }
 
+/// The bytes of part data a BLOB query sends in a round when the
+/// options ask for `asked`: the default for zero.
+fn blob_round_bytes_of(asked: u32) -> u64 {
+  if asked == 0 {
+    return IC_DEFAULT_BLOB_ROUND_BYTES as u64;
+  }
+  asked as u64
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn a_blob_round_takes_the_default_for_zero() {
+    let default = IC_DEFAULT_BLOB_ROUND_BYTES as u64;
+    assert_eq!(blob_round_bytes_of(0), default);
+    assert_eq!(blob_round_bytes_of(1), 1);
+    assert_eq!(blob_round_bytes_of(65_536), 65_536);
+    assert_eq!(GlobalOptions::default().blob_round_bytes as u64, default);
+  }
 
   #[test]
   fn a_transaction_waits_six_minutes_at_most() {

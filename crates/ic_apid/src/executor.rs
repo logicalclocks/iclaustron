@@ -176,13 +176,15 @@ impl std::fmt::Debug for OpShape {
 impl OpShape {
   /// Operations by primary key on a table. Both records must be over
   /// this version of the table, and the key record must hold every
-  /// primary key column, as for a query.
+  /// primary key column, as for a query. Neither may name a blob field
+  /// until an executor runs BLOB queries (chapter 06, 12.6).
   pub fn new(
     table: &Arc<TableDef>,
     key_rec: &Record,
     attr_rec: &Record,
   ) -> Result<Arc<OpShape>, IcError> {
     query::check_records(table, key_rec, attr_rec)?;
+    attr_rec.refuse_blob_fields()?;
     Ok(Arc::new(OpShape {
       id: next_shape_id(),
       table: Arc::clone(table),
