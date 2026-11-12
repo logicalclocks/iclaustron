@@ -348,8 +348,8 @@ pub const IC_ERROR_TRANSACTION_ROLLED_BACK: i32 = 7151;
 pub const IC_ERROR_NO_SUCH_COLLATION: i32 = 7152;
 /// A delete on a table with a blob column that would leave the row's
 /// blob parts, kept in another table that the client looks after,
-/// behind: through a unique index, of a scanned row taken over, or by
-/// an executor or a synchronous helper, until they delete them too
+/// behind: through a unique index, until it deletes them too, of a
+/// scanned row taken over, or with a blob column that cannot be used
 /// (chapter 06, phase 12).
 pub const IC_ERROR_DELETE_WITH_BLOBS: i32 = 7153;
 /// The index is not online: still being built, being dropped, or

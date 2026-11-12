@@ -82,6 +82,7 @@ use ic_apid::apid_global::IC_DEFAULT_BLOB_ROUND_BYTES;
 use ic_apid::blob;
 use ic_apid::blob::BlobColumn;
 use ic_apid::blob::BlobRefusal;
+use ic_apid::blob::BlobValues;
 use ic_apid::blob::PartColumn;
 use ic_apid::blob::PartData;
 use ic_apid::collation_client;
@@ -2555,7 +2556,7 @@ fn blob_guard_knows_every_kind_of_blob_column() {
 }
 
 #[test]
-fn blob_guard_refuses_deletes_by_helper_and_unique_key() {
+fn blob_guard_refuses_deletes_by_unique_key() {
   let cluster = match cluster() {
     Some(cluster) => cluster,
     None => return,
@@ -2571,18 +2572,19 @@ fn blob_guard_refuses_deletes_by_helper_and_unique_key() {
     db = IC_IT_DB
   ));
 
-  // One operation, its own transaction.
+  // One operation, its own transaction: the helper deletes the row
+  // with its parts, in two rounds (12.6).
   let mut key = t.row();
   t.put(&mut key, "id", "1");
-  let done = key_op::write_key(
+  key_op::write_key(
     &mut conn,
     key_ops::IC_OP_DELETE,
     &t.rec,
     &key,
     &t.rec,
     &key,
-  );
-  assert_eq!(refused_with(done), err::IC_ERROR_DELETE_WITH_BLOBS);
+  )
+  .expect("the helper deletes");
 
   // By primary key in a transaction, a delete takes the parts with the
   // row (12.4, the `blob` group); rolled back before it is sent, it
@@ -2628,12 +2630,12 @@ fn blob_guard_refuses_deletes_by_helper_and_unique_key() {
   assert_eq!(finish(&mut conn, tid), CommitState::RolledBack);
   conn.close_transaction(tid).expect("close");
 
-  // Nothing went, and the long TEXT is whole.
+  // Only the helper's delete went, and the long TEXT is whole.
   let seen = mysql(&format!(
     "SELECT id, LENGTH(txt) FROM {}.bt ORDER BY id",
     IC_IT_DB
   ));
-  assert_eq!(seen, Some("1\t5\n2\t5000".to_string()));
+  assert_eq!(seen, Some("2\t5000".to_string()));
 }
 
 #[test]
@@ -2814,8 +2816,8 @@ fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
   assert_eq!(parts.num_fields(), 5);
 
   // A record may name a blob column. A query takes it, and reads and
-  // writes with it (12.3 to 12.5); an executor's shapes refuse it until
-  // 12.6, and a scan always.
+  // writes with it (12.3 to 12.5), and so does an executor's shape
+  // (12.6), though not with a program; a scan always refuses it.
   let id = t.def.field_id("id").expect("id");
   let text = t.def.field_id("t").expect("t");
   let rec = Record::default_for(&t.def, Some(&[id, text])).expect("a record");
@@ -2823,8 +2825,9 @@ fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
   let key_rec = Record::default_for(&t.def, Some(&[id])).expect("its key");
   let qid = conn.create_query(&t.def, &key_rec, &rec).expect("a query");
   conn.free_query(qid).expect("free the query");
-  match OpShape::new(&t.def, &key_rec, &rec) {
-    Ok(_) => panic!("a shape naming a blob field was taken"),
+  let shape = OpShape::new(&t.def, &key_rec, &rec).expect("a shape");
+  match shape.reading_after(&key_rec) {
+    Ok(_) => panic!("a shape naming a blob field read after a program"),
     Err(e) => assert_eq!(e.code, err::IC_ERROR_NOT_SUPPORTED),
   }
   match conn.create_scan(&t.def, &rec) {
@@ -4587,6 +4590,428 @@ fn blob_readers_and_writers_see_no_torn_value() {
     }
   });
   assert!(failures.is_empty(), "{:?}", failures);
+}
+
+/// Set a holder's blob value at `position`, or NULL.
+fn hold_value(values: &mut BlobValues, position: u32, value: Option<&[u8]>) {
+  match value {
+    Some(bytes) => values.set_blob(position, bytes).expect("a value"),
+    None => values.set_blob_null(position).expect("NULL"),
+  }
+}
+
+/// Set an executor's operation's blob value at `position`, or NULL.
+fn op_value(op: &mut KeyOp, position: u32, value: Option<&[u8]>) {
+  match value {
+    Some(bytes) => op.set_blob(position, bytes).expect("a value"),
+    None => op.set_blob_null(position).expect("NULL"),
+  }
+}
+
+/// The TEXT and LONGBLOB values of `bl_kinds` row `id` at `step`, of
+/// lengths at the boundaries: NULL, empty, inline, a part and a byte
+/// past it, several parts; a step shifts which row has which.
+fn kinds_values(
+  t: &Table,
+  id: i64,
+  step: usize,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+  let t_sizes = blob_column_of(t, "t").sizes().expect("sizes");
+  let b_sizes = blob_column_of(t, "b").sizes().expect("sizes");
+  let (t_inline, t_part) = (t_sizes.inline as usize, t_sizes.part as usize);
+  let (b_inline, b_part) = (b_sizes.inline as usize, b_sizes.part as usize);
+  let t_lengths = [
+    None,
+    Some(0),
+    Some(t_inline),
+    Some(t_inline + t_part + 1),
+    Some(3 * t_part + 7),
+  ];
+  let b_lengths = [
+    Some(2 * b_part + 300),
+    Some(1),
+    Some(b_inline + 1),
+    None,
+    Some(40_000),
+  ];
+  let at = id as usize + step;
+  let seed = id as u32 * 100 + step as u32;
+  (
+    t_lengths[at % 5].map(|n| blob_value(n, seed, true)),
+    b_lengths[(at / 5 + at) % 5].map(|n| blob_value(n, seed + 1, false)),
+  )
+}
+
+/// Check that MySQL reads `bl_kinds` rows 1 to `rows`, and no other, as
+/// [`kinds_values`] gives them at `step`.
+fn assert_kinds_rows(t: &Table, rows: i64, step: usize) {
+  let seen = mysql(&format!(
+    "SELECT id, LENGTH(t), CRC32(t), LENGTH(b), CRC32(b)
+       FROM {}.bl_kinds ORDER BY id",
+    IC_IT_DB
+  ))
+  .expect("a MySQL client");
+  let mut want = String::new();
+  let mut id: i64 = 1;
+  while id <= rows {
+    let (t_value, b_value) = kinds_values(t, id, step);
+    want.push_str(&format!(
+      "{}\t{}\t{}\n",
+      id,
+      read_back(t_value.as_deref()),
+      read_back(b_value.as_deref())
+    ));
+    id += 1;
+  }
+  assert_eq!(
+    seen.trim_end(),
+    want.trim_end(),
+    "the rows at step {}",
+    step
+  );
+}
+
+#[test]
+fn blob_values_go_through_the_synchronous_helpers() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let key_rec = record_over(&t, &["id"]);
+  let rec = record_over(&t, &["id", "t", "b"]);
+  let at_t = position_in(&t, &rec, "t");
+  let at_b = position_in(&t, &rec, "b");
+  let mut values = BlobValues::new(&rec);
+  let mut key = vec![0; key_rec.row_size() as usize];
+  let mut row = vec![0; rec.row_size() as usize];
+  // Each row inserted, then changed by each kind of write, its values
+  // read back after each by the helper and by MySQL.
+  let kinds = [
+    WriteKind::Insert,
+    WriteKind::Update,
+    WriteKind::Write,
+    WriteKind::Update,
+    WriteKind::Write,
+  ];
+  let mut id: i64 = 1;
+  while id <= 5 {
+    put_into(&t, &key_rec, &mut key, "id", &id.to_string());
+    put_into(&t, &rec, &mut row, "id", &id.to_string());
+    for (step, kind) in kinds.iter().enumerate() {
+      let (t_value, b_value) = kinds_values(&t, id, step);
+      let what = format!("row {} by {:?}, step {}", id, kind, step);
+      hold_value(&mut values, at_t, t_value.as_deref());
+      hold_value(&mut values, at_b, b_value.as_deref());
+      let wrote = key_op::write_key_blobs(
+        &mut conn,
+        *kind,
+        &key_rec,
+        &key,
+        &rec,
+        &row,
+        &mut values,
+      );
+      assert!(wrote.is_ok(), "{}: {:?}", what, wrote);
+      // The holder comes back as it went.
+      assert!(
+        values.blob(at_t).expect("t") == t_value.as_deref(),
+        "{}",
+        what
+      );
+      assert!(
+        values.blob(at_b).expect("b") == b_value.as_deref(),
+        "{}",
+        what
+      );
+      assert_eq!(
+        mysql_blob("bl_kinds", "t", id),
+        read_back(t_value.as_deref()),
+        "{}: the TEXT",
+        what
+      );
+      assert_eq!(
+        mysql_blob("bl_kinds", "b", id),
+        read_back(b_value.as_deref()),
+        "{}: the LONGBLOB",
+        what
+      );
+      values.clear();
+      let found = key_op::read_committed_blobs(
+        &mut conn,
+        &key_rec,
+        &key,
+        &rec,
+        &mut row,
+        &mut values,
+      );
+      assert!(matches!(found, Ok(true)), "{}: {:?}", what, found);
+      assert!(
+        values.blob(at_t).expect("t") == t_value.as_deref(),
+        "{}: the TEXT read",
+        what
+      );
+      assert!(
+        values.blob(at_b).expect("b") == b_value.as_deref(),
+        "{}: the LONGBLOB read",
+        what
+      );
+    }
+    id += 1;
+  }
+  assert_parts_match(&mut conn, &t, "bl_kinds", "t");
+  assert_parts_match(&mut conn, &t, "bl_kinds", "b");
+
+  // An insert of a row there fails as the data node says, changing
+  // nothing; so does an update of a row not there, which a read then
+  // does not find.
+  put_into(&t, &key_rec, &mut key, "id", "1");
+  put_into(&t, &rec, &mut row, "id", "1");
+  let before = mysql_blob("bl_kinds", "t", 1);
+  hold_value(&mut values, at_t, Some(b"other"));
+  let e = key_op::write_key_blobs(
+    &mut conn,
+    WriteKind::Insert,
+    &key_rec,
+    &key,
+    &rec,
+    &row,
+    &mut values,
+  )
+  .expect_err("1 is there");
+  assert_eq!(e.code, 630);
+  assert_eq!(mysql_blob("bl_kinds", "t", 1), before);
+  put_into(&t, &key_rec, &mut key, "id", "99");
+  put_into(&t, &rec, &mut row, "id", "99");
+  let e = key_op::write_key_blobs(
+    &mut conn,
+    WriteKind::Update,
+    &key_rec,
+    &key,
+    &rec,
+    &row,
+    &mut values,
+  )
+  .expect_err("99 is not there");
+  assert_eq!(e.code, 626);
+  let found = key_op::read_committed_blobs(
+    &mut conn,
+    &key_rec,
+    &key,
+    &rec,
+    &mut row,
+    &mut values,
+  )
+  .expect("a read");
+  assert!(!found, "99 is not there");
+
+  // Deletes take every part with the row: by the helper, and by
+  // write_key, whose records name no blob field.
+  put_into(&t, &key_rec, &mut key, "id", "1");
+  key_op::write_key_blobs(
+    &mut conn,
+    WriteKind::Delete,
+    &key_rec,
+    &key,
+    &rec,
+    &row,
+    &mut values,
+  )
+  .expect("delete 1");
+  put_into(&t, &key_rec, &mut key, "id", "2");
+  key_op::write_key(
+    &mut conn,
+    key_ops::IC_OP_DELETE,
+    &key_rec,
+    &key,
+    &key_rec,
+    &key,
+  )
+  .expect("delete 2");
+  let left =
+    mysql(&format!("SELECT id FROM {}.bl_kinds ORDER BY id", IC_IT_DB));
+  assert_eq!(left, Some("3\n4\n5".to_string()));
+  assert_parts_match(&mut conn, &t, "bl_kinds", "t");
+  assert_parts_match(&mut conn, &t, "bl_kinds", "b");
+  // Every transaction was let go of: none is left behind.
+  conn.poll(0);
+  assert_eq!(conn.transactions_open(), 0);
+}
+
+#[test]
+fn blob_values_go_through_an_executor() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let executor = executor_with(&cluster, 64, 256);
+  let mut submitter = executor.submitter();
+  let def = submitter.table_bind(IC_IT_DB, "bl_kinds").expect("bind");
+  let all = Record::default_for(&def, None).expect("a record");
+  let x = Table { def, rec: all };
+  let key_rec = record_over(&x, &["id"]);
+  let rec = record_over(&x, &["id", "t", "b"]);
+  let shape = OpShape::new(&x.def, &key_rec, &rec).expect("a shape");
+  let plain = OpShape::new(&x.def, &key_rec, &key_rec).expect("a shape");
+  let at_t = position_in(&x, &rec, "t");
+  let at_b = position_in(&x, &rec, "b");
+  const ROWS: i64 = 20;
+
+  // One request inserts every row: one transaction, of many BLOB
+  // operations on many rows.
+  let mut request = Request::new();
+  let mut id: i64 = 1;
+  while id <= ROWS {
+    let mut op = KeyOp::write(&shape, WriteKind::Insert);
+    put_into(&x, &key_rec, op.key_row_mut(), "id", &id.to_string());
+    put_into(&x, &rec, op.attr_row_mut(), "id", &id.to_string());
+    let (t_value, b_value) = kinds_values(&x, id, 0);
+    op_value(&mut op, at_t, t_value.as_deref());
+    op_value(&mut op, at_b, b_value.as_deref());
+    request.push(op);
+    id += 1;
+  }
+  submitter.execute(&mut request).expect("the inserts commit");
+  assert_kinds_rows(&x, ROWS, 0);
+  assert_parts_match(&mut conn, &t, "bl_kinds", "t");
+  assert_parts_match(&mut conn, &t, "bl_kinds", "b");
+
+  // One request reads every row, each its own way, a committed read
+  // beside the others taking its lock first; the values come back in
+  // the operations.
+  let reads = [
+    ReadKind::Committed,
+    ReadKind::Locked,
+    ReadKind::Exclusive,
+    ReadKind::Simple,
+  ];
+  let rounds = executor.stats().blob_rounds;
+  let mut request = Request::new();
+  let mut id: i64 = 1;
+  while id <= ROWS {
+    let mut op = KeyOp::read(&shape, reads[id as usize % reads.len()]);
+    put_into(&x, &key_rec, op.key_row_mut(), "id", &id.to_string());
+    op.set_blob_lock_first(id % 8 == 0);
+    request.push(op);
+    id += 1;
+  }
+  submitter.execute(&mut request).expect("the reads commit");
+  for (index, op) in request.ops().iter().enumerate() {
+    let id = index as i64 + 1;
+    let (t_value, b_value) = kinds_values(&x, id, 0);
+    assert!(op.error().is_none(), "row {}: {:?}", id, op.error());
+    assert!(
+      op.blob(at_t).expect("t") == t_value.as_deref(),
+      "row {}",
+      id
+    );
+    assert!(
+      op.blob(at_b).expect("b") == b_value.as_deref(),
+      "row {}",
+      id
+    );
+  }
+  assert!(
+    executor.stats().blob_rounds > rounds,
+    "the parts are read in rounds after the first"
+  );
+
+  // A committed read alone in its request reads committed first: one
+  // round for inline values, three for values with parts.
+  for (id, after_first) in [(1, 0), (4, 2)] {
+    let mut op = KeyOp::read(&shape, ReadKind::Committed);
+    put_into(&x, &key_rec, op.key_row_mut(), "id", &id.to_string());
+    let mut request = Request::with_op(op);
+    let rounds = executor.stats().blob_rounds;
+    submitter.execute(&mut request).expect("a read alone");
+    let op = &request.ops()[0];
+    let (t_value, b_value) = kinds_values(&x, id, 0);
+    assert!(op.error().is_none(), "row {}: {:?}", id, op.error());
+    assert!(
+      op.blob(at_t).expect("t") == t_value.as_deref(),
+      "row {}",
+      id
+    );
+    assert!(
+      op.blob(at_b).expect("b") == b_value.as_deref(),
+      "row {}",
+      id
+    );
+    assert_eq!(
+      executor.stats().blob_rounds - rounds,
+      after_first,
+      "row {}'s rounds",
+      id
+    );
+  }
+
+  // A request with an insert of a row there rolls back whole, leaving
+  // no part of the row it would have inserted.
+  let mut request = Request::new();
+  for id in [99, 1] {
+    let mut op = KeyOp::write(&shape, WriteKind::Insert);
+    put_into(&x, &key_rec, op.key_row_mut(), "id", &id.to_string());
+    put_into(&x, &rec, op.attr_row_mut(), "id", &id.to_string());
+    let (t_value, b_value) = kinds_values(&x, 4, 0);
+    op_value(&mut op, at_t, t_value.as_deref());
+    op_value(&mut op, at_b, b_value.as_deref());
+    request.push(op);
+  }
+  let e = submitter.execute(&mut request).expect_err("1 is there");
+  assert_eq!(e.code, 630);
+  assert_kinds_rows(&x, ROWS, 0);
+  assert_parts_match(&mut conn, &t, "bl_kinds", "t");
+  assert_parts_match(&mut conn, &t, "bl_kinds", "b");
+
+  // One request changes every row, by updates and writes in turn.
+  let mut request = Request::new();
+  let mut id: i64 = 1;
+  while id <= ROWS {
+    let mut kind = WriteKind::Write;
+    if id % 2 == 0 {
+      kind = WriteKind::Update;
+    }
+    let mut op = KeyOp::write(&shape, kind);
+    put_into(&x, &key_rec, op.key_row_mut(), "id", &id.to_string());
+    put_into(&x, &rec, op.attr_row_mut(), "id", &id.to_string());
+    let (t_value, b_value) = kinds_values(&x, id, 1);
+    op_value(&mut op, at_t, t_value.as_deref());
+    op_value(&mut op, at_b, b_value.as_deref());
+    request.push(op);
+    id += 1;
+  }
+  submitter.execute(&mut request).expect("the changes commit");
+  assert_kinds_rows(&x, ROWS, 1);
+  assert_parts_match(&mut conn, &t, "bl_kinds", "t");
+  assert_parts_match(&mut conn, &t, "bl_kinds", "b");
+
+  // One request deletes every row with its parts, half through a shape
+  // whose record names no blob field.
+  let mut request = Request::new();
+  let mut id: i64 = 1;
+  while id <= ROWS {
+    let mut op = KeyOp::write(&plain, WriteKind::Delete);
+    if id % 2 == 0 {
+      op = KeyOp::write(&shape, WriteKind::Delete);
+    }
+    put_into(&x, &key_rec, op.key_row_mut(), "id", &id.to_string());
+    request.push(op);
+    id += 1;
+  }
+  submitter.execute(&mut request).expect("the deletes commit");
+  let left = mysql(&format!("SELECT COUNT(*) FROM {}.bl_kinds", IC_IT_DB));
+  assert_eq!(left, Some("0".to_string()));
+  assert_parts_match(&mut conn, &t, "bl_kinds", "t");
+  assert_parts_match(&mut conn, &t, "bl_kinds", "b");
 }
 
 /// As [`finish`], giving up after `wait_ms`: `None` if the transaction

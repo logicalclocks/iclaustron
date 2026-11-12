@@ -188,8 +188,9 @@ then, into the connection's staged buffer, and goes with the next send.
   shared lock for a simple or committed read (05 §6.8).
 - `WriteKind`: `Update`, `Write`, `Insert`, `Delete`. An insert or write
   through a unique index is refused, and so is an update through one
-  whose values hold an indexed column (Q12). A delete on a table with a
-  blob column is refused (7153) until 12.4 deletes the parts with it.
+  whose values hold an indexed column (Q12). A delete by primary key
+  from a table with blob columns deletes their parts with the row
+  (12.4); through a unique index it is refused (7153) until 12.7.
 - `AbortOption`: `Default` (abort on error for a write, ignore it for a
   read), `AbortOnError`, `IgnoreError`; a committed read only ignores.
 - `BatchHint`: `None`, `Safe`, `Unsafe` (bits 22 and 23 of the request).
@@ -199,7 +200,7 @@ then, into the connection's staged buffer, and goes with the next send.
 - Every row size a table can hold is written: a request too large for
   one message goes as a train of fragments (05 §2.2).
 
-### Blob values (phase 12; inserts since 12.3, other writes since 12.4, reads since 12.5)
+### Blob values (phase 12; inserts since 12.3, other writes since 12.4, reads since 12.5, executors and helpers since 12.6)
 
 An attribute record may name blob fields (BLOB, TEXT, and a MySQL
 server's JSON and GEOMETRY), and a query over it holds their values
@@ -228,12 +229,41 @@ whole.
 Such a query reads and writes: `read_key` with any `ReadKind` and
 `write_key` with any `WriteKind`, by primary key, running no program. A
 delete by primary key from a table with blob columns, whether its
-record names blob fields or not, deletes their parts with the row. An
-executor's shapes refuse blob fields until 12.6 and unique queries
-until 12.7 (`IC_ERROR_NOT_SUPPORTED`); scans and takeovers always do. A
-delete keeps 7153 through a unique index, of a row taken over from a
-scan, on a table with a blob column that cannot be used, and through
-an executor or `key_op::write_key` until 12.6.
+record names blob fields or not, deletes their parts with the row.
+Unique queries refuse blob fields until 12.7
+(`IC_ERROR_NOT_SUPPORTED`); scans and takeovers always do. A delete
+keeps 7153 through a unique index, of a row taken over from a scan,
+and on a table with a blob column that cannot be used.
+
+An executor's `OpShape` takes an attribute record naming blob fields,
+and each `KeyOp` of it holds the values, with the same calls as a
+query: `op.set_blob`, `set_blob_null`, `blob_buf_mut`, `blob`,
+`set_blob_lock_first` and `set_blob_probe`. As the operation is defined
+its values are swapped into the pooled query it runs as, and swapped
+back as it completes, so nothing is copied and each buffer keeps its
+capacity. Such a shape runs no program and reads nothing after one
+(`IC_ERROR_NOT_SUPPORTED`). A request of many BLOB operations is one
+transaction, counted once towards `in_flight`; its commit, asked for at
+admission, waits inside the connection for the last round, and
+`ExecutorStats::blob_rounds` counts the rounds after each query's
+first. A committed read alone in its request reads committed first;
+beside other operations it takes the lock first. In C,
+`ic_request_blob` and its setters come with 12.8.
+
+The synchronous helpers, each a transaction of its own on the
+transaction API, take the values in a `BlobValues` holder made for the
+attribute record, `BlobValues::new(&rec)`, with the same calls:
+`key_op::read_committed_blobs(conn, &key_rec, &key, &rec, &mut row,
+&mut values)`, which reads committed first, and
+`key_op::write_key_blobs(conn, WriteKind::Update, &key_rec, &key, &rec,
+&row, &mut values)`, which takes the kind of write as the transaction
+API does (ours to choose, where `write_key` takes the operation's
+number). A write's holder is lent to it and given back as it was,
+hence taken mutably. `key_op::write_key`, whose records name no blob
+field, deletes from a table with blob columns in two rounds, the parts
+with the row. In C, `IC_BLOB_VALUES`,
+`ic_apid_conn_read_committed_blobs` and `ic_apid_conn_write_key_blobs`
+come with 12.8, and examples in both languages with them.
 
 Every write goes in rounds (chapter 06, phase 12), at most
 `GlobalOptions::blob_round_bytes` (1 MiB by default) of part data in a

@@ -89,6 +89,7 @@ use ic_port::IcError;
 use crate::apid_conn::ApidConnection;
 use crate::apid_global::ApidGlobal;
 use crate::apid_global::ApidShared;
+use crate::blob::BlobValues;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
 use crate::index_scan::RangeSet;
@@ -176,15 +177,15 @@ impl std::fmt::Debug for OpShape {
 impl OpShape {
   /// Operations by primary key on a table. Both records must be over
   /// this version of the table, and the key record must hold every
-  /// primary key column, as for a query. Neither may name a blob field
-  /// until an executor runs BLOB queries (chapter 06, 12.6).
+  /// primary key column, as for a query. The attribute record may name
+  /// blob fields, whose values each operation holds
+  /// ([`KeyOp::blob`]); the key record may not.
   pub fn new(
     table: &Arc<TableDef>,
     key_rec: &Record,
     attr_rec: &Record,
   ) -> Result<Arc<OpShape>, IcError> {
     query::check_records(table, key_rec, attr_rec)?;
-    attr_rec.refuse_blob_fields()?;
     Ok(Arc::new(OpShape {
       id: next_shape_id(),
       table: Arc::clone(table),
@@ -219,13 +220,14 @@ impl OpShape {
   /// must be for its table (`IC_ERROR_BAD_PROGRAM`). Which operations
   /// may run it is checked as each is defined: reads, updates and
   /// deletes, and only updates one that assigns. A program goes by
-  /// primary key only: a unique shape refuses it
+  /// primary key only: a unique shape refuses it, and so does one whose
+  /// attribute record names blob fields, as a BLOB query runs none
   /// (`IC_ERROR_NOT_SUPPORTED`).
   pub fn with_program(
     &self,
     program: &Arc<Program>,
   ) -> Result<Arc<OpShape>, IcError> {
-    if self.index.is_some() {
+    if self.index.is_some() || self.attr_rec.has_blob_fields() {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
     program::check_program(program, &self.table, true)?;
@@ -237,13 +239,14 @@ impl OpShape {
   /// A shape of the same records whose updates read the columns of
   /// `after_rec` after their program, into each operation's
   /// [`KeyOp::after_row`]. The record must be over the shape's table
-  /// (`IC_ERROR_KEY_RECORD`); a unique shape refuses it
+  /// (`IC_ERROR_KEY_RECORD`); a unique shape refuses it, and so does
+  /// one whose attribute record names blob fields
   /// (`IC_ERROR_NOT_SUPPORTED`).
   pub fn reading_after(
     &self,
     after_rec: &Record,
   ) -> Result<Arc<OpShape>, IcError> {
-    if self.index.is_some() {
+    if self.index.is_some() || self.attr_rec.has_blob_fields() {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
     if !query::over_table(after_rec, &self.table) {
@@ -327,6 +330,12 @@ pub struct KeyOp {
   result_len: u32,
   /// The query it runs as, while it is out.
   query: Option<QueryId>,
+  /// The values of the shape's blob fields, lent to its query while it
+  /// is out, and what a committed read and a write ask of their rounds
+  /// (chapter 06, phase 12).
+  blobs: Option<BlobValues>,
+  blob_lock_first: bool,
+  blob_probe: bool,
 }
 
 impl std::fmt::Debug for KeyOp {
@@ -357,6 +366,12 @@ impl KeyOp {
       error_data: 0,
       result_len: 0,
       query: None,
+      blobs: shape
+        .attr_rec
+        .has_blob_fields()
+        .then(|| BlobValues::new(&shape.attr_rec)),
+      blob_lock_first: false,
+      blob_probe: false,
     }
   }
 
@@ -454,6 +469,81 @@ impl KeyOp {
     self.result_len
   }
 
+  /// The value of the blob field at `position` of the shape's attribute
+  /// record: `None` for NULL. What a write is to send, or what a read
+  /// brought once the request is back. `IC_ERROR_NO_SUCH_FIELD` when
+  /// the position names no blob field. As a query's
+  /// ([`ApidQuery::blob`](crate::query::ApidQuery::blob)).
+  pub fn blob(&self, position: u32) -> Result<Option<&[u8]>, IcError> {
+    match &self.blobs {
+      Some(values) => values.blob(position),
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    }
+  }
+
+  /// Set the blob field at `position` to a copy of `value`. Refused
+  /// with 4266 when the value is longer than a write takes.
+  pub fn set_blob(
+    &mut self,
+    position: u32,
+    value: &[u8],
+  ) -> Result<(), IcError> {
+    self.values_mut()?.set_blob(position, value)
+  }
+
+  /// Set the blob field at `position` NULL.
+  pub fn set_blob_null(&mut self, position: u32) -> Result<(), IcError> {
+    self.values_mut()?.set_blob_null(position)
+  }
+
+  /// The buffer of the blob field at `position`, to fill in place: the
+  /// field is no longer NULL. It holds the last value set or read, with
+  /// its capacity; one longer than a write takes fails the operation
+  /// with 4266.
+  pub fn blob_buf_mut(
+    &mut self,
+    position: u32,
+  ) -> Result<&mut Vec<u8>, IcError> {
+    self.values_mut()?.blob_buf_mut(position)
+  }
+
+  /// The values of the shape's blob fields, if its attribute record
+  /// names any.
+  pub fn blob_values(&self) -> Option<&BlobValues> {
+    self.blobs.as_ref()
+  }
+
+  /// Have a committed read take the shared lock and its lock reference
+  /// in its first round, as a query's `set_blob_lock_first` does. A
+  /// committed read in a request of several operations always does.
+  pub fn set_blob_lock_first(&mut self, lock_first: bool) {
+    self.blob_lock_first = lock_first;
+  }
+
+  /// True if a committed read takes its lock first.
+  pub fn blob_lock_first(&self) -> bool {
+    self.blob_lock_first
+  }
+
+  /// Have a write that finds no row probe for parts a racing insert may
+  /// have left, as a query's `set_blob_probe` does.
+  pub fn set_blob_probe(&mut self, probe: bool) {
+    self.blob_probe = probe;
+  }
+
+  /// True if a write that finds no row probes for parts left past its
+  /// value.
+  pub fn blob_probe(&self) -> bool {
+    self.blob_probe
+  }
+
+  fn values_mut(&mut self) -> Result<&mut BlobValues, IcError> {
+    match &mut self.blobs {
+      Some(values) => Ok(values),
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    }
+  }
+
   fn is_read(&self) -> bool {
     matches!(self.kind, OpKind::Read(_))
   }
@@ -463,6 +553,38 @@ impl KeyOp {
     self.error_data = 0;
     self.result_len = 0;
     self.query = None;
+  }
+}
+
+/// Lend an operation's blob values to the query it is to run as, for
+/// one execution, with what it asks of its rounds: swapped, not copied
+/// (chapter 06, phase 12). A query of a shape without blob fields only
+/// has its flags set, which a delete from a table with blob columns
+/// ignores.
+fn lend_values(
+  conn: &mut ApidConnection,
+  op: &mut KeyOp,
+  qid: QueryId,
+) -> Result<(), IcError> {
+  let query = match conn.query_mut(qid) {
+    Some(query) => query,
+    None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+  };
+  query.set_blob_lock_first(op.blob_lock_first)?;
+  query.set_blob_probe(op.blob_probe)?;
+  match &mut op.blobs {
+    Some(values) => query.swap_blob_values(values),
+    None => Ok(()),
+  }
+}
+
+/// An operation's blob values back from the idle query it ran as,
+/// which gets its own back: what a read brought, or what a write sent.
+fn values_back(conn: &mut ApidConnection, op: &mut KeyOp, qid: QueryId) {
+  if let (Some(values), Some(query)) = (&mut op.blobs, conn.query_mut(qid)) {
+    // An idle query of the operation's shape: the swap that lent them
+    // takes them back.
+    let _ = query.swap_blob_values(values);
   }
 }
 
@@ -855,6 +977,10 @@ pub struct ExecutorStats {
   pub passes: u64,
   /// Scans started, each for a reader.
   pub scans: u64,
+  /// Rounds of BLOB queries sent after their first: a request of
+  /// several rounds counts once towards `in_flight`, and each round
+  /// after its first here.
+  pub blob_rounds: u64,
 }
 
 /// What the executor's thread, its handle and its submitters share.
@@ -876,6 +1002,7 @@ struct ExecutorShared {
   sends: AtomicU64,
   passes: AtomicU64,
   scans: AtomicU64,
+  blob_rounds: AtomicU64,
 }
 
 impl ExecutorShared {
@@ -896,6 +1023,7 @@ impl ExecutorShared {
       sends: self.sends.load(Ordering::Relaxed),
       passes: self.passes.load(Ordering::Relaxed),
       scans: self.scans.load(Ordering::Relaxed),
+      blob_rounds: self.blob_rounds.load(Ordering::Relaxed),
     }
   }
 }
@@ -947,6 +1075,7 @@ impl Executor {
       sends: AtomicU64::new(0),
       passes: AtomicU64::new(0),
       scans: AtomicU64::new(0),
+      blob_rounds: AtomicU64::new(0),
     });
     let mut runner = Runner::new(
       conn,
@@ -1418,6 +1547,12 @@ impl Runner {
           .conn
           .poll_with_requests(wait_ms, None, Some(&mut self.nudges));
       }
+      // The poll sent the BLOB rounds its replies called for: counted
+      // before a request they finished is handed back.
+      self
+        .shared
+        .blob_rounds
+        .store(self.conn.blob_rounds(), Ordering::Relaxed);
       // 2 and 3. The operations the replies completed, and the requests
       // they finished, handed back; the batches completed, moved to
       // their readers, those handed back, and the scans that ended.
@@ -1603,6 +1738,7 @@ impl Runner {
       }
       let shape_id = op.shape.id;
       if let Some(qid) = op.query.take() {
+        values_back(&mut self.conn, op, qid);
         self.give_back(shape_id, qid);
       }
       position += 1;
@@ -1670,6 +1806,10 @@ impl Runner {
       self.give_back(shape_id, qid);
       return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
     }
+    if let Err(e) = lend_values(&mut self.conn, op, qid) {
+      self.give_back(shape_id, qid);
+      return Err(e);
+    }
     let defined = match op.kind {
       OpKind::Read(kind) => {
         let args = ReadKeyArgs {
@@ -1680,12 +1820,6 @@ impl Runner {
           binding: position,
         };
         self.conn.read_key(qid, trans, &args)
-      }
-      // A delete from a table with blob columns waits for the executor
-      // to run BLOB queries (chapter 06, 12.6): it would leave the
-      // parts behind.
-      OpKind::Write(WriteKind::Delete) if op.shape.table.has_blob_columns() => {
-        Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS))
       }
       OpKind::Write(kind) => {
         let args = WriteKeyArgs {
@@ -1700,6 +1834,7 @@ impl Runner {
       }
     };
     if let Err(e) = defined {
+      values_back(&mut self.conn, op, qid);
       self.give_back(shape_id, qid);
       return Err(e);
     }
@@ -2237,6 +2372,7 @@ impl Runner {
           op.error = error;
           op.error_data = error_data;
           op.result_len = result_len;
+          values_back(&mut self.conn, op, qid);
           if op.is_read() && error.is_none() {
             // The row is copied out, so that the query is free at once.
             if let Some(query) = self.conn.query(qid) {

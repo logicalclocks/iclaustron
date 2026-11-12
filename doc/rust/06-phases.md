@@ -2844,6 +2844,50 @@ Done 2026-11-12, every test passing, the capture still to be taken:
 Exit: the cases of 12.3 to 12.5 through an executor and through the
 helpers; a request of many BLOB operations on many rows.
 
+Done 2026-11-12, every test passing:
+
+- **An executor's operations hold blob values.** `OpShape::new` takes
+  an attribute record naming blob fields; each `KeyOp` of it holds a
+  `BlobValues` with the query's calls, and its committed read's and
+  write's flags. `define_op` swaps the holder into the pooled query
+  (`ApidQuery::swap_blob_values`, checked to fit the record) and sets
+  the flags; `complete_op`, a define that fails and an abandoned
+  request swap it back, so nothing is copied. A shape naming blob
+  fields refuses a program and reads after one
+  (`IC_ERROR_NOT_SUPPORTED`), as a BLOB query runs none. A delete from
+  a table with blob columns goes through, where it kept 7153.
+- **Nothing new drives the rounds**: the executor's poll is the
+  connection's, which sends each round after the first, and the commit
+  asked for at admission waits inside the connection. A request counts
+  once towards `in_flight`; `ExecutorStats::blob_rounds` gives the
+  connection's count of rounds after a query's first, taken just after
+  the poll, so that a request handed back has its rounds counted.
+- **The helpers** `key_op::read_committed_blobs` and
+  `key_op::write_key_blobs` run a query of the two records as a
+  transaction of its own, by primary key, at a node holding the row,
+  the caller's `BlobValues` lent to it and given back; the write takes
+  a `WriteKind` (ours to choose: typed, as the transaction API's
+  writes are, where `write_key` takes the operation's number) and its
+  holder mutably, so that it is lent, not copied. `key_op::write_key`
+  deletes from a table with blob columns the same way, in two rounds.
+  `read_unique_committed` runs on the same path
+  (`transaction_of_one`), unchanged. A helper's wait goes on past the
+  reply timeout as long as rounds go, so that a value of many rounds is
+  waited for to its end.
+- C: the texts of `ic_apid_conn_write` and of 7153 changed with the
+  helper's deletes; the C calls for values come with 12.8.
+- Tests: integration tests in the `blob` group: a row's values by each
+  kind of write through the helpers, read back by the helper and by
+  MySQL, an insert of a row there, an update and a read of one not
+  there, deletes by both helpers; through an executor, one request of
+  twenty inserts, one of reads of every kind, a committed read alone
+  with its rounds, a request rolled back by a duplicate, one of
+  updates and writes, and one of deletes, half through a shape naming
+  no blob field, the parts counted against MySQL's lengths after each.
+  The guard test's helper delete now goes through, and the binding
+  test's shape naming a blob field is made. Unit tests: values lent to
+  a query come back uncopied, and an operation holds its shape's.
+
 ### 12.7 Unique keys (3 days)
 
 Exit: reads, updates and deletes through a unique index of a table with

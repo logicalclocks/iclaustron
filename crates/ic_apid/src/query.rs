@@ -383,8 +383,8 @@ impl ApidQuery {
   /// column.
   ///
   /// The attribute record may name blob fields, whose values the query
-  /// holds ([`blob`](Self::blob)); inserts, writes and updates take
-  /// them (chapter 06, 12.3 and 12.4), reads come in 12.5.
+  /// holds ([`blob`](Self::blob)): inserts, writes, updates and reads
+  /// take them (chapter 06, 12.3 to 12.5).
   pub fn new(
     table: &Arc<TableDef>,
     key_rec: &Record,
@@ -812,6 +812,28 @@ impl ApidQuery {
 
   pub(crate) fn put_blob_values(&mut self, values: BlobValues) {
     self.blobs = Some(values);
+  }
+
+  /// Swap the query's blob values with `values`, a holder for the same
+  /// record's: an executor's operation or a synchronous helper lends
+  /// its own to the query for one execution and takes them back after,
+  /// so that no value is copied and each buffer keeps its capacity.
+  /// Only an idle query's are swapped (`IC_ERROR_TRANSACTION_ACTIVE`),
+  /// and only with a holder that fits its record
+  /// (`IC_ERROR_RECORD_LAYOUT`); for a record without blob fields, an
+  /// empty holder is nothing to swap.
+  pub(crate) fn swap_blob_values(
+    &mut self,
+    values: &mut BlobValues,
+  ) -> Result<(), IcError> {
+    self.check_idle()?;
+    if !values.fits(&self.attr_rec) {
+      return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
+    }
+    if let Some(own) = &mut self.blobs {
+      std::mem::swap(own, values);
+    }
+    Ok(())
   }
 
   fn check_idle(&self) -> Result<(), IcError> {

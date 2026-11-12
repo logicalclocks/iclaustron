@@ -1326,6 +1326,11 @@ pub fn parse_part_row<'a>(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::executor::KeyOp;
+  use crate::executor::OpShape;
+  use crate::query::ApidQuery;
+  use crate::query::ReadKind;
+  use crate::query::WriteKind;
   use ic_signals::prop_stream::PropertyWriter;
   use ic_signals::table_props::parse_table_info;
   use ic_signals::table_props::IC_TP_COLUMN_ARRAY_KIND;
@@ -2222,5 +2227,66 @@ mod tests {
     // A row not read by bitmask is not ours.
     let refused = parse_heads(&def, &[7], &mut heads).expect_err("not ours");
     assert_eq!(refused.code, err::IC_ERROR_INCONSISTENT_DATA);
+  }
+
+  #[test]
+  fn values_lent_to_a_query_come_back_uncopied() {
+    let def = bound_main_table();
+    let key_rec = Record::default_for(&def, Some(&[0])).expect("key");
+    // id, t, tiny: positions 0, 1 and 2.
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let mut query = ApidQuery::new(&def, &key_rec, &rec).expect("a query");
+    let mut values = BlobValues::new(&rec);
+    values.set_blob(1, &value_of(5000)).expect("t");
+    let bytes = values.blob(1).expect("t").map(<[u8]>::as_ptr);
+    query.swap_blob_values(&mut values).expect("lent");
+    // The query holds the value itself, the holder the query's own.
+    assert_eq!(query.blob(1).expect("t").map(<[u8]>::as_ptr), bytes);
+    assert_eq!(values.blob(1).expect("t"), None);
+    query.swap_blob_values(&mut values).expect("given back");
+    assert_eq!(values.blob(1).expect("t").map(<[u8]>::as_ptr), bytes);
+    assert_eq!(query.blob(1).expect("t"), None);
+    // A holder for other blob fields is not the query's to take.
+    let other = Record::default_for(&def, Some(&[0, 1])).expect("record");
+    let mut wrong = BlobValues::new(&other);
+    let refused = query.swap_blob_values(&mut wrong).expect_err("refused");
+    assert_eq!(refused.code, err::IC_ERROR_RECORD_LAYOUT);
+    // Without blob fields, an empty holder is nothing to lend.
+    let mut plain = ApidQuery::new(&def, &key_rec, &key_rec).expect("plain");
+    let mut empty = BlobValues::new(&key_rec);
+    plain.swap_blob_values(&mut empty).expect("nothing to swap");
+  }
+
+  #[test]
+  fn an_executor_operation_holds_its_shapes_values() {
+    let def = bound_main_table();
+    let key_rec = Record::default_for(&def, Some(&[0])).expect("key");
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let shape = OpShape::new(&def, &key_rec, &rec).expect("a shape");
+    let mut op = KeyOp::write(&shape, WriteKind::Insert);
+    assert_eq!(op.blob(1).expect("t"), None);
+    op.set_blob(1, b"text").expect("t");
+    assert_eq!(op.blob(1).expect("t"), Some(&b"text"[..]));
+    op.blob_buf_mut(2)
+      .expect("tiny")
+      .extend_from_slice(b"in place");
+    assert_eq!(op.blob(2).expect("tiny"), Some(&b"in place"[..]));
+    op.set_blob_null(1).expect("NULL");
+    assert_eq!(op.blob(1).expect("t"), None);
+    let not_blob = op.blob(0).expect_err("id is no blob");
+    assert_eq!(not_blob.code, err::IC_ERROR_NO_SUCH_FIELD);
+    assert!(!op.blob_lock_first() && !op.blob_probe());
+    op.set_blob_lock_first(true);
+    op.set_blob_probe(true);
+    assert!(op.blob_lock_first() && op.blob_probe());
+    // A shape without blob fields holds none, and one with them reads
+    // nothing after a program, as it runs none.
+    let plain = OpShape::new(&def, &key_rec, &key_rec).expect("a shape");
+    let read = KeyOp::read(&plain, ReadKind::Committed);
+    assert!(read.blob_values().is_none());
+    let none = read.blob(1).expect_err("no blob fields");
+    assert_eq!(none.code, err::IC_ERROR_NO_SUCH_FIELD);
+    let refused = shape.reading_after(&key_rec).expect_err("refused");
+    assert_eq!(refused.code, err::IC_ERROR_NOT_SUPPORTED);
   }
 }

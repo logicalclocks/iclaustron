@@ -357,8 +357,9 @@ impl Record {
   }
 
   /// Refuse a record naming a blob field (`IC_ERROR_NOT_SUPPORTED`),
-  /// where the operation takes none: scans, takeovers and key records,
-  /// and, until phase 12 brings them, the executor and the helpers.
+  /// where the operation takes none: scans, takeovers, key records,
+  /// the helpers without `_blobs` in their names, and, until 12.7,
+  /// unique queries.
   pub(crate) fn refuse_blob_fields(&self) -> Result<(), IcError> {
     if self.has_blob_fields {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));

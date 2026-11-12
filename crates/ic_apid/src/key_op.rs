@@ -38,6 +38,11 @@
 //! The two may come in either order, and either may come packed with
 //! others; the receive thread has taken those apart.
 //!
+//! The helpers with blob values, and a delete from a table with blob
+//! columns, run on the transaction API instead, as
+//! `read_unique_committed` does: one query, a transaction of its own,
+//! in as many rounds as its values take (chapter 06, phase 12).
+//!
 //! Verify: chapter 05 §17.14.
 
 use ic_port::debug::IC_NDB_MESSAGE_LEVEL;
@@ -58,16 +63,23 @@ use std::sync::Arc;
 
 use crate::apid_conn::ApidConnection;
 use crate::apid_conn::CoordRecord;
+use crate::blob::BlobValues;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
+use crate::executor::OpKind;
 use crate::hash;
 use crate::node_connect::ReceivedSignal;
 use crate::query::QueryId;
 use crate::query::ReadKeyArgs;
 use crate::query::ReadKind;
+use crate::query::TransId;
+use crate::query::WriteKeyArgs;
+use crate::query::WriteKind;
 use crate::record::Record;
 use crate::row_codec;
 use crate::transaction::schema_error;
+use crate::transaction::CommitState;
+use crate::transaction::TransactionHint;
 
 /// How long a key operation waits for its outcome.
 pub const IC_KEY_OP_WAIT_MS: u32 = 10_000;
@@ -125,7 +137,7 @@ pub fn read_committed(
   if !same_table || !key_rec.covers_primary_key() {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  // These helpers take no blob value (chapter 06, phase 12).
+  // Blob values go through the helpers named for them.
   key_rec.refuse_blob_fields()?;
   attr_rec.refuse_blob_fields()?;
   let key = row_codec::key_info(key_rec, key_row)?;
@@ -151,6 +163,46 @@ pub fn read_committed(
   }
   row_codec::unpack_row(attr_rec, &outcome.row, attr_row)?;
   Ok(true)
+}
+
+/// Read, as [`read_committed`] does, the row whose key is in `key_row`
+/// into `attr_row`, and the values of the attribute record's blob
+/// fields into `values`, a holder made for `attr_rec`
+/// ([`BlobValues::new`]), whose buffers keep their capacity from call
+/// to call. It is a transaction of its own on the transaction API, the
+/// read its only operation: an inline value takes one round, one with
+/// parts three (chapter 06, phase 12, item 4). Returns false if there
+/// is no such row. `IC_ERROR_RECORD_LAYOUT` for a holder not made for
+/// `attr_rec`, or a row shorter than its record; 4267 for a value whose
+/// parts are not all there.
+pub fn read_committed_blobs(
+  conn: &mut ApidConnection,
+  key_rec: &Record,
+  key_row: &[u8],
+  attr_rec: &Record,
+  attr_row: &mut [u8],
+  values: &mut BlobValues,
+) -> Result<bool, IcError> {
+  let attr_len = attr_rec.row_size() as usize;
+  if attr_row.len() < attr_len {
+    return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
+  }
+  let read = OpKind::Read(ReadKind::Committed);
+  let (qid, _, _) =
+    run_alone(conn, read, key_rec, key_row, attr_rec, &[], Some(values))?;
+  let found = match conn.query(qid) {
+    Some(query) => match query.error() {
+      Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32 => Ok(false),
+      Some(e) => Err(e),
+      None => {
+        attr_row[..attr_len].copy_from_slice(query.attr_row());
+        Ok(true)
+      }
+    },
+    None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+  };
+  let _ = conn.free_query(qid);
+  found
 }
 
 /// The node to send an operation on this key to: one holding the row
@@ -201,12 +253,7 @@ pub fn read_unique_committed(
 }
 
 /// The transaction of one committed read, waited for, at a node that
-/// holds the index's row for the key. The transaction is always ended
-/// and closed, so that neither it nor its coordinator record is left
-/// behind: one whose read is refused before anything goes, as a NULL
-/// key is, is rolled back, which ends it at once, and the wait lasts
-/// until the reply timeout has ended one whose coordinator does not
-/// answer, its read failing with 4012.
+/// holds the index's row for the key ([`transaction_of_one`]).
 fn unique_read(
   conn: &mut ApidConnection,
   index: &IndexDef,
@@ -216,29 +263,11 @@ fn unique_read(
   attr_row: &mut [u8],
 ) -> Result<bool, IcError> {
   let hint = conn.hint_for_unique_key(index, key_rec, key_row);
-  let tid = conn.start_transaction(hint, Some(index.as_table()))?;
   if let Some(query) = conn.query_mut(qid) {
     query.key_row_mut().copy_from_slice(key_row);
   }
-  let args = ReadKeyArgs {
-    kind: ReadKind::Committed,
-    ..ReadKeyArgs::default()
-  };
-  let asked = match conn.read_key(qid, tid, &args) {
-    Ok(()) => conn.commit_transaction(tid),
-    Err(e) => {
-      let _ = conn.rollback_transaction(tid);
-      Err(e)
-    }
-  };
-  let ended = conn.wait_for_end(tid);
-  if ended.is_some() {
-    let _ = conn.close_transaction(tid);
-  }
-  asked?;
-  if ended.is_none() {
-    return Err(IcError::new(err::IC_ERROR_TIMEOUT));
-  }
+  let read = OpKind::Read(ReadKind::Committed);
+  transaction_of_one(conn, qid, hint, index.as_table(), read)?;
   // Read only our result. The caller's free_query removes its completion
   // entry, leaving unrelated completions in their original order.
   let query = match conn.query(qid) {
@@ -253,6 +282,171 @@ fn unique_read(
       attr_row[..len].copy_from_slice(query.attr_row());
       Ok(true)
     }
+  }
+}
+
+/// A transaction of one query, `qid`, its rows already filled: started
+/// with `hint` on `table`, the query defined as `kind` says, then
+/// committed, and waited for. The transaction is always ended and
+/// closed, so that neither it nor its coordinator record is left
+/// behind: one whose query is refused before anything goes, as a NULL
+/// key is, is rolled back, which ends it at once, and the wait lasts
+/// until the reply timeout has ended one whose coordinator does not
+/// answer, its query failing with 4012. How it ended, and why, if it
+/// rolled back; the query's own outcome stays on the query.
+fn transaction_of_one(
+  conn: &mut ApidConnection,
+  qid: QueryId,
+  hint: TransactionHint,
+  table: &TableDef,
+  kind: OpKind,
+) -> Result<(CommitState, Option<IcError>), IcError> {
+  let tid = conn.start_transaction(hint, Some(table))?;
+  let defined = match kind {
+    OpKind::Read(kind) => {
+      let args = ReadKeyArgs {
+        kind,
+        ..ReadKeyArgs::default()
+      };
+      conn.read_key(qid, tid, &args)
+    }
+    OpKind::Write(kind) => {
+      let args = WriteKeyArgs {
+        kind,
+        ..WriteKeyArgs::default()
+      };
+      conn.write_key(qid, tid, &args)
+    }
+  };
+  let asked = match defined {
+    Ok(()) => conn.commit_transaction(tid),
+    Err(e) => {
+      let _ = conn.rollback_transaction(tid);
+      Err(e)
+    }
+  };
+  let ended = wait_through_rounds(conn, tid);
+  let mut why: Option<IcError> = None;
+  if ended.is_some() {
+    if let Some(trans) = conn.transaction(tid) {
+      why = trans.error();
+    }
+    let _ = conn.close_transaction(tid);
+  }
+  asked?;
+  match ended {
+    Some(state) => Ok((state, why)),
+    None => Err(IcError::new(err::IC_ERROR_TIMEOUT)),
+  }
+}
+
+/// Wait for a transaction's end, as long as its BLOB rounds go on: a
+/// wait lasts the reply timeout, and one in which a round went is
+/// followed by another, so that a value of many rounds is waited for
+/// to its end. `None` if a wait passed with no round and no end.
+fn wait_through_rounds(
+  conn: &mut ApidConnection,
+  tid: TransId,
+) -> Option<CommitState> {
+  loop {
+    let rounds = conn.blob_rounds();
+    if let Some(state) = conn.wait_for_end(tid) {
+      return Some(state);
+    }
+    if conn.blob_rounds() == rounds {
+      return None;
+    }
+  }
+}
+
+/// A query of the two records run as a transaction of its own by
+/// primary key, at a node that holds the key's row
+/// ([`transaction_of_one`]): its key from `key_row`, a write's values
+/// from `attr_row` and from `values`, which are lent to it and given
+/// back, holding what a read brought. The query, completed, for the
+/// caller to read and free, with how its transaction ended.
+fn run_alone(
+  conn: &mut ApidConnection,
+  kind: OpKind,
+  key_rec: &Record,
+  key_row: &[u8],
+  attr_rec: &Record,
+  attr_row: &[u8],
+  values: Option<&mut BlobValues>,
+) -> Result<(QueryId, CommitState, Option<IcError>), IcError> {
+  let table = key_rec.table();
+  let key_len = key_rec.row_size() as usize;
+  let attr_len = attr_rec.row_size() as usize;
+  // A delete sends no values, and reads no attribute row.
+  let write = matches!(kind, OpKind::Write(_))
+    && kind != OpKind::Write(WriteKind::Delete);
+  if key_row.len() < key_len || (write && attr_row.len() < attr_len) {
+    return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
+  }
+  // The records are checked as for any query.
+  let qid = conn.create_query(table, key_rec, attr_rec)?;
+  let hint = conn.hint_for_key(table, key_rec, key_row);
+  let mut values = values;
+  let mut lent = Ok(());
+  if let Some(query) = conn.query_mut(qid) {
+    query.key_row_mut().copy_from_slice(&key_row[..key_len]);
+    if write {
+      query.attr_row_mut().copy_from_slice(&attr_row[..attr_len]);
+    }
+    if let Some(values) = values.as_deref_mut() {
+      lent = query.swap_blob_values(values);
+    }
+  }
+  let ran = match lent {
+    Ok(()) => {
+      let ran = transaction_of_one(conn, qid, hint, table, kind);
+      // The query is idle once its transaction has ended. One still
+      // out after a timeout keeps the values, the holder the query's
+      // own, every value NULL.
+      if let (Some(values), Some(query)) = (values, conn.query_mut(qid)) {
+        let _ = query.swap_blob_values(values);
+      }
+      ran
+    }
+    Err(e) => Err(e),
+  };
+  match ran {
+    Ok((state, why)) => Ok((qid, state, why)),
+    Err(e) => {
+      let _ = conn.free_query(qid);
+      Err(e)
+    }
+  }
+}
+
+/// A write run alone ([`run_alone`]): the query's error, as the data
+/// node gave it, else its transaction's if that did not commit.
+fn write_alone(
+  conn: &mut ApidConnection,
+  kind: WriteKind,
+  key_rec: &Record,
+  key_row: &[u8],
+  attr_rec: &Record,
+  attr_row: &[u8],
+  values: Option<&mut BlobValues>,
+) -> Result<(), IcError> {
+  let write = OpKind::Write(kind);
+  let (qid, state, why) =
+    run_alone(conn, write, key_rec, key_row, attr_rec, attr_row, values)?;
+  let mut error: Option<IcError> = None;
+  if let Some(query) = conn.query(qid) {
+    error = query.error();
+  }
+  let _ = conn.free_query(qid);
+  if let Some(e) = error {
+    return Err(e);
+  }
+  if state == CommitState::Committed {
+    return Ok(());
+  }
+  match why {
+    Some(e) => Err(e),
+    None => Err(IcError::new(err::IC_ERROR_TRANSACTION_ROLLED_BACK)),
   }
 }
 
@@ -309,11 +503,14 @@ pub fn read_partition(
 /// `operation` is one of the `IC_OP_*` values of `key_ops`. Every field
 /// of the attribute record is written, except the key columns of an
 /// update, which may not change; a delete sends no values at all, and
-/// then `attr_row` is not read.
+/// then `attr_row` is not read. Neither record may name a blob field
+/// ([`write_key_blobs`] takes their values).
 ///
-/// A delete on a table with a blob column is refused before anything
-/// is sent, with `IC_ERROR_DELETE_WITH_BLOBS`: it would leave the
-/// blobs' parts behind (chapter 06 §6.2).
+/// A delete from a table with blob columns deletes their parts with the
+/// row, in two rounds, as a transaction of the transaction API (chapter
+/// 06, phase 12); one with a blob column that cannot be used is refused
+/// before anything is sent, with `IC_ERROR_DELETE_WITH_BLOBS`, as it
+/// would leave that column's parts behind.
 ///
 /// The NDB error comes back as it is: 626 for a row that is not there,
 /// 630 for one that already is.
@@ -331,11 +528,12 @@ pub fn write_key(
   if !same_table || !key_rec.covers_primary_key() {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  // These helpers take no blob value (chapter 06, phase 12).
+  // Blob values go through the helpers named for them.
   key_rec.refuse_blob_fields()?;
   attr_rec.refuse_blob_fields()?;
   if operation == key_ops::IC_OP_DELETE && table.has_blob_columns() {
-    return Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS));
+    let delete = WriteKind::Delete;
+    return write_alone(conn, delete, key_rec, key_row, attr_rec, &[], None);
   }
   let key = row_codec::key_info(key_rec, key_row)?;
   let mut attr_info: Vec<u32> = Vec::new();
@@ -360,6 +558,37 @@ pub fn write_key(
     Some(code) => Err(IcError::new(code as i32)),
     None => Ok(()),
   }
+}
+
+/// Insert, update, delete or write, as `kind` says, the row whose key
+/// is in `key_row`, as [`write_key`] does, with the values of the
+/// attribute record's blob fields from `values`, a holder made for
+/// `attr_rec` ([`BlobValues::new`]). The holder is lent to the write
+/// and given back as it was, so that no value is copied, which is why
+/// it is taken mutably. It is a transaction of its own on the
+/// transaction API, in as many rounds as its values take (chapter 06,
+/// phase 12). The NDB error comes back as it is: 626 for a row that is
+/// not there, 630 for one that already is; 4266 for a value longer
+/// than its column's MySQL type holds; `IC_ERROR_RECORD_LAYOUT` for a
+/// holder not made for `attr_rec`, or a row shorter than its record.
+pub fn write_key_blobs(
+  conn: &mut ApidConnection,
+  kind: WriteKind,
+  key_rec: &Record,
+  key_row: &[u8],
+  attr_rec: &Record,
+  attr_row: &[u8],
+  values: &mut BlobValues,
+) -> Result<(), IcError> {
+  write_alone(
+    conn,
+    kind,
+    key_rec,
+    key_row,
+    attr_rec,
+    attr_row,
+    Some(values),
+  )
 }
 
 /// Send one operation as a whole transaction to `node_id`'s

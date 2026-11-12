@@ -2222,8 +2222,9 @@ int32_t ic_apid_conn_read_unique_committed(IC_APID_CONNECTION *conn,
  `IC_NDB_ERROR_NO_SUCH_ROW` for an update or delete of no row,
  `IC_NDB_ERROR_ROW_EXISTS` for an insert of one there,
  `IC_NDB_ERROR_UNIQUE_DUPLICATE` when a unique index already holds the value;
- and as `ic_apid_conn_read_committed`, which runs the same way;
- `IC_ERROR_DELETE_WITH_BLOBS` for a delete on a table with a blob column.
+ and as `ic_apid_conn_read_committed`, which runs the same way. A delete
+ from a table with blob columns deletes their parts with the row, in two
+ rounds; `IC_ERROR_DELETE_WITH_BLOBS` when a blob column cannot be used.
  `IC_ERROR_NOT_SUPPORTED` for a kind no define names.
 
  # Safety
@@ -2811,8 +2812,10 @@ int32_t ic_apid_submitter_index_bind(IC_APID_SUBMITTER *submitter,
 
  Errors: `IC_ERROR_KEY_RECORD` when the key record does not hold every
  primary key field, or a record is over another table or another version of
- it. The shape is the caller's, freed with `ic_op_shape_free`; any thread
- may use it, and a request keeps what it needs of it.
+ it; `IC_ERROR_NOT_SUPPORTED` for a record naming a blob field, until the
+ calls for its values come. The shape is the caller's, freed with
+ `ic_op_shape_free`; any thread may use it, and a request keeps what it
+ needs of it.
 
  # Safety
 
