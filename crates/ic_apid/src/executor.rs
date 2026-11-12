@@ -198,7 +198,8 @@ impl OpShape {
   }
 
   /// Operations through a unique index, with records over the index's
-  /// table, as for a unique query.
+  /// table, as for a unique query: the attribute record may name blob
+  /// fields, the key record may not.
   pub fn new_unique(
     index: &Arc<IndexDef>,
     key_rec: &Record,

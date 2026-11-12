@@ -2893,6 +2893,53 @@ Done 2026-11-12, every test passing:
 Exit: reads, updates and deletes through a unique index of a table with
 blob columns, checked as by primary key.
 
+Done 2026-11-12, every test passing:
+
+- **A unique query takes blob fields**: `ApidQuery::new_unique` holds
+  their values, and so an executor's `OpShape::new_unique` and its
+  operations do; the key record still names none.
+  `key_op::read_unique_committed` refuses them, as it has no holder for
+  them. In C a unique query and a unique shape refuse them until 12.8,
+  as the others do.
+- **The first round goes through the index** (item 7), as a
+  `UNIQUE_OP_REQ` of the run's own: a read reads the row with its lock,
+  an update or a delete the heads, exclusive, with its abort option;
+  each asks for the primary key's columns after them, each by its
+  header, as a MySQL server asks for blob columns after the bitmap
+  (chapter 05 §6.10, seen). From the reply the run takes the primary
+  key's words and their copy in the parts tables' first columns
+  (`take_primary_key`), and goes by that key from the second round on:
+  a read's parts; an update's or a delete's main row, which waits for
+  the heads as a delete's does by primary key, with its parts. So a
+  read takes the rounds it takes by primary key, an update two where
+  by primary key its main row goes in the first, and a delete two. A
+  query whose values have no parts goes through the index alone, in
+  one round, asking for no key.
+- **A read through an index always locks** (chapter 05 §6.8): a
+  committed or simple read takes the shared lock, the committed one
+  with bit 20 as before, and holds it to the commit; it reads no lock
+  reference and sends no unlock.
+- **Ordering**: a unique query keeps its order with every BLOB query of
+  its transaction on the same table (ours to choose: its row's primary
+  key is not known before its first round is back, and a table with
+  blob columns seldom needs to be fast through a unique index).
+- **Refusals** through an index are shared with every operation through
+  one (`through_index_allows`): an insert or a write, and an update
+  whose values hold an indexed column (7155). A delete through a unique
+  index no longer keeps 7153; a takeover and an unusable blob column
+  still do.
+- Tests: the heads' parse gives the words it took; integration tests in
+  the `blob` group: each kind of read through the index of rows
+  written by primary key, the values, the row and the rounds as by
+  primary key; updates through the index growing, shrinking and
+  setting NULL, the parts counted against MySQL's lengths; an update
+  of a row not there (626); an executor's unique shape reading every
+  row in one request and deleting three; deletes on a connection by a
+  record naming no blob field; and a key of an INT and a VARCHAR found
+  through the index, MySQL's values read, updated and read back by
+  MySQL, and every part deleted with its row. The guard test's delete
+  through a unique index now goes through, the parts with the row.
+
 ### 12.8 C ABI, chapter 04, the user guide, examples in Rust and C (3 days)
 
 Exit: the C API test reads and writes blob values; the examples build

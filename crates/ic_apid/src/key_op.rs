@@ -245,6 +245,8 @@ pub fn read_unique_committed(
   if key_row.len() < key_len || attr_row.len() < attr_len {
     return Err(IcError::new(err::IC_ERROR_RECORD_LAYOUT));
   }
+  // Blob values go through the helpers named for them.
+  attr_rec.refuse_blob_fields()?;
   let qid = conn.create_unique_query(index, key_rec, attr_rec)?;
   let key_row = &key_row[..key_len];
   let result = unique_read(conn, index, key_rec, qid, key_row, attr_row);

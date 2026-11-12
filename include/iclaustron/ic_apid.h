@@ -1921,11 +1921,11 @@ int32_t ic_apid_conn_read_key(IC_APID_CONNECTION *conn,
  Errors: as `ic_apid_conn_read_key`; `IC_ERROR_NOT_SUPPORTED` too for an
  insert or a write through a unique index; `IC_ERROR_INDEXED_COLUMN_UPDATE`
  for an update through a unique index whose values hold an indexed column;
- `IC_ERROR_DELETE_WITH_BLOBS` for a delete through a unique index from a
- table with a blob column; `IC_ERROR_RECORD_SIZE_TOO_BIG` for more column
- data than a request may carry. A delete by primary key from a table with
- blob columns deletes their parts with the row, in rounds. From here until
- the query completes its rows are the library's.
+ `IC_ERROR_DELETE_WITH_BLOBS` for a delete from a table with a blob column
+ that cannot be used; `IC_ERROR_RECORD_SIZE_TOO_BIG` for more column data
+ than a request may carry. A delete by primary or unique key from a table
+ with blob columns deletes their parts with the row, in rounds. From here
+ until the query completes its rows are the library's.
 
  # Safety
 

@@ -53,6 +53,13 @@
 //!   of the row between the head read and the write may otherwise leave
 //!   its parts behind, past the value's length. A round with a probe is
 //!   not the last, so such a write commits a round later.
+//! - **Through a unique index** (chapter 06, item 7) the first round
+//!   reads the row, or for an update or a delete its heads, through the
+//!   index with the operation's lock, and the primary key's columns
+//!   after, each by its header; from the second round on the run goes
+//!   by that key. A read through an index always locks, and holds its
+//!   lock to the commit. A query whose values have no parts goes
+//!   through the index alone, in one round.
 //! - **A failure ends the run**: the query completes with it, and a
 //!   round that could not be defined rolls the transaction back, so
 //!   that a value is never committed without its parts.
@@ -78,8 +85,10 @@ use crate::blob::PartOp;
 use crate::blob::PartOpKind;
 use crate::blob::RunKind;
 use crate::blob::ValueParts;
+use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
 use crate::key_op::IC_NDB_ERROR_NO_SUCH_ROW;
+use crate::node_connect::words_as_bytes;
 use crate::query::ApidQuery;
 use crate::query::Execution;
 use crate::query::PartOf;
@@ -87,6 +96,7 @@ use crate::query::QueryId;
 use crate::query::QueryState;
 use crate::query::TransId;
 use crate::row_codec;
+use crate::row_codec::push_padded;
 use crate::row_codec::IC_COL_LOCK_REF;
 use crate::row_codec::IC_LOCK_REF_WORDS;
 
@@ -150,6 +160,8 @@ struct OpReq<'a> {
   slot: QueryId,
   of: PartOf,
   table: &'a TableDef,
+  /// The unique index the request goes through, the key its key.
+  index: Option<&'a IndexDef>,
   flags: KeyOpFlags,
   is_read: bool,
   key: &'a [u32],
@@ -221,6 +233,15 @@ pub(crate) struct BlobRun {
   /// first columns.
   main_key: Vec<u32>,
   key_attrs: Vec<u32>,
+  /// The unique index the query goes through (chapter 06, item 7),
+  /// and whether `main_key` is the primary key yet: until the first
+  /// round has read it, the main row's requests go through the index,
+  /// `main_key` holding the index's key.
+  index: Option<Arc<IndexDef>>,
+  key_known: bool,
+  /// The headers of the primary key's columns, asked for after what the
+  /// first round reads through the index.
+  pk_info: Vec<u32>,
   /// The part operations of the round being defined.
   plan: Vec<PartOp>,
   /// The operations of the round out, by the index their `PartOf`
@@ -280,6 +301,9 @@ impl BlobRun {
       main_cursor: 0,
       main_key: Vec::new(),
       key_attrs: Vec::new(),
+      index: None,
+      key_known: true,
+      pk_info: Vec::new(),
       plan: Vec::new(),
       round_ops: Vec::new(),
     }
@@ -367,19 +391,50 @@ impl BlobRun {
         slot += 1;
       }
     }
-    row_codec::key_info_into(
-      query.key_record(),
-      query.key_row(),
-      &mut self.main_key,
-    )?;
-    row_codec::parts_key_attr_info_into(
-      query.key_record(),
-      query.key_row(),
-      &mut self.key_attrs,
-    )?;
     let has_parts = blob::reads_any_head(&self.values);
+    // Through a unique index, the key is the index's until the first
+    // round has read the primary key's columns, which it asks for only
+    // when there are parts to go by it.
+    self.index = query.index().cloned();
+    self.key_known = self.index.is_none();
+    self.pk_info.clear();
+    match &self.index {
+      Some(index) => {
+        row_codec::index_key_info_into(
+          index,
+          query.key_record(),
+          query.key_row(),
+          &mut self.main_key,
+        )?;
+        self.key_attrs.clear();
+        if has_parts {
+          for attr in &self.main_table.info().attributes {
+            if attr.primary_key {
+              self
+                .pk_info
+                .push(column_header::column_header(attr.column_id, 0));
+            }
+          }
+        }
+      }
+      None => {
+        row_codec::key_info_into(
+          query.key_record(),
+          query.key_row(),
+          &mut self.main_key,
+        )?;
+        row_codec::parts_key_attr_info_into(
+          query.key_record(),
+          query.key_row(),
+          &mut self.key_attrs,
+        )?;
+      }
+    }
     // A part's key is the main key and one word more.
-    if has_parts && self.main_key.len() >= key_ops::IC_MAX_KEY_WORDS {
+    if has_parts
+      && self.key_known
+      && self.main_key.len() >= key_ops::IC_MAX_KEY_WORDS
+    {
       return Err(IcError::new(err::IC_ERROR_KEY_TOO_LONG));
     }
     self.main_flags = KeyOpFlags {
@@ -389,6 +444,7 @@ impl BlobRun {
       batch_unsafe: flags.batch_unsafe,
       simple: flags.simple,
       dirty: flags.dirty,
+      committed_base: flags.committed_base,
       no_wait: flags.no_wait,
       ..KeyOpFlags::default()
     };
@@ -410,6 +466,8 @@ impl BlobRun {
       if self.kind == RunKind::LockFirstRead && has_parts {
         self.lock_read(flags.abort_option);
       }
+      // Through an index, the primary key after the columns.
+      self.main_attr.extend_from_slice(&self.pk_info);
     } else if self.kind != RunKind::Delete {
       row_codec::write_attr_info_append(
         query.attr_record(),
@@ -432,8 +490,13 @@ impl BlobRun {
       }
     }
     blob::masked_read_info(&ids, &mut self.heads_info);
-    // A delete's main row waits for its heads, read with its lock.
-    self.main_due = !(self.kind == RunKind::Delete && self.heads_due);
+    // Through an index, the primary key after the heads.
+    self.heads_info.extend_from_slice(&self.pk_info);
+    // A delete's main row waits for its heads, read with its lock, and
+    // so does an update's through an index, which goes by the primary
+    // key they bring.
+    let waits = self.kind == RunKind::Delete || !self.key_known;
+    self.main_due = !(waits && self.heads_due);
     self.error = None;
     self.after = None;
     self.started = false;
@@ -488,12 +551,71 @@ impl BlobRun {
     }
   }
 
+  /// The primary key a first round through a unique index read after
+  /// `used` words, each key column behind its header, in attribute
+  /// order: the key the run goes by from now on, and its copy in the
+  /// parts tables' first columns, as `row_codec::key_info_into` and
+  /// `parts_key_attr_info_into` build them from a key row. A key not as
+  /// asked for is `IC_ERROR_INCONSISTENT_DATA`.
+  fn take_primary_key(
+    &mut self,
+    row: &[u32],
+    used: usize,
+  ) -> Result<(), IcError> {
+    let bad = IcError::new(err::IC_ERROR_INCONSISTENT_DATA);
+    self.main_key.clear();
+    self.key_attrs.clear();
+    let table = Arc::clone(&self.main_table);
+    let mut at = used;
+    let mut place: u32 = 0;
+    for attr in &table.info().attributes {
+      if !attr.primary_key {
+        continue;
+      }
+      let header = match row.get(at) {
+        Some(header) => *header,
+        None => return Err(bad),
+      };
+      let len = column_header::byte_size(header) as usize;
+      let words = len.div_ceil(4);
+      let fits = column_header::column_id(header) == attr.column_id
+        && len > 0
+        && at + 1 + words <= row.len();
+      if !fits {
+        return Err(bad);
+      }
+      let bytes = words_as_bytes(&row[at + 1..at + 1 + words]);
+      push_padded(&mut self.main_key, &bytes[..len]);
+      self
+        .key_attrs
+        .push(column_header::column_header(place, len as u32));
+      push_padded(&mut self.key_attrs, &bytes[..len]);
+      at += 1 + words;
+      place += 1;
+    }
+    // A part's key is the main key and one word more.
+    if self.main_key.len() >= key_ops::IC_MAX_KEY_WORDS {
+      return Err(IcError::new(err::IC_ERROR_KEY_TOO_LONG));
+    }
+    self.key_known = true;
+    Ok(())
+  }
+
   /// What the read of the heads brought: each old value's length, its
   /// parts past the new value's to be deleted.
   fn take_heads(&mut self, row: &[u32]) {
-    if let Err(e) = blob::parse_heads(&self.main_table, row, &mut self.heads) {
-      self.fail(e, 0);
-      return;
+    let used = match blob::parse_heads(&self.main_table, row, &mut self.heads) {
+      Ok(used) => used,
+      Err(e) => {
+        self.fail(e, 0);
+        return;
+      }
+    };
+    if !self.key_known {
+      if let Err(e) = self.take_primary_key(row, used) {
+        self.fail(e, 0);
+        return;
+      }
     }
     let mut i: usize = 0;
     while i < self.heads.len() {
@@ -656,9 +778,13 @@ impl ApidConnection {
         },
         None => continue,
       };
+      // Through a unique index the row is not known by its primary key
+      // until the first round is back: such a query keeps its order
+      // with every other on the table.
+      let unique = earlier.index.is_some() || run.index.is_some();
       let same_row = earlier.active
         && earlier.main_table.table_id() == run.main_table.table_id()
-        && earlier.main_key == run.main_key;
+        && (unique || earlier.main_key == run.main_key);
       if same_row {
         found = Some(*other);
       }
@@ -742,6 +868,12 @@ impl ApidConnection {
     scratch: &mut Scratch,
   ) -> Result<(), IcError> {
     let main_table = Arc::clone(&run.main_table);
+    // Until the primary key is known, the main row is reached through
+    // the unique index.
+    let mut through: Option<Arc<IndexDef>> = None;
+    if !run.key_known {
+      through = run.index.clone();
+    }
     if run.heads_due {
       run.heads_due = false;
       // Exclusive, so that every operation locks the main row before
@@ -760,6 +892,7 @@ impl ApidConnection {
         slot,
         of: part_of(qid, run),
         table: &main_table,
+        index: through.as_deref(),
         flags,
         is_read: true,
         key: &run.main_key,
@@ -777,6 +910,7 @@ impl ApidConnection {
         slot,
         of: part_of(qid, run),
         table: &main_table,
+        index: through.as_deref(),
         flags: run.main_flags,
         is_read: run.kind.is_read(),
         key: &run.main_key,
@@ -860,6 +994,7 @@ impl ApidConnection {
         slot,
         of: part_of(qid, run),
         table: &parts,
+        index: None,
         flags,
         is_read,
         key: &scratch.key,
@@ -887,6 +1022,7 @@ impl ApidConnection {
           slot,
           of: part_of(qid, run),
           table: &main_table,
+          index: None,
           flags,
           is_read: false,
           key: &key,
@@ -906,20 +1042,31 @@ impl ApidConnection {
     to: &RoundTo,
     req: &OpReq<'_>,
   ) -> Result<(), IcError> {
+    // Through a unique index the request names the index's own table,
+    // and the coordinator finds the row through it.
+    let (signal, table_id, table_version) = match req.index {
+      Some(index) => (
+        numbers::IC_SIG_UNIQUE_OP_REQ,
+        index.index_id(),
+        index.index_version(),
+      ),
+      None => (
+        numbers::IC_SIG_KEY_OP_REQ,
+        req.table.table_id(),
+        req.table.table_version(),
+      ),
+    };
     let request = KeyOpReq {
       coord_ptr: to.coord.coord_ptr,
       query_ref: req.slot.wire_word(),
-      table_id: req.table.table_id(),
+      table_id,
       flags_word: req.flags.flags_word(),
-      table_version: req.table.table_version(),
+      table_version,
       trans_id_lo: to.trans_id as u32,
       trans_id_hi: (to.trans_id >> 32) as u32,
     };
-    let header = SignalHeader::new(
-      numbers::IC_SIG_KEY_OP_REQ,
-      self.block_number(),
-      to.coord.coord_block,
-    );
+    let header =
+      SignalHeader::new(signal, self.block_number(), to.coord.coord_block);
     let both: [&[u32]; 2] = [req.key, req.attr];
     let mut sections: &[&[u32]] = &both;
     if req.attr.is_empty() {
@@ -1085,12 +1232,13 @@ impl ApidConnection {
       matches!(error, Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32);
     match (role, error) {
       (OpRole::Heads, None) => {
-        run.take_heads(row);
         // A delete's main row goes in the next round, with the parts
-        // its heads have told of.
-        if run.kind == RunKind::Delete {
+        // its heads have told of, and so does an update's through an
+        // index, by the primary key they brought.
+        if run.kind == RunKind::Delete || !run.key_known {
           run.main_due = true;
         }
+        run.take_heads(row);
       }
       // A write finds no row: it inserts one, with no old parts to
       // delete; asked to, it probes for parts an insert racing it may
@@ -1148,6 +1296,12 @@ impl ApidConnection {
           match lock_ref_after(row, used) {
             Some(lock) => run.lock_ref = Some(lock),
             None => run.fail(IcError::new(err::IC_ERROR_INCONSISTENT_DATA), 0),
+          }
+        }
+        // Through an index, the primary key the parts go by.
+        if !run.key_known && !run.pk_info.is_empty() {
+          if let Err(e) = run.take_primary_key(row, used) {
+            run.fail(e, 0);
           }
         }
         // Each value's length, now known: its parts to be read.

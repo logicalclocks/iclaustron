@@ -298,8 +298,8 @@ pub(crate) fn check_records(
 /// As [`check_records`], for an operation through a unique index: the
 /// index must be unique and the records over its table. That the key
 /// record holds every indexed column is checked when the operation is
-/// defined. Neither record may name a blob field until phase 12 goes
-/// through unique indexes (chapter 06, 12.7).
+/// defined. The key record may name no blob field; the attribute record
+/// may (chapter 06, 12.7).
 pub(crate) fn check_unique_records(
   index: &IndexDef,
   key_rec: &Record,
@@ -312,8 +312,7 @@ pub(crate) fn check_unique_records(
   if !over_table(key_rec, table) || !over_table(attr_rec, table) {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  key_rec.refuse_blob_fields()?;
-  attr_rec.refuse_blob_fields()
+  key_rec.refuse_blob_fields()
 }
 
 /// One key operation, defined once and used many times
@@ -425,7 +424,9 @@ impl ApidQuery {
   /// A query through a unique index (`ic_apid_query_create_unique`).
   /// The records are over the index's table; the key record must hold
   /// every column the index is over, which is checked when the query is
-  /// defined. Only reads, updates and deletes go through an index.
+  /// defined. Only reads, updates and deletes go through an index. The
+  /// attribute record may name blob fields, whose values the query
+  /// holds, as [`new`](Self::new) says (chapter 06, 12.7).
   pub fn new_unique(
     index: &Arc<IndexDef>,
     key_rec: &Record,
@@ -433,6 +434,10 @@ impl ApidQuery {
   ) -> Result<ApidQuery, IcError> {
     check_unique_records(index, key_rec, attr_rec)?;
     let table = index.table();
+    let mut blobs: Option<BlobValues> = None;
+    if attr_rec.has_blob_fields() {
+      blobs = Some(BlobValues::new(attr_rec));
+    }
     Ok(ApidQuery {
       table: Arc::clone(table),
       index: Some(Arc::clone(index)),
@@ -451,7 +456,7 @@ impl ApidQuery {
       inputs: [0; IC_PROGRAM_INPUTS as usize],
       after_rec: None,
       after_row: Vec::new(),
-      blobs: None,
+      blobs,
       run: None,
       internal: false,
       blob_probe: false,

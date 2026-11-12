@@ -1269,14 +1269,15 @@ pub fn walk_packed<'a>(
 
 /// The heads a read of blob columns of `table` brought, a packed row as
 /// a read by bitmask gets it back: each column read, by its id, with
-/// its value's length, `None` for NULL, into `out`, emptied first. A
+/// its value's length, `None` for NULL, into `out`, emptied first. The
+/// words the row took, what else the read asked for coming after. A
 /// head that disagrees with its column's sizes is a damaged value
 /// (4267); a row not as asked for is `IC_ERROR_INCONSISTENT_DATA`.
 pub fn parse_heads(
   table: &TableDef,
   words: &[u32],
   out: &mut Vec<(u32, Option<u64>)>,
-) -> Result<(), IcError> {
+) -> Result<usize, IcError> {
   out.clear();
   let mut each =
     |attr: &ColumnProps, value: Option<&[u8]>| -> Result<(), IcError> {
@@ -1294,8 +1295,7 @@ pub fn parse_heads(
       }
       Ok(())
     };
-  walk_packed(table, words, &mut each)?;
-  Ok(())
+  walk_packed(table, words, &mut each)
 }
 
 /// A part's value as a simple read of its parts table's data column
@@ -2216,8 +2216,14 @@ mod tests {
     words.push(0b11_0010);
     words.extend_from_slice(&padded(&value));
     let mut heads = Vec::new();
-    parse_heads(&def, &words, &mut heads).expect("parsed");
+    // What a read through a unique index asks for after the heads
+    // follows them: the words they took say where.
+    let used = words.len();
+    words.push(0xABCD);
+    let took = parse_heads(&def, &words, &mut heads).expect("parsed");
+    assert_eq!(took, used);
     assert_eq!(heads, [(1, Some(5000)), (3, None)]);
+    words.truncate(used);
     // A head that disagrees with its column is a damaged value: a
     // length of 100, which would leave 100 bytes inline, not 256.
     let mut bad = words.clone();

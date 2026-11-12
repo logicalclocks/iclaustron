@@ -188,9 +188,9 @@ then, into the connection's staged buffer, and goes with the next send.
   shared lock for a simple or committed read (05 §6.8).
 - `WriteKind`: `Update`, `Write`, `Insert`, `Delete`. An insert or write
   through a unique index is refused, and so is an update through one
-  whose values hold an indexed column (Q12). A delete by primary key
-  from a table with blob columns deletes their parts with the row
-  (12.4); through a unique index it is refused (7153) until 12.7.
+  whose values hold an indexed column (Q12). A delete by primary or
+  unique key from a table with blob columns deletes their parts with
+  the row (12.4, 12.7).
 - `AbortOption`: `Default` (abort on error for a write, ignore it for a
   read), `AbortOnError`, `IgnoreError`; a committed read only ignores.
 - `BatchHint`: `None`, `Safe`, `Unsafe` (bits 22 and 23 of the request).
@@ -200,7 +200,7 @@ then, into the connection's staged buffer, and goes with the next send.
 - Every row size a table can hold is written: a request too large for
   one message goes as a train of fragments (05 §2.2).
 
-### Blob values (phase 12; inserts since 12.3, other writes since 12.4, reads since 12.5, executors and helpers since 12.6)
+### Blob values (phase 12; inserts since 12.3, other writes since 12.4, reads since 12.5, executors and helpers since 12.6, unique keys since 12.7)
 
 An attribute record may name blob fields (BLOB, TEXT, and a MySQL
 server's JSON and GEOMETRY), and a query over it holds their values
@@ -230,10 +230,25 @@ Such a query reads and writes: `read_key` with any `ReadKind` and
 `write_key` with any `WriteKind`, by primary key, running no program. A
 delete by primary key from a table with blob columns, whether its
 record names blob fields or not, deletes their parts with the row.
-Unique queries refuse blob fields until 12.7
-(`IC_ERROR_NOT_SUPPORTED`); scans and takeovers always do. A delete
-keeps 7153 through a unique index, of a row taken over from a scan,
-and on a table with a blob column that cannot be used.
+Scans and takeovers refuse blob fields (`IC_ERROR_NOT_SUPPORTED`). A
+delete keeps 7153 of a row taken over from a scan, and on a table with
+a blob column that cannot be used.
+
+A unique query (`create_unique_query`, or an executor's
+`OpShape::new_unique`) takes blob fields too, for what goes through a
+unique index: reads, updates whose values hold no indexed column, and
+deletes, which take the parts with the row whether the record names
+blob fields or not (12.7). Its first round goes through the index with
+the operation's lock: a read reads the row, an update or a delete the
+heads, and each asks for the primary key's columns after them; from
+the second round on it goes by that key, as by primary key, in as many
+rounds. A read through an index always takes its lock, a committed or
+simple read the shared one, and holds it to the commit, so it needs no
+lock reference and sends no unlock. A query whose values have no parts
+goes through the index alone, in one round. Such a query keeps its
+order with every other BLOB query of its transaction on the table, as
+its row's primary key is not known before its first round is back.
+`key_op::read_unique_committed` still refuses blob fields.
 
 An executor's `OpShape` takes an attribute record naming blob fields,
 and each `KeyOp` of it holds the values, with the same calls as a

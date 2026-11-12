@@ -371,6 +371,31 @@ impl Transaction {
   }
 }
 
+/// Refuse what cannot go through a unique index: an insert or a write,
+/// as the reference refuses too (`IC_ERROR_NOT_SUPPORTED`), and an
+/// update whose values hold an indexed column
+/// (`IC_ERROR_INDEXED_COLUMN_UPDATE`): the row is found by the indexed
+/// columns, so an update through the index cannot change them, and the
+/// reference takes them from the key row whatever the values say
+/// (chapter 06 §6.5, Q12).
+fn through_index_allows(
+  index: &IndexDef,
+  flags: &KeyOpFlags,
+  attr_rec: &Record,
+) -> Result<(), IcError> {
+  let inserts = flags.operation == key_ops::IC_OP_INSERT
+    || flags.operation == key_ops::IC_OP_WRITE;
+  if inserts {
+    return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+  }
+  if flags.operation == key_ops::IC_OP_UPDATE
+    && holds_indexed_column(index, attr_rec)
+  {
+    return Err(IcError::new(err::IC_ERROR_INDEXED_COLUMN_UPDATE));
+  }
+  Ok(())
+}
+
 /// True if `rec` holds a column the unique index is over: one of the
 /// key columns of the index's own table, found in the record's table by
 /// name.
@@ -837,11 +862,11 @@ impl ApidConnection {
       return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE));
     }
     // The blobs' parts are rows of another table that the client keeps
-    // in step: a delete by primary key deletes them with the row, in
-    // rounds (chapter 06, 12.4). Through a unique index (12.7), as a
-    // scanned row taken over, or with a blob column that cannot be used,
-    // a delete would leave them behind. A unique query's table is the
-    // base table, so this covers both.
+    // in step: a delete by primary or unique key deletes them with the
+    // row, in rounds (chapter 06, 12.4 and 12.7). As a scanned row taken
+    // over, or with a blob column that cannot be used, a delete would
+    // leave them behind. A unique query's table is the base table, so
+    // this covers both.
     let delete = flags.operation == key_ops::IC_OP_DELETE;
     let blob_table = query.table().has_blob_columns();
     if delete && blob_table {
@@ -850,7 +875,7 @@ impl ApidConnection {
         .blob_columns()
         .iter()
         .all(BlobColumn::is_usable);
-      if query.index().is_some() || takeover.is_some() || !usable {
+      if takeover.is_some() || !usable {
         return Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS));
       }
     }
@@ -859,12 +884,16 @@ impl ApidConnection {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
     // A query with blob values goes in rounds, as such a delete does
-    // (chapter 06, phase 12): by primary key, running no program, and
-    // never a takeover, which is a scan's.
+    // (chapter 06, phase 12): by primary or unique key, running no
+    // program, and never a takeover, which is a scan's. Through an index
+    // it is refused what any operation through one is.
     if query.blob_values().is_some() || (delete && blob_table) {
       let plain = query.program().is_none() && query.after_record().is_none();
-      if !plain || query.index().is_some() || takeover.is_some() {
+      if !plain || takeover.is_some() {
         return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+      }
+      if let Some(index) = query.index() {
+        through_index_allows(index, &flags, query.attr_record())?;
       }
       return self.define_blob_query(
         query_id, trans_id, flags, user_ref, callback, binding,
@@ -895,20 +924,7 @@ impl ApidConnection {
     // UNIQUE_OP_REQ; the coordinator looks the row up through the index.
     let (signal, table_id, table_version) = match query.index() {
       Some(index) => {
-        // The reference refuses an insert through an index too.
-        let inserts = flags.operation == key_ops::IC_OP_INSERT
-          || flags.operation == key_ops::IC_OP_WRITE;
-        if inserts {
-          return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
-        }
-        // The row is found by the indexed columns, so an update through
-        // the index cannot change them; the reference takes them from
-        // the key row whatever the values say (chapter 06 §6.5, Q12).
-        if flags.operation == key_ops::IC_OP_UPDATE
-          && holds_indexed_column(index, query.attr_record())
-        {
-          return Err(IcError::new(err::IC_ERROR_INDEXED_COLUMN_UPDATE));
-        }
+        through_index_allows(index, &flags, query.attr_record())?;
         (
           numbers::IC_SIG_UNIQUE_OP_REQ,
           index.index_id(),
