@@ -247,6 +247,7 @@ impl OpShape {
     if !query::over_table(after_rec, &self.table) {
       return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
     }
+    after_rec.refuse_blob_fields()?;
     let mut shape = self.copy();
     shape.after_rec = Some(after_rec.clone());
     Ok(Arc::new(shape))

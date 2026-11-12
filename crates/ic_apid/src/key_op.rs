@@ -125,6 +125,9 @@ pub fn read_committed(
   if !same_table || !key_rec.covers_primary_key() {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
+  // These helpers take no blob value (chapter 06, phase 12).
+  key_rec.refuse_blob_fields()?;
+  attr_rec.refuse_blob_fields()?;
   let key = row_codec::key_info(key_rec, key_row)?;
   let attr_info = row_codec::read_attr_info(attr_rec);
   let flags = KeyOpFlags {
@@ -264,6 +267,7 @@ pub fn read_partition(
   if !key_rec.covers_primary_key() {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
+  key_rec.refuse_blob_fields()?;
   let key = row_codec::key_info(key_rec, key_row)?;
   let attr_info =
     [column_header::column_header(row_codec::IC_COL_PARTITION, 0)];
@@ -327,6 +331,9 @@ pub fn write_key(
   if !same_table || !key_rec.covers_primary_key() {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
+  // These helpers take no blob value (chapter 06, phase 12).
+  key_rec.refuse_blob_fields()?;
+  attr_rec.refuse_blob_fields()?;
   if operation == key_ops::IC_OP_DELETE && table.has_blob_columns() {
     return Err(IcError::new(err::IC_ERROR_DELETE_WITH_BLOBS));
   }

@@ -18,16 +18,27 @@
 //!   DECIMAL                    packed binary
 //!   BIT(n)                     n bits in whole 32-bit words
 //!   nullable field             one bit in a null byte; set means NULL
-//!   BLOB, TEXT                 not in a record, for now
+//!   BLOB, TEXT                 no room in the row, and no null bit
 //! ```
 //!
 //! A variable-sized field takes its largest size in the row.
 //!
+//! **A blob field** (BLOB, TEXT, and a MySQL server's JSON and
+//! GEOMETRY) takes no room in the row and has no null bit: its offset
+//! and null bit are not used, and its value, NULL included, is kept
+//! apart, in a [`BlobValues`](crate::blob::BlobValues) (chapter 06,
+//! phase 12). Naming one says that the operation reads or writes it.
+//! Only a column the table was bound with as usable may be named
+//! ([`BlobColumn`](crate::blob::BlobColumn)); another is refused with
+//! `IC_ERROR_NOT_SUPPORTED`. Until the operations that take them are
+//! there, every operation refuses a record naming a blob field, as
+//! scans, takeovers and key records always will.
+//!
 //! **Checked when made, as the reference checks a record:** every field
-//! exists and is not a blob, no field comes twice, every value and null
-//! bit lies inside the row, and no two of them share a bit. A nullable
-//! field must have a null bit. A NOT NULL field's null bit is not used,
-//! so it is not checked. Verify: chapter 05 §17.13.
+//! exists, no field comes twice, every value and null bit lies inside
+//! the row, and no two of them share a bit. A nullable field must have
+//! a null bit, a blob field apart. A NOT NULL field's null bit is not
+//! used, so it is not checked. Verify: chapter 05 §17.13.
 //!
 //! **The default record** puts the null bits first, eight to a byte in
 //! attribute order, then every field in attribute order, each starting
@@ -128,8 +139,15 @@ impl RecordField {
     self.size
   }
 
+  /// True for a blob field, which takes no room in the row and has no
+  /// null bit; its value is kept apart.
+  pub fn is_blob(&self) -> bool {
+    self.field_type == table_props::IC_TYPE_BLOB
+      || self.field_type == table_props::IC_TYPE_TEXT
+  }
+
   /// True if the field has a null bit, which it has exactly when the
-  /// column may be NULL.
+  /// column may be NULL and is not a blob.
   pub fn is_nullable(&self) -> bool {
     self.null_byte_offset != IC_NO_NULL_BIT
   }
@@ -156,6 +174,8 @@ pub struct Record {
   /// By column id, the column's position in `fields`, or `u32::MAX`:
   /// found by index when a row is packed or unpacked.
   position_by_id: Vec<u32>,
+  /// True if a field is a blob, whose value is kept apart.
+  has_blob_fields: bool,
 }
 
 /// The position of each field, by its column id.
@@ -200,13 +220,14 @@ impl Record {
         Some(attr) => attr,
         None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
       };
-      if attr.is_blob() {
-        return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
-      }
       for field in &fields {
         if field.field_id == one.field_id {
           return Err(IcError::new(err::IC_ERROR_DUPLICATE_FIELD_IDS));
         }
+      }
+      if attr.is_blob() {
+        fields.push(blob_field(table, attr)?);
+        continue;
       }
       let mut null_byte_offset = IC_NO_NULL_BIT;
       let mut null_bit: u32 = 0;
@@ -231,17 +252,23 @@ impl Record {
     }
     check_layout(&fields, row_size)?;
     let position_by_id = index_positions(&fields);
+    let mut has_blob_fields = false;
+    for field in &fields {
+      has_blob_fields |= field.is_blob();
+    }
     Ok(Record {
       table: Arc::clone(table),
       fields,
       row_size,
       position_by_id,
+      has_blob_fields,
     })
   }
 
   /// A record with every field word-aligned, over the fields named,
   /// or over every field but the blobs if none are named
-  /// (`ic_table_def_default_record`). See the module note for the
+  /// (`ic_table_def_default_record`): a blob field is in it only when
+  /// named, and then takes no room. See the module note for the
   /// layout; [`field`](Self::field) tells where each field went.
   pub fn default_for(
     table: &Arc<TableDef>,
@@ -267,7 +294,7 @@ impl Record {
     }
     let mut num_nullable: u32 = 0;
     for attr in &attrs {
-      if attr.nullable {
+      if attr.nullable && !attr.is_blob() {
         num_nullable += 1;
       }
     }
@@ -275,6 +302,11 @@ impl Record {
     let mut next_null: u32 = 0;
     let mut spec: Vec<FieldSpec> = Vec::with_capacity(attrs.len());
     for attr in &attrs {
+      if attr.is_blob() {
+        // No room and no null bit: where the next field begins.
+        spec.push(FieldSpec::not_null(attr.column_id, offset));
+        continue;
+      }
       offset = offset.next_multiple_of(field_alignment(attr));
       let mut one = FieldSpec::not_null(attr.column_id, offset);
       if attr.nullable {
@@ -318,6 +350,22 @@ impl Record {
     Some(position)
   }
 
+  /// True if a field is a blob, whose value is kept apart from the row
+  /// ([`BlobValues`](crate::blob::BlobValues)).
+  pub fn has_blob_fields(&self) -> bool {
+    self.has_blob_fields
+  }
+
+  /// Refuse a record naming a blob field (`IC_ERROR_NOT_SUPPORTED`),
+  /// where the operation takes none: scans, takeovers and key records,
+  /// and, until phase 12 brings them, the key operations.
+  pub(crate) fn refuse_blob_fields(&self) -> Result<(), IcError> {
+    if self.has_blob_fields {
+      return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+    }
+    Ok(())
+  }
+
   /// True if every primary key field is in the record, as a key record
   /// needs.
   pub fn covers_primary_key(&self) -> bool {
@@ -330,7 +378,8 @@ impl Record {
   }
 
   /// True if the field at `position` is NULL in `row`
-  /// (`ic_record_is_null`). A field that cannot be NULL never is.
+  /// (`ic_record_is_null`). A field that cannot be NULL never is, nor
+  /// is a blob field in the row: its value is kept apart.
   pub fn is_null(&self, row: &[u8], position: u32) -> bool {
     let field = match self.field(position) {
       Some(field) => field,
@@ -372,6 +421,30 @@ impl Record {
     }
     Ok(())
   }
+}
+
+/// A blob field of `table`: no room in the row and no null bit. Only a
+/// column the table was bound with as usable, with the sizes and the
+/// parts table its description gives (`IC_ERROR_NOT_SUPPORTED`).
+fn blob_field(
+  table: &TableDef,
+  attr: &ColumnProps,
+) -> Result<RecordField, IcError> {
+  let usable = match table.blob_column(attr.column_id) {
+    Some(column) => column.is_usable(),
+    None => false,
+  };
+  if !usable {
+    return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+  }
+  Ok(RecordField {
+    field_id: attr.column_id,
+    field_type: attr.type_code,
+    offset: 0,
+    size: 0,
+    null_byte_offset: IC_NO_NULL_BIT,
+    null_bit: 0,
+  })
 }
 
 /// Where a field of the default record may start: on a word, as the
@@ -429,6 +502,7 @@ mod tests {
   use super::*;
   use ic_signals::prop_stream::PropertyWriter;
   use ic_signals::table_props::parse_table_info;
+  use ic_signals::table_props::IC_TP_COLUMN_ARRAY_KIND;
   use ic_signals::table_props::IC_TP_COLUMN_COUNT;
   use ic_signals::table_props::IC_TP_COLUMN_END;
   use ic_signals::table_props::IC_TP_COLUMN_ID;
@@ -437,6 +511,7 @@ mod tests {
   use ic_signals::table_props::IC_TP_COLUMN_NAME;
   use ic_signals::table_props::IC_TP_COLUMN_NULLABLE;
   use ic_signals::table_props::IC_TP_COLUMN_PRECISION;
+  use ic_signals::table_props::IC_TP_COLUMN_SCALE;
   use ic_signals::table_props::IC_TP_COLUMN_TYPE;
   use ic_signals::table_props::IC_TP_TABLE_NAME;
   use ic_signals::table_props::IC_TYPE_BIGINT;
@@ -684,5 +759,98 @@ mod tests {
     assert_eq!(row[0], 0);
     let e = rec.set_null(&mut row, 0, true).expect_err("not nullable");
     assert_eq!(e.code, err::IC_ERROR_NO_NULL_BIT);
+  }
+
+  /// `id INT` key, `tiny TINYBLOB` (the second version, 256 inline
+  /// bytes, no parts table), `b INT NULL`, bound with `tiny` usable or
+  /// not.
+  fn blob_table(usable: bool) -> Arc<TableDef> {
+    let mut w = PropertyWriter::new();
+    w.add_string(IC_TP_TABLE_NAME, "db/def/t2");
+    w.add_u32(IC_TP_COLUMN_COUNT, 3);
+    let columns: [(&str, u32, bool, bool); 3] = [
+      ("id", IC_TYPE_INT, true, false),
+      ("tiny", IC_TYPE_BLOB, false, true),
+      ("b", IC_TYPE_INT, false, true),
+    ];
+    for (id, (name, type_code, key, nullable)) in columns.iter().enumerate() {
+      w.add_string(IC_TP_COLUMN_NAME, name);
+      w.add_u32(IC_TP_COLUMN_ID, id as u32);
+      w.add_u32(IC_TP_COLUMN_TYPE, *type_code);
+      w.add_u32(IC_TP_COLUMN_IN_KEY, *key as u32);
+      w.add_u32(IC_TP_COLUMN_NULLABLE, *nullable as u32);
+      if *type_code == IC_TYPE_BLOB {
+        w.add_u32(IC_TP_COLUMN_LENGTH, 0);
+        w.add_u32(IC_TP_COLUMN_PRECISION, 256);
+        w.add_u32(IC_TP_COLUMN_SCALE, 0);
+        w.add_u32(
+          IC_TP_COLUMN_ARRAY_KIND,
+          table_props::IC_ARRAY_KIND_LONG_VARSIZE,
+        );
+      } else {
+        w.add_u32(IC_TP_COLUMN_LENGTH, 1);
+      }
+      w.add_u32(IC_TP_COLUMN_END, 0);
+    }
+    let info = parse_table_info(w.words()).expect("parsed");
+    let attr = info.attribute("tiny").expect("tiny");
+    let sizes = crate::blob::column_sizes(attr).expect("second version");
+    let column = if usable {
+      crate::blob::BlobColumn::usable(1, sizes, None)
+    } else {
+      let why = crate::blob::BlobRefusal::NotHashMapped;
+      crate::blob::BlobColumn::refused(1, Some(sizes), why)
+    };
+    Arc::new(TableDef::new(info, None).with_blob_columns(vec![column]))
+  }
+
+  #[test]
+  fn a_blob_field_takes_no_room_and_no_null_bit() {
+    let t2 = blob_table(true);
+    // Left out unless named.
+    let rec = Record::default_for(&t2, None).expect("record");
+    assert_eq!(rec.num_fields(), 2);
+    assert!(!rec.has_blob_fields());
+    let rec = Record::default_for(&t2, Some(&[0, 1, 2])).expect("record");
+    assert!(rec.has_blob_fields());
+    let tiny = rec.field(1).expect("tiny");
+    assert!(tiny.is_blob());
+    assert_eq!(tiny.size(), 0);
+    assert!(!tiny.is_nullable());
+    // One null byte, for b alone; id at 4, b right after it.
+    let id = rec.field(0).expect("id");
+    let b = rec.field(2).expect("b");
+    assert_eq!((id.offset(), b.offset()), (4, 8));
+    assert_eq!((b.null_byte_offset(), b.null_bit()), (0, 0));
+    assert_eq!(rec.row_size(), 16);
+    let row = vec![0xFFu8; 16];
+    assert!(!rec.is_null(&row, 1));
+    assert_eq!(
+      rec.refuse_blob_fields().expect_err("refused").code,
+      err::IC_ERROR_NOT_SUPPORTED
+    );
+    // A null bit given for it is not used, nor is its offset.
+    let spec = [
+      FieldSpec::not_null(0, 0),
+      FieldSpec::nullable(1, 0, 4, 0),
+      FieldSpec::nullable(2, 4, 8, 0),
+    ];
+    let rec = Record::new(&t2, &spec, 12).expect("record");
+    assert!(!rec.field(1).expect("tiny").is_nullable());
+  }
+
+  #[test]
+  fn a_blob_column_that_cannot_be_used_is_refused() {
+    let t2 = blob_table(false);
+    let spec = [FieldSpec::not_null(0, 0), FieldSpec::not_null(1, 4)];
+    assert_eq!(
+      code_of(Record::new(&t2, &spec, 8)),
+      err::IC_ERROR_NOT_SUPPORTED
+    );
+    assert_eq!(
+      code_of(Record::default_for(&t2, Some(&[0, 1]))),
+      err::IC_ERROR_NOT_SUPPORTED
+    );
+    assert!(Record::default_for(&t2, None).is_ok());
   }
 }

@@ -2,8 +2,9 @@
 // Licensed under the MIT License. See LICENSE in the repository root.
 
 //! Blob columns, which hold MySQL's BLOB, TEXT, JSON and GEOMETRY: the
-//! head a main row keeps, and where each byte of a value lies. New: the
-//! C had no blobs.
+//! head a main row keeps, where each byte of a value lies, the parts
+//! table a column is bound with, and the values a program reads and
+//! writes. New: the C had no blobs.
 //!
 //! A blob column's value is kept in two places. The main row holds a
 //! head and the value's first bytes, its inline bytes; the rest lies in
@@ -18,26 +19,46 @@
 //!   value's whole length in 64 bits. The inline bytes follow it, as
 //!   many as the length or the inline size allows, the smaller. The
 //!   reserved field and the part key id are written 0 and not read.
-//! - **The sizes** are kept in the column's description: the inline
-//!   size in its precision, the part size in its scale, the stripe in
-//!   its length. A part size of 0 means no parts table: the value must
-//!   fit inline, or it is refused with 4266.
+//! - **The sizes** are never assumed: they are read from the
+//!   dictionary's description of the table, the inline size from the
+//!   column's precision, the part size from its scale, the stripe from
+//!   its length. MySQL gives each type its own, and the parts table's
+//!   data column must agree with the part size, or the column is not
+//!   used. A part size of 0 means no parts table: the value must fit
+//!   inline, or it is refused with 4266.
 //! - **Part k** holds the bytes from `inline + k * part`, a whole part
 //!   of them but the last. A value of length `L` past the inline size
 //!   has `(L - inline) / part` parts, rounded up.
-//! - **A part's bytes** are a variable-sized value behind a 2-byte
-//!   length for a parts table in memory, or a fixed-size one, padded to
-//!   the part size with 0x00 (binary) or 0x20 (text), for one on disk.
+//! - **The parts table** is `<database>/def/NDB$BLOB_<table id>_<column
+//!   id>`: the main table's key columns, copied, then `NDB$PART`, the
+//!   part number, `NDB$PKID`, always 0, and `NDB$DATA`, the part's bytes,
+//!   behind a 2-byte length for a parts table in memory, or fixed at the
+//!   part size and padded with 0x00 (binary) or 0x20 (text) for one on
+//!   disk. Binding a table binds its parts tables with it
+//!   ([`BlobColumn`]).
 //!
 //! A part that is missing, or a head or part whose sizes disagree with
 //! the value's, is a damaged value, 4267.
 //!
-//! This module is pure: it works out sizes and encodes and decodes,
-//! and is tested on its own. Verify: chapter 05 §6.10.
+//! **A value belongs to its query**, NULL included: a blob field in a
+//! record takes no room in the row and has no null bit, and
+//! [`BlobValues`] holds each blob field's value apart from the row.
+//!
+//! The functions here are pure: they work out sizes, check
+//! descriptions, encode and decode, and are tested on their own.
+//! Verify: chapter 05 §6.10.
 
+use std::sync::Arc;
+
+use ic_port::err;
 use ic_port::IcError;
 use ic_signals::table_props;
 use ic_signals::table_props::ColumnProps;
+use ic_signals::table_props::TableProps;
+
+use crate::dict_cache::TableDef;
+use crate::dict_client;
+use crate::record::Record;
 
 /// A value longer than its blob column holds without a parts table.
 pub const IC_NDB_ERROR_BLOB_TOO_LONG: i32 = 4266;
@@ -55,6 +76,17 @@ const IC_PART_LENGTH_BYTES: usize = 2;
 const IC_PART_PAD_BINARY: u8 = 0x00;
 const IC_PART_PAD_TEXT: u8 = 0x20;
 
+/// How a parts table's name begins, before the table and column ids.
+const IC_PARTS_TABLE_PREFIX: &str = "NDB$BLOB_";
+/// The parts table's own columns, after the main table's key columns.
+pub const IC_PARTS_COLUMN_PART: &str = "NDB$PART";
+/// The part key id column, always 0.
+pub const IC_PARTS_COLUMN_PKID: &str = "NDB$PKID";
+/// The column holding a part's bytes.
+pub const IC_PARTS_COLUMN_DATA: &str = "NDB$DATA";
+/// Columns a parts table has besides the main table's key columns.
+const IC_PARTS_OWN_COLUMNS: usize = 3;
+
 /// A blob column's sizes, as its description gives them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlobSizes {
@@ -67,8 +99,9 @@ pub struct BlobSizes {
 }
 
 impl BlobSizes {
-  /// The sizes of a blob column of the second version; `None` for any
-  /// other column, a blob of the first version among them.
+  /// The sizes of a blob column of the second version, from its
+  /// description; `None` for any other column, a blob of the first
+  /// version among them.
   pub fn of(column: &ColumnProps) -> Option<BlobSizes> {
     if !column.is_blob() {
       return None;
@@ -195,18 +228,6 @@ pub enum PartData {
 }
 
 impl PartData {
-  /// How the parts table's data column keeps a part; `None` for a
-  /// column of another type.
-  pub fn of(column: &ColumnProps) -> Option<PartData> {
-    match column.type_code {
-      table_props::IC_TYPE_LONGVARBINARY => Some(PartData::Var),
-      table_props::IC_TYPE_LONGVARCHAR => Some(PartData::Var),
-      table_props::IC_TYPE_BINARY => Some(PartData::FixedBinary),
-      table_props::IC_TYPE_CHAR => Some(PartData::FixedText),
-      _ => None,
-    }
-  }
-
   /// What pads a fixed-size part.
   fn pad(self) -> u8 {
     match self {
@@ -216,23 +237,46 @@ impl PartData {
   }
 }
 
+/// A parts table's data column, as its description gives it: how it
+/// keeps a part's bytes, and how many it holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartColumn {
+  /// How a part's bytes are kept.
+  pub data: PartData,
+  /// The most bytes a part holds: the part size.
+  pub size: u32,
+}
+
+impl PartColumn {
+  /// The data column of a parts table, from its description; `None`
+  /// for a column of a type no parts table has.
+  pub fn of(column: &ColumnProps) -> Option<PartColumn> {
+    let data = match column.type_code {
+      table_props::IC_TYPE_LONGVARBINARY => PartData::Var,
+      table_props::IC_TYPE_LONGVARCHAR => PartData::Var,
+      table_props::IC_TYPE_BINARY => PartData::FixedBinary,
+      table_props::IC_TYPE_CHAR => PartData::FixedText,
+      _ => return None,
+    };
+    Some(PartColumn {
+      data,
+      size: column.length,
+    })
+  }
+}
+
 /// A part's value for its data column, into `out`, which is emptied
 /// first: its bytes behind their length, or padded to the part size.
-pub fn encode_part(
-  data: PartData,
-  part_size: u32,
-  bytes: &[u8],
-  out: &mut Vec<u8>,
-) {
+pub fn encode_part(column: PartColumn, bytes: &[u8], out: &mut Vec<u8>) {
   out.clear();
-  match data {
+  match column.data {
     PartData::Var => {
       out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
       out.extend_from_slice(bytes);
     }
     PartData::FixedBinary | PartData::FixedText => {
       out.extend_from_slice(bytes);
-      out.resize(part_size as usize, data.pad());
+      out.resize(column.size as usize, column.data.pad());
     }
   }
 }
@@ -241,11 +285,11 @@ pub fn encode_part(
 /// says the part holds `expected` of them. Damaged (4267) when it holds
 /// another number.
 pub fn decode_part(
-  data: PartData,
+  column: PartColumn,
   expected: usize,
   value: &[u8],
 ) -> Result<&[u8], IcError> {
-  match data {
+  match column.data {
     PartData::Var => {
       if value.len() < IC_PART_LENGTH_BYTES {
         return Err(IcError::new(IC_NDB_ERROR_BLOB_DAMAGED));
@@ -258,7 +302,7 @@ pub fn decode_part(
       Ok(bytes)
     }
     PartData::FixedBinary | PartData::FixedText => {
-      if value.len() < expected {
+      if value.len() < expected || expected > column.size as usize {
         return Err(IcError::new(IC_NDB_ERROR_BLOB_DAMAGED));
       }
       Ok(&value[..expected])
@@ -276,22 +320,545 @@ pub fn part_key(main_key: &[u32], part: u32, out: &mut Vec<u32>) {
   out.push(part);
 }
 
+/// The internal name of a blob column's parts table.
+pub fn parts_table_name(
+  database: &str,
+  table_id: u32,
+  column_id: u32,
+) -> String {
+  let own = format!("{}{}_{}", IC_PARTS_TABLE_PREFIX, table_id, column_id);
+  dict_client::internal_name(database, &own)
+}
+
+/// Why a blob column cannot be read or written: what phase 12 leaves
+/// out (chapter 06, "Not in this phase"), or a parts table that is not
+/// as the column's description says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobRefusal {
+  /// The first version of the blob layout.
+  FirstVersion,
+  /// Parts striped over partitions: a stripe other than 0.
+  Striped,
+  /// The table is not placed by a hash map: partitioned by the user.
+  NotHashMapped,
+  /// The table's rows have a lifetime.
+  TimeToLive,
+  /// The table is a ring buffer.
+  RingBuffer,
+  /// The column has parts, and its parts table is not there.
+  NoPartsTable,
+  /// The parts table's columns are not those the column calls for.
+  PartsTableDiffers,
+}
+
+impl BlobRefusal {
+  /// What it means, for a message.
+  pub fn text(self) -> &'static str {
+    match self {
+      BlobRefusal::FirstVersion => "a blob of the first version",
+      BlobRefusal::Striped => "a blob whose parts are striped",
+      BlobRefusal::NotHashMapped => "a table partitioned by the user",
+      BlobRefusal::TimeToLive => "a table whose rows have a lifetime",
+      BlobRefusal::RingBuffer => "a ring buffer table",
+      BlobRefusal::NoPartsTable => "a blob whose parts table is missing",
+      BlobRefusal::PartsTableDiffers => {
+        "a blob whose parts table is not as its column says"
+      }
+    }
+  }
+}
+
+/// Why no blob column of the table can be used, if one cannot: the
+/// table's own options that phase 12 leaves out.
+pub fn table_refusal(main: &TableProps) -> Option<BlobRefusal> {
+  if main.fragment_kind != table_props::IC_FRAGMENT_KIND_HASH_MAP {
+    return Some(BlobRefusal::NotHashMapped);
+  }
+  if main.ttl_seconds != table_props::IC_NULL_PTR {
+    return Some(BlobRefusal::TimeToLive);
+  }
+  if main.ring_size != table_props::IC_NULL_PTR {
+    return Some(BlobRefusal::RingBuffer);
+  }
+  None
+}
+
+/// A blob column's sizes, or why it cannot be used whatever its parts
+/// table: the first version, or parts striped.
+pub fn column_sizes(column: &ColumnProps) -> Result<BlobSizes, BlobRefusal> {
+  let sizes = match BlobSizes::of(column) {
+    Some(sizes) => sizes,
+    None => return Err(BlobRefusal::FirstVersion),
+  };
+  if sizes.stripe != 0 {
+    return Err(BlobRefusal::Striped);
+  }
+  Ok(sizes)
+}
+
+/// Check a blob column's parts table against the main table and the
+/// column, and give its data column. The parts table must have the
+/// main table's key columns, copied in order, then the part number as
+/// a key, the part key id, and a data column of the column's kind
+/// (binary for a BLOB, characters for a TEXT) holding exactly the part
+/// size the column's description gives.
+pub fn check_parts_table(
+  main: &TableProps,
+  column: &ColumnProps,
+  sizes: BlobSizes,
+  parts: &TableProps,
+) -> Result<PartColumn, BlobRefusal> {
+  let differs = BlobRefusal::PartsTableDiffers;
+  let mut keys: usize = 0;
+  for main_key in &main.attributes {
+    if !main_key.primary_key {
+      continue;
+    }
+    let copy = match parts.attributes.get(keys) {
+      Some(copy) => copy,
+      None => return Err(differs),
+    };
+    let same = copy.primary_key
+      && copy.type_code == main_key.type_code
+      && copy.length == main_key.length
+      && copy.precision == main_key.precision
+      && copy.scale == main_key.scale
+      && copy.charset == main_key.charset;
+    if !same {
+      return Err(differs);
+    }
+    keys += 1;
+  }
+  if parts.attributes.len() != keys + IC_PARTS_OWN_COLUMNS {
+    return Err(differs);
+  }
+  let part = &parts.attributes[keys];
+  let pkid = &parts.attributes[keys + 1];
+  let data = &parts.attributes[keys + 2];
+  let part_ok = part.name == IC_PARTS_COLUMN_PART
+    && part.primary_key
+    && part.type_code == table_props::IC_TYPE_UNSIGNED;
+  let pkid_ok = pkid.name == IC_PARTS_COLUMN_PKID
+    && !pkid.primary_key
+    && pkid.type_code == table_props::IC_TYPE_UNSIGNED;
+  if !part_ok || !pkid_ok || data.name != IC_PARTS_COLUMN_DATA {
+    return Err(differs);
+  }
+  let part_column = match PartColumn::of(data) {
+    Some(part_column) => part_column,
+    None => return Err(differs),
+  };
+  // A TEXT's parts are characters, a BLOB's bytes.
+  let text_data = data.is_char_type();
+  let text_column = column.type_code == table_props::IC_TYPE_TEXT;
+  if text_data != text_column || part_column.size != sizes.part {
+    return Err(differs);
+  }
+  Ok(part_column)
+}
+
+/// A blob column of a bound table: its sizes, and its parts table bound
+/// with the table, or why it cannot be used.
+#[derive(Clone)]
+pub struct BlobColumn {
+  column_id: u32,
+  sizes: Option<BlobSizes>,
+  parts: Option<Arc<TableDef>>,
+  part_column: Option<PartColumn>,
+  refusal: Option<BlobRefusal>,
+}
+
+impl std::fmt::Debug for BlobColumn {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "BlobColumn({}, {:?}", self.column_id, self.sizes)?;
+    if let Some(parts) = &self.parts {
+      write!(f, ", parts {}", parts.name())?;
+    }
+    if let Some(refusal) = self.refusal {
+      write!(f, ", not usable: {}", refusal.text())?;
+    }
+    write!(f, ")")
+  }
+}
+
+impl BlobColumn {
+  /// A column that can be read and written: with its parts table and
+  /// that table's data column, or with neither for part size 0.
+  pub(crate) fn usable(
+    column_id: u32,
+    sizes: BlobSizes,
+    parts: Option<(Arc<TableDef>, PartColumn)>,
+  ) -> BlobColumn {
+    let (parts, part_column) = match parts {
+      Some((parts, part_column)) => (Some(parts), Some(part_column)),
+      None => (None, None),
+    };
+    BlobColumn {
+      column_id,
+      sizes: Some(sizes),
+      parts,
+      part_column,
+      refusal: None,
+    }
+  }
+
+  /// A column that cannot be used, and why.
+  pub(crate) fn refused(
+    column_id: u32,
+    sizes: Option<BlobSizes>,
+    refusal: BlobRefusal,
+  ) -> BlobColumn {
+    BlobColumn {
+      column_id,
+      sizes,
+      parts: None,
+      part_column: None,
+      refusal: Some(refusal),
+    }
+  }
+
+  /// The column's id in its table.
+  pub fn column_id(&self) -> u32 {
+    self.column_id
+  }
+
+  /// Its sizes, from its description; `None` for the first version.
+  pub fn sizes(&self) -> Option<BlobSizes> {
+    self.sizes
+  }
+
+  /// Its parts table, bound with the table; `None` for a column with
+  /// part size 0 and for one that cannot be used.
+  pub fn parts_table(&self) -> Option<&Arc<TableDef>> {
+    self.parts.as_ref()
+  }
+
+  /// The parts table's data column, as its description gives it.
+  pub fn part_column(&self) -> Option<PartColumn> {
+    self.part_column
+  }
+
+  /// True if the column can be read and written.
+  pub fn is_usable(&self) -> bool {
+    self.refusal.is_none()
+  }
+
+  /// Why it cannot be, if it cannot.
+  pub fn refusal(&self) -> Option<BlobRefusal> {
+    self.refusal
+  }
+}
+
+/// One blob field's value.
+#[derive(Clone, Debug)]
+struct BlobSlot {
+  /// The column's sizes, from the table's description.
+  sizes: BlobSizes,
+  /// The bytes, when not NULL; kept, with their capacity, when the
+  /// value is set NULL or cleared.
+  value: Vec<u8>,
+  null: bool,
+}
+
+/// The values of a record's blob fields, kept apart from its row: a
+/// blob field takes no room in the row and has no null bit, so its
+/// value, NULL included, is here. Each field is named by its position
+/// in the record, as a field mask counts. A value is NULL until set.
+///
+/// A query's values and those the synchronous helpers take are this
+/// holder; a buffer keeps its capacity when a value is set again or
+/// cleared, so that a run after the first allocates nothing.
+#[derive(Clone, Debug)]
+pub struct BlobValues {
+  table: Arc<TableDef>,
+  slots: Vec<BlobSlot>,
+  /// By position in the record, the field's place in `slots`, or
+  /// `u32::MAX` for a field that is not a blob.
+  slot_by_position: Vec<u32>,
+}
+
+impl BlobValues {
+  /// A holder for the blob fields of `rec`, every value NULL.
+  pub fn new(rec: &Record) -> BlobValues {
+    let mut slots: Vec<BlobSlot> = Vec::new();
+    let mut slot_by_position: Vec<u32> = Vec::new();
+    for position in 0..rec.num_fields() {
+      let field = match rec.field(position) {
+        Some(field) => field,
+        None => break,
+      };
+      let column = rec.table().blob_column(field.field_id());
+      let sizes = match column.and_then(BlobColumn::sizes) {
+        Some(sizes) if field.is_blob() => sizes,
+        _ => continue,
+      };
+      slot_by_position.resize(position as usize + 1, u32::MAX);
+      slot_by_position[position as usize] = slots.len() as u32;
+      slots.push(BlobSlot {
+        sizes,
+        value: Vec::new(),
+        null: true,
+      });
+    }
+    BlobValues {
+      table: Arc::clone(rec.table()),
+      slots,
+      slot_by_position,
+    }
+  }
+
+  /// How many blob fields there are.
+  pub fn len(&self) -> usize {
+    self.slots.len()
+  }
+
+  /// True if the record has no blob field.
+  pub fn is_empty(&self) -> bool {
+    self.slots.is_empty()
+  }
+
+  /// True if the holder was made for a record of the same blob fields
+  /// as `rec`, over the same version of its table.
+  pub fn fits(&self, rec: &Record) -> bool {
+    let table = rec.table();
+    if self.table.table_id() != table.table_id()
+      || self.table.table_version() != table.table_version()
+    {
+      return false;
+    }
+    let mut count: usize = 0;
+    for position in 0..rec.num_fields() {
+      let blob = match rec.field(position) {
+        Some(field) => field.is_blob(),
+        None => false,
+      };
+      if blob {
+        if self.slot(position).is_err() {
+          return false;
+        }
+        count += 1;
+      }
+    }
+    count == self.slots.len()
+  }
+
+  /// The field at `position`'s value: `None` when it is NULL.
+  /// `IC_ERROR_NO_SUCH_FIELD` when the position names no blob field.
+  pub fn blob(&self, position: u32) -> Result<Option<&[u8]>, IcError> {
+    let slot = &self.slots[self.slot(position)?];
+    if slot.null {
+      return Ok(None);
+    }
+    Ok(Some(slot.value.as_slice()))
+  }
+
+  /// Set the field at `position` to a copy of `value`. Refused with
+  /// 4266 when the column has no parts table and the value is longer
+  /// than its inline size.
+  pub fn set_blob(
+    &mut self,
+    position: u32,
+    value: &[u8],
+  ) -> Result<(), IcError> {
+    let index = self.slot(position)?;
+    let slot = &mut self.slots[index];
+    if !slot.sizes.holds(value.len() as u64) {
+      return Err(IcError::new(IC_NDB_ERROR_BLOB_TOO_LONG));
+    }
+    slot.value.clear();
+    slot.value.extend_from_slice(value);
+    slot.null = false;
+    Ok(())
+  }
+
+  /// Set the field at `position` NULL.
+  pub fn set_blob_null(&mut self, position: u32) -> Result<(), IcError> {
+    let index = self.slot(position)?;
+    self.slots[index].null = true;
+    Ok(())
+  }
+
+  /// The buffer of the field at `position`, to fill in place; the field
+  /// is no longer NULL, and holds what the buffer holds when it is
+  /// written. The buffer holds the last value set or read, or nothing.
+  /// A value too long for a column without parts is refused when it is
+  /// written.
+  pub fn blob_buf_mut(
+    &mut self,
+    position: u32,
+  ) -> Result<&mut Vec<u8>, IcError> {
+    let index = self.slot(position)?;
+    let slot = &mut self.slots[index];
+    slot.null = false;
+    Ok(&mut slot.value)
+  }
+
+  /// Set every value NULL, keeping each buffer's capacity.
+  pub fn clear(&mut self) {
+    for slot in &mut self.slots {
+      slot.value.clear();
+      slot.null = true;
+    }
+  }
+
+  /// The place in `slots` of the blob field at `position`.
+  fn slot(&self, position: u32) -> Result<usize, IcError> {
+    match self.slot_by_position.get(position as usize) {
+      Some(&index) if index != u32::MAX => Ok(index as usize),
+      _ => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use ic_signals::prop_stream::PropertyWriter;
+  use ic_signals::table_props::parse_table_info;
+  use ic_signals::table_props::IC_TP_COLUMN_ARRAY_KIND;
+  use ic_signals::table_props::IC_TP_COLUMN_COUNT;
+  use ic_signals::table_props::IC_TP_COLUMN_END;
+  use ic_signals::table_props::IC_TP_COLUMN_ID;
+  use ic_signals::table_props::IC_TP_COLUMN_IN_KEY;
+  use ic_signals::table_props::IC_TP_COLUMN_LENGTH;
+  use ic_signals::table_props::IC_TP_COLUMN_NAME;
+  use ic_signals::table_props::IC_TP_COLUMN_NULLABLE;
+  use ic_signals::table_props::IC_TP_COLUMN_PRECISION;
+  use ic_signals::table_props::IC_TP_COLUMN_SCALE;
+  use ic_signals::table_props::IC_TP_COLUMN_TYPE;
+  use ic_signals::table_props::IC_TP_FRAGMENT_KIND;
+  use ic_signals::table_props::IC_TP_RING_SIZE;
+  use ic_signals::table_props::IC_TP_TABLE_NAME;
+  use ic_signals::table_props::IC_TP_TTL_SECONDS;
+  use ic_signals::table_props::IC_TYPE_BINARY;
+  use ic_signals::table_props::IC_TYPE_BLOB;
+  use ic_signals::table_props::IC_TYPE_CHAR;
+  use ic_signals::table_props::IC_TYPE_INT;
+  use ic_signals::table_props::IC_TYPE_LONGVARBINARY;
+  use ic_signals::table_props::IC_TYPE_LONGVARCHAR;
+  use ic_signals::table_props::IC_TYPE_TEXT;
+  use ic_signals::table_props::IC_TYPE_UNSIGNED;
 
-  /// MySQL's TEXT: 256 inline bytes, parts of 2 000.
-  const TEXT: BlobSizes = BlobSizes {
-    inline: 256,
-    part: 2000,
-    stripe: 0,
-  };
-  /// MySQL's TINYTEXT: 256 inline bytes and no parts table.
-  const TINY: BlobSizes = BlobSizes {
-    inline: 256,
-    part: 0,
-    stripe: 0,
-  };
+  /// The character set the text columns are given.
+  const UTF8MB4: u32 = 255;
+
+  /// A column as a description gives it: name, type, length, precision
+  /// (with the character set above it), scale, array kind, key and
+  /// nullable.
+  struct Col {
+    name: &'static str,
+    type_code: u32,
+    length: u32,
+    precision: u32,
+    scale: u32,
+    array_kind: u32,
+    key: bool,
+    nullable: bool,
+  }
+
+  fn col(name: &'static str, type_code: u32, length: u32) -> Col {
+    // Kept as a data node keeps the type: a long variable-sized one
+    // behind two length bytes.
+    let long_var =
+      type_code == IC_TYPE_LONGVARCHAR || type_code == IC_TYPE_LONGVARBINARY;
+    let array_kind = if long_var {
+      table_props::IC_ARRAY_KIND_LONG_VARSIZE
+    } else {
+      table_props::IC_ARRAY_KIND_FIXED
+    };
+    Col {
+      name,
+      type_code,
+      length,
+      precision: 0,
+      scale: 0,
+      array_kind,
+      key: false,
+      nullable: false,
+    }
+  }
+
+  /// A blob column of the second version, with the inline size and
+  /// part size given, as a MySQL server describes its blob types.
+  fn blob_col(name: &'static str, text: bool, inline: u32, part: u32) -> Col {
+    let type_code = if text { IC_TYPE_TEXT } else { IC_TYPE_BLOB };
+    let charset = if text { UTF8MB4 } else { 0 };
+    Col {
+      name,
+      type_code,
+      length: 0,
+      precision: inline | (charset << 16),
+      scale: part,
+      array_kind: table_props::IC_ARRAY_KIND_LONG_VARSIZE,
+      key: false,
+      nullable: true,
+    }
+  }
+
+  /// A table described with these columns and table properties.
+  fn described(name: &str, cols: &[Col], props: &[(u16, u32)]) -> TableProps {
+    let mut w = PropertyWriter::new();
+    w.add_string(IC_TP_TABLE_NAME, name);
+    for (key, value) in props {
+      w.add_u32(*key, *value);
+    }
+    w.add_u32(IC_TP_COLUMN_COUNT, cols.len() as u32);
+    for (id, c) in cols.iter().enumerate() {
+      w.add_string(IC_TP_COLUMN_NAME, c.name);
+      w.add_u32(IC_TP_COLUMN_ID, id as u32);
+      w.add_u32(IC_TP_COLUMN_TYPE, c.type_code);
+      w.add_u32(IC_TP_COLUMN_LENGTH, c.length);
+      w.add_u32(IC_TP_COLUMN_PRECISION, c.precision);
+      w.add_u32(IC_TP_COLUMN_SCALE, c.scale);
+      w.add_u32(IC_TP_COLUMN_ARRAY_KIND, c.array_kind);
+      w.add_u32(IC_TP_COLUMN_IN_KEY, c.key as u32);
+      w.add_u32(IC_TP_COLUMN_NULLABLE, c.nullable as u32);
+      w.add_u32(IC_TP_COLUMN_END, 0);
+    }
+    parse_table_info(w.words()).expect("parsed")
+  }
+
+  fn key(name: &'static str) -> Col {
+    let mut c = col(name, IC_TYPE_INT, 1);
+    c.key = true;
+    c
+  }
+
+  /// `id INT` key, `t TEXT`, `b LONGBLOB`, `tiny TINYBLOB`.
+  fn main_table() -> TableProps {
+    described(
+      "db/def/t",
+      &[
+        key("id"),
+        blob_col("t", true, 256, 2000),
+        blob_col("b", false, 256, 13948),
+        blob_col("tiny", false, 256, 0),
+      ],
+      &[],
+    )
+  }
+
+  /// A parts table for the main table, its data column `data` given.
+  fn parts_table(data: Col) -> TableProps {
+    let mut part = col(IC_PARTS_COLUMN_PART, IC_TYPE_UNSIGNED, 1);
+    part.key = true;
+    described(
+      "db/def/NDB$BLOB_7_1",
+      &[
+        key("id"),
+        part,
+        col(IC_PARTS_COLUMN_PKID, IC_TYPE_UNSIGNED, 1),
+        data,
+      ],
+      &[],
+    )
+  }
+
+  /// The sizes of the main table's column, as its description gives.
+  fn sizes_of(main: &TableProps, name: &str) -> BlobSizes {
+    let column = main.attribute(name).expect("the column");
+    BlobSizes::of(column).expect("a blob of the second version")
+  }
 
   fn value_of(length: usize) -> Vec<u8> {
     let mut value = Vec::with_capacity(length);
@@ -302,60 +869,88 @@ mod tests {
   }
 
   #[test]
+  fn blob_sizes_come_from_the_description() {
+    let main = main_table();
+    let t = sizes_of(&main, "t");
+    assert_eq!((t.inline, t.part, t.stripe), (256, 2000, 0));
+    let b = sizes_of(&main, "b");
+    assert_eq!((b.inline, b.part), (256, 13948));
+    assert!(!sizes_of(&main, "tiny").has_parts());
+    // The character set above the precision is not the inline size.
+    assert_eq!(main.attribute("t").expect("t").charset, UTF8MB4);
+    // A blob of the first version keeps no 2-byte length: not ours.
+    let mut v1 = blob_col("v1", false, 256, 2000);
+    v1.array_kind = table_props::IC_ARRAY_KIND_FIXED;
+    let old = described("db/def/o", &[key("id"), v1], &[]);
+    let column = old.attribute("v1").expect("v1");
+    assert_eq!(BlobSizes::of(column), None);
+    assert_eq!(column_sizes(column), Err(BlobRefusal::FirstVersion));
+    let int = main.attribute("id").expect("id");
+    assert_eq!(BlobSizes::of(int), None);
+  }
+
+  #[test]
   fn blob_parts_at_every_boundary() {
+    let text = sizes_of(&main_table(), "t");
+    let (inline, part) = (text.inline as u64, text.part as u64);
     // (length, parts, length of the last part)
-    let cases: [(u64, u64, usize); 9] = [
+    let cases: [(u64, u64, u64); 9] = [
       (0, 0, 0),
       (1, 0, 0),
-      (255, 0, 0),
-      (256, 0, 0),
-      (257, 1, 1),
-      (2256, 1, 2000),
-      (2257, 2, 1),
-      (5000, 3, 744),
-      (1 << 20, 525, 1_048_576 - 256 - 524 * 2000),
+      (inline - 1, 0, 0),
+      (inline, 0, 0),
+      (inline + 1, 1, 1),
+      (inline + part, 1, part),
+      (inline + part + 1, 2, 1),
+      (inline + 2 * part + 744, 3, 744),
+      (1 << 20, 525, (1 << 20) - inline - 524 * part),
     ];
     for (length, parts, last) in cases {
-      assert_eq!(TEXT.part_count(length), parts, "length {length}");
+      assert_eq!(text.part_count(length), parts, "length {length}");
       if parts > 0 {
-        assert_eq!(TEXT.part_len(length, parts - 1), last);
-        let first = if parts == 1 { last } else { 2000 };
-        assert_eq!(TEXT.part_len(length, 0), first);
-        let end = TEXT.part_offset(parts - 1) + last as u64;
+        assert_eq!(text.part_len(length, parts - 1) as u64, last);
+        let first = if parts == 1 { last } else { part };
+        assert_eq!(text.part_len(length, 0) as u64, first);
+        let end = text.part_offset(parts - 1) + last;
         assert_eq!(end, length);
       }
     }
-    assert_eq!(TEXT.part_of(256), 0);
-    assert_eq!(TEXT.part_of(2255), 0);
-    assert_eq!(TEXT.part_of(2256), 1);
-    assert_eq!(TINY.part_count(10_000), 0);
-    assert_eq!(TEXT.inline_len(100), 100);
-    assert_eq!(TEXT.inline_len(5000), 256);
+    assert_eq!(text.part_of(inline), 0);
+    assert_eq!(text.part_of(inline + part - 1), 0);
+    assert_eq!(text.part_of(inline + part), 1);
+    let tiny = sizes_of(&main_table(), "tiny");
+    assert_eq!(tiny.part_count(10_000), 0);
+    assert_eq!(text.inline_len(100), 100);
+    assert_eq!(text.inline_len(5000), inline as usize);
   }
 
   #[test]
   fn blob_head_round_trip() {
+    let text = sizes_of(&main_table(), "t");
+    let inline = text.inline as usize;
+    let part = text.part as usize;
     let mut out = Vec::new();
-    for length in [0usize, 1, 255, 256, 257, 2256, 2257, 5000] {
+    for length in [0, 1, inline - 1, inline, inline + 1, inline + part, 5000] {
       let value = value_of(length);
-      encode_main_value(TEXT, &value, &mut out).expect("encodes");
-      let inline_len = length.min(256);
+      encode_main_value(text, &value, &mut out).expect("encodes");
+      let inline_len = length.min(inline);
       assert_eq!(out.len(), IC_BLOB_HEAD_BYTES + inline_len);
       // The size field is the column's 2-byte length.
       let size = u16::from_le_bytes([out[0], out[1]]) as usize;
       assert_eq!(size, out.len() - 2);
       assert_eq!(&out[2..8], &[0u8; 6]);
-      let (got_length, inline) =
-        decode_main_value(TEXT, &out).expect("decodes");
+      let (got_length, got_inline) =
+        decode_main_value(text, &out).expect("decodes");
       assert_eq!(got_length, length as u64);
-      assert_eq!(inline, &value[..inline_len]);
+      assert_eq!(got_inline, &value[..inline_len]);
     }
   }
 
   #[test]
   fn blob_head_bytes_as_laid_out() {
     let mut out = Vec::new();
-    encode_main_value(TEXT, b"abc", &mut out).expect("encodes");
+    let text = sizes_of(&main_table(), "t");
+    encode_main_value(text, b"abc", &mut out).expect("encodes");
     let expected: [u8; 19] = [
       17, 0, // size: 14 + 3
       0, 0, // reserved
@@ -368,9 +963,11 @@ mod tests {
 
   #[test]
   fn blob_too_long_without_parts_table() {
+    let tiny = sizes_of(&main_table(), "tiny");
+    let inline = tiny.inline as usize;
     let mut out = Vec::new();
-    encode_main_value(TINY, &value_of(256), &mut out).expect("fits");
-    let refused = encode_main_value(TINY, &value_of(257), &mut out);
+    encode_main_value(tiny, &value_of(inline), &mut out).expect("fits");
+    let refused = encode_main_value(tiny, &value_of(inline + 1), &mut out);
     assert_eq!(
       refused.expect_err("refused").code,
       IC_NDB_ERROR_BLOB_TOO_LONG
@@ -379,40 +976,200 @@ mod tests {
 
   #[test]
   fn blob_damaged_heads() {
+    let text = sizes_of(&main_table(), "t");
     let mut out = Vec::new();
-    encode_main_value(TEXT, &value_of(5000), &mut out).expect("encodes");
+    encode_main_value(text, &value_of(5000), &mut out).expect("encodes");
     // Too short for a head.
-    let short = decode_main_value(TEXT, &out[..10]);
+    let short = decode_main_value(text, &out[..10]);
     assert_eq!(short.expect_err("short").code, IC_NDB_ERROR_BLOB_DAMAGED);
     // A size that is not the value's.
     let mut bad_size = out.clone();
     bad_size[0] = bad_size[0].wrapping_add(1);
-    let refused = decode_main_value(TEXT, &bad_size);
+    let refused = decode_main_value(text, &bad_size);
     assert_eq!(refused.expect_err("size").code, IC_NDB_ERROR_BLOB_DAMAGED);
     // Fewer inline bytes than the length calls for.
     let mut cut = out.clone();
     cut.truncate(out.len() - 1);
     let size = (cut.len() - 2) as u16;
     cut[0..2].copy_from_slice(&size.to_le_bytes());
-    let refused = decode_main_value(TEXT, &cut);
+    let refused = decode_main_value(text, &cut);
     assert_eq!(refused.expect_err("cut").code, IC_NDB_ERROR_BLOB_DAMAGED);
   }
 
   #[test]
   fn blob_parts_in_memory_and_on_disk() {
+    let main = main_table();
+    let text = main.attribute("t").expect("t");
+    let sizes = sizes_of(&main, "t");
+    let mut data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_LONGVARCHAR, sizes.part);
+    data.precision = UTF8MB4 << 16;
+    let var = check_parts_table(&main, text, sizes, &parts_table(data))
+      .expect("in memory");
+    assert_eq!(
+      var,
+      PartColumn {
+        data: PartData::Var,
+        size: sizes.part
+      }
+    );
     let mut out = Vec::new();
     let bytes = value_of(744);
-    encode_part(PartData::Var, 2000, &bytes, &mut out);
+    encode_part(var, &bytes, &mut out);
     assert_eq!(out.len(), 746);
-    assert_eq!(decode_part(PartData::Var, 744, &out).expect("var"), &bytes);
-    let refused = decode_part(PartData::Var, 745, &out);
+    assert_eq!(decode_part(var, 744, &out).expect("var"), &bytes);
+    let refused = decode_part(var, 745, &out);
     assert_eq!(refused.expect_err("var").code, IC_NDB_ERROR_BLOB_DAMAGED);
 
-    let text = PartData::FixedText;
-    encode_part(text, 2000, &bytes, &mut out);
-    assert_eq!(out.len(), 2000);
-    assert_eq!(out[1999], 0x20);
-    assert_eq!(decode_part(text, 744, &out).expect("fixed"), &bytes);
+    // On disk: fixed at the part size the parts table's column has.
+    let mut data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_CHAR, sizes.part);
+    data.precision = UTF8MB4 << 16;
+    let fixed = check_parts_table(&main, text, sizes, &parts_table(data))
+      .expect("on disk");
+    assert_eq!(fixed.data, PartData::FixedText);
+    encode_part(fixed, &bytes, &mut out);
+    assert_eq!(out.len(), sizes.part as usize);
+    assert_eq!(out[out.len() - 1], 0x20);
+    assert_eq!(decode_part(fixed, 744, &out).expect("fixed"), &bytes);
+
+    let b = main.attribute("b").expect("b");
+    let b_sizes = sizes_of(&main, "b");
+    let data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_BINARY, b_sizes.part);
+    let binary = check_parts_table(&main, b, b_sizes, &parts_table(data))
+      .expect("binary on disk");
+    encode_part(binary, b"xy", &mut out);
+    assert_eq!(out.len(), b_sizes.part as usize);
+    assert_eq!(out[2], 0x00);
+  }
+
+  #[test]
+  fn blob_parts_table_must_be_as_the_column_says() {
+    let main = main_table();
+    let text = main.attribute("t").expect("t");
+    let sizes = sizes_of(&main, "t");
+    let differs = Err(BlobRefusal::PartsTableDiffers);
+    // Parts of another size than the column's scale.
+    let mut data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_LONGVARCHAR, 4000);
+    data.precision = UTF8MB4 << 16;
+    let parts = parts_table(data);
+    assert_eq!(check_parts_table(&main, text, sizes, &parts), differs);
+    // Bytes where a TEXT keeps characters.
+    let data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_LONGVARBINARY, sizes.part);
+    let parts = parts_table(data);
+    assert_eq!(check_parts_table(&main, text, sizes, &parts), differs);
+    // A key column that is not the main table's.
+    let mut part = col(IC_PARTS_COLUMN_PART, IC_TYPE_UNSIGNED, 1);
+    part.key = true;
+    let mut wide = key("id");
+    wide.type_code = table_props::IC_TYPE_BIGINT;
+    let mut data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_LONGVARCHAR, sizes.part);
+    data.precision = UTF8MB4 << 16;
+    let pkid = col(IC_PARTS_COLUMN_PKID, IC_TYPE_UNSIGNED, 1);
+    let parts = described("db/def/x", &[wide, part, pkid, data], &[]);
+    assert_eq!(check_parts_table(&main, text, sizes, &parts), differs);
+    // A column too many.
+    let mut part = col(IC_PARTS_COLUMN_PART, IC_TYPE_UNSIGNED, 1);
+    part.key = true;
+    let mut data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_LONGVARCHAR, sizes.part);
+    data.precision = UTF8MB4 << 16;
+    let pkid = col(IC_PARTS_COLUMN_PKID, IC_TYPE_UNSIGNED, 1);
+    let extra = col("NDB$DIST", IC_TYPE_UNSIGNED, 1);
+    let parts =
+      described("db/def/x", &[key("id"), extra, part, pkid, data], &[]);
+    assert_eq!(check_parts_table(&main, text, sizes, &parts), differs);
+  }
+
+  #[test]
+  fn blob_tables_and_columns_left_out() {
+    assert_eq!(table_refusal(&main_table()), None);
+    let cols = [key("id"), blob_col("t", true, 256, 2000)];
+    let user = described("db/def/u", &cols, &[(IC_TP_FRAGMENT_KIND, 8)]);
+    assert_eq!(table_refusal(&user), Some(BlobRefusal::NotHashMapped));
+    let ttl = described("db/def/l", &cols, &[(IC_TP_TTL_SECONDS, 60)]);
+    assert_eq!(table_refusal(&ttl), Some(BlobRefusal::TimeToLive));
+    let ring = described("db/def/r", &cols, &[(IC_TP_RING_SIZE, 1000)]);
+    assert_eq!(table_refusal(&ring), Some(BlobRefusal::RingBuffer));
+    let mut striped = blob_col("s", false, 256, 2000);
+    striped.length = 4;
+    let main = described("db/def/s", &[key("id"), striped], &[]);
+    let column = main.attribute("s").expect("s");
+    assert_eq!(column_sizes(column), Err(BlobRefusal::Striped));
+  }
+
+  /// The main table bound as a table is: `t` with its parts table, `b`
+  /// without the one it calls for, `tiny` with none.
+  fn bound_main_table() -> Arc<TableDef> {
+    let main = main_table();
+    let t = main.attribute("t").expect("t");
+    let sizes = column_sizes(t).expect("t's sizes");
+    let mut data = col(IC_PARTS_COLUMN_DATA, IC_TYPE_LONGVARCHAR, sizes.part);
+    data.precision = UTF8MB4 << 16;
+    let parts = parts_table(data);
+    let part_column =
+      check_parts_table(&main, t, sizes, &parts).expect("the parts table");
+    let parts = Arc::new(TableDef::new(parts, None));
+    let tiny = main.attribute("tiny").expect("tiny");
+    let b = main.attribute("b").expect("b");
+    let columns = vec![
+      BlobColumn::usable(t.column_id, sizes, Some((parts, part_column))),
+      BlobColumn::refused(
+        b.column_id,
+        BlobSizes::of(b),
+        BlobRefusal::NoPartsTable,
+      ),
+      BlobColumn::usable(
+        tiny.column_id,
+        column_sizes(tiny).expect("tiny's sizes"),
+        None,
+      ),
+    ];
+    Arc::new(TableDef::new(main, None).with_blob_columns(columns))
+  }
+
+  #[test]
+  fn blob_values_are_kept_apart_from_the_row() {
+    let def = bound_main_table();
+    let blob = def.blob_column(1).expect("t");
+    assert!(blob.is_usable());
+    assert_eq!(blob.part_column().expect("t's parts").size, 2000);
+    assert!(!def.blob_column(2).expect("b").is_usable());
+    // id, t, tiny: positions 0, 1 and 2.
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let mut values = BlobValues::new(&rec);
+    assert_eq!(values.len(), 2);
+    assert!(values.fits(&rec));
+    let no_such = values.blob(0).expect_err("not a blob");
+    assert_eq!(no_such.code, err::IC_ERROR_NO_SUCH_FIELD);
+    assert_eq!(values.blob(1).expect("t"), None);
+    let text = value_of(5000);
+    values.set_blob(1, &text).expect("set t");
+    assert_eq!(values.blob(1).expect("t"), Some(&text[..]));
+    // tiny has no parts table: no more than its inline size.
+    let inline = def.blob_column(3).expect("tiny").sizes().expect("sizes");
+    let too_long = value_of(inline.inline as usize + 1);
+    let refused = values.set_blob(2, &too_long).expect_err("too long");
+    assert_eq!(refused.code, IC_NDB_ERROR_BLOB_TOO_LONG);
+    values.set_blob(2, &too_long[1..]).expect("fits");
+    values.set_blob_null(1).expect("NULL");
+    assert_eq!(values.blob(1).expect("t"), None);
+    // The buffer still holds the last value set.
+    let buf = values.blob_buf_mut(1).expect("t's buffer");
+    assert_eq!(buf.len(), text.len());
+    buf.clear();
+    buf.extend_from_slice(b"in place");
+    assert_eq!(values.blob(1).expect("t"), Some(&b"in place"[..]));
+    values.clear();
+    assert_eq!(values.blob(1).expect("t"), None);
+    assert_eq!(values.blob(2).expect("tiny"), None);
+    assert!(values.blob_buf_mut(1).expect("t").capacity() >= 5000);
+    // Made for another set of blob fields.
+    let other = Record::default_for(&def, Some(&[0, 1])).expect("record");
+    assert!(!values.fits(&other));
+    assert!(BlobValues::new(&other).fits(&other));
+  }
+
+  #[test]
+  fn blob_parts_table_name() {
+    assert_eq!(parts_table_name("ic_it", 13, 1), "ic_it/def/NDB$BLOB_13_1");
   }
 
   #[test]

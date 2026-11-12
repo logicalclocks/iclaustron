@@ -137,6 +137,9 @@ pub fn put_value(
     Some(attr) => attr,
     None => return Err("No such column in the table".to_string()),
   };
+  if field.is_blob() {
+    return Err(format!("{} is a blob, not kept in the row", attr.name));
+  }
   if text == IC_NULL_TEXT {
     if let Err(e) = rec.set_null(row, position, true) {
       return Err(format!("{} cannot be NULL ({})", attr.name, e.code));
@@ -156,6 +159,10 @@ pub fn value_text(rec: &Record, position: u32, row: &[u8]) -> String {
     Some(field) => field,
     None => return String::new(),
   };
+  // A blob's value is not in the row.
+  if field.is_blob() {
+    return String::new();
+  }
   if rec.is_null(row, position) {
     return IC_NULL_TEXT.to_string();
   }

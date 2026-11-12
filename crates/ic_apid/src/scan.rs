@@ -810,7 +810,8 @@ pub(crate) fn check_scan_record(
   if !over {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  Ok(())
+  // A scan reads no blob column (chapter 06, phase 12).
+  rec.refuse_blob_fields()
 }
 
 /// The rows and bytes a receiver's batch may hold: the run's own, or

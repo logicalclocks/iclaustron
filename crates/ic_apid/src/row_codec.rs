@@ -363,6 +363,10 @@ pub(crate) fn field_value<'a>(
     Some(found) => found,
     None => return Err(IcError::new(err::IC_ERROR_KEY_RECORD)),
   };
+  // A blob's value is not in the row (`blob::BlobValues`).
+  if field.is_blob() {
+    return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
+  }
   let start = field.offset() as usize;
   let len = value_len(attr, field, &row[start..])?;
   Ok(Some(&row[start..start + len]))

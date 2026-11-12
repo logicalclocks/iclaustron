@@ -2505,7 +2505,11 @@ at the part's offset: no row is allocated for a part.
   table neither partitioned by the user nor with a TTL or ring-buffer
   option. Naming another in a record is refused, and a delete on its
   table keeps 7153.
-- A blob field in a record takes no room in the row, only its null bit.
+- A blob field in a record takes no room in the row, and has no null
+  bit (decided in 12.2, ours to choose): its value, NULL included, is
+  its query's, so that a query, an executor's `KeyOp` and `BlobValues`
+  take the same calls, and a value and its NULL cannot disagree. The
+  offset and null bit a C program gives it are not used.
   `Record::default_for(&table, None)` still leaves blob columns out, so
   a program written before is unchanged and no slower; naming the field
   opts in. Records naming blob fields are taken by key queries, by
@@ -2581,6 +2585,43 @@ Exit: unit tests of the head and of the part arithmetic at every
 boundary; a table with TEXT, JSON, LONGBLOB, TINYBLOB and a BLOB stored
 on disk binds with its parts tables and the sizes MySQL gave them; the
 columns that are not usable are refused by name.
+
+Done 2026-11-12, every test passing:
+
+- **Sizes from the dictionary only.** The inline size, part size and
+  stripe are the main column's precision, scale and length; a part's
+  size is the parts table's data column's, which must equal the main
+  column's part size. No size is assumed anywhere in the code; MySQL's
+  sizes appear only in the tests, as what a MySQL server is expected to
+  have given.
+- **Binding** fetches each blob column's parts table with its table and
+  checks it: the main key's columns copied in order, then `NDB$PART`
+  as a key, `NDB$PKID` and `NDB$DATA` of the column's kind and the part
+  size. A parts table is bound as a table of its own, with its hash map
+  and its key's collations, and is held by its table's object, not kept
+  in the cache under its name: a notice naming it lets go of its table,
+  and letting go of a table lets go of its parts tables.
+- **Not usable**, and refused when a record names it, with the reason
+  in the log: the first version, a stripe, a table not placed by a hash
+  map (partitioned by the user), with a lifetime or a ring buffer, a
+  parts table missing or not as the column says. The rest of such a
+  table binds as before.
+- **Records** may name a usable blob field; every operation refuses
+  such a record until 12.3, with `IC_ERROR_NOT_SUPPORTED`, and scans,
+  after-reads, key records, the helpers there are and the text helpers
+  always will. Deletes keep 7153 until 12.4.
+- **`BlobValues`**: a record's blob values by position, NULL until set,
+  a value too long for a column without parts refused with 4266 when
+  set, a buffer to fill in place, cleared with its capacity kept.
+- Tests: the unit tests `blob_*` (sizes from a description, the head and
+  the arithmetic at every boundary, parts in memory and on disk, a parts
+  table that differs, the tables and columns left out, `BlobValues`),
+  two in the cache (a parts table let go of with its table) and two in
+  records; the integration group `blob`, whose two tests bind TEXT,
+  JSON, LONGBLOB, MEDIUMBLOB and TINYBLOB, a BLOB and a TEXT on disk and
+  a TEXT under a key of two columns, and refuse a TEXT in a table
+  partitioned by range by name: such a table is described as not
+  placed by a hash map, as expected.
 
 ### 12.3 The driver, and inserts on a connection (1.5 weeks)
 

@@ -135,8 +135,14 @@ ret = ic_record_create(table, specs, 3, sizeof(struct my_row), &rec);
   attribute order, each on a 4-byte boundary, eight-byte integers and
   doubles on eight, the row rounded to eight bytes. Without ids it takes
   every field but the blob columns.
-- A record naming a blob column is refused (`IC_ERROR_NOT_SUPPORTED`);
-  blob columns wait for phase 12, whose planned API is in chapter 06.
+- A blob field takes no room in the row and has no null bit: its
+  offset and null bit are not used, and its value, NULL included, is
+  kept apart, in a `blob::BlobValues` (phase 12; chapter 06). Only a
+  blob column the table was bound with as usable may be named
+  (`TableDef::blob_column`, `BlobColumn::is_usable`); another is refused
+  (`IC_ERROR_NOT_SUPPORTED`). Until phase 12's key operations take them
+  (12.3), every operation refuses a record naming a blob field, as
+  scans, takeovers and key records always will.
 - A record over the key fields serves as a key record; one covering
   every key field serves as key and attribute record alike.
 - `text_row::put_value` and `value_text` put a value given as text into

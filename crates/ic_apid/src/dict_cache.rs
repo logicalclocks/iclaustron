@@ -61,6 +61,15 @@
 //! **Hash maps are shared by id and version.** A hash map never
 //! changes; a table that is reorganised names a new one.
 //!
+//! **A table's parts tables are bound with it** (chapter 06, phase 12):
+//! each blob column's, `<database>/def/NDB$BLOB_<table id>_<column id>`,
+//! is fetched when the table is, checked against the column, and kept
+//! in the table's object, not in the cache under its own name. So both
+//! live, and are let go of, together: a notice naming a parts table
+//! lets go of the table that holds it. A notice for a parts table that
+//! arrives while its table is being fetched is not kept; the table's
+//! own notice, which an alteration of it also sends, is.
+//!
 //! The lock is the dictionary level, the lowest. It is never held while
 //! asking the dictionary. The receive thread takes it for a notice and
 //! when the last link goes, holding nothing else.
@@ -86,6 +95,9 @@ use ic_signals::table_props::TableProps;
 
 use crate::apid_conn::ApidConnection;
 use crate::auto_increment::TableCounter;
+use crate::blob;
+use crate::blob::BlobColumn;
+use crate::blob::BlobSizes;
 use crate::collation_client;
 use crate::collation_map::CollationMap;
 use crate::dict_client;
@@ -107,6 +119,9 @@ pub struct TableDef {
   attr_index: Vec<u32>,
   /// Whether any column is a blob, asked on every delete.
   has_blob: bool,
+  /// Each blob column, with its parts table or why it cannot be used,
+  /// in attribute order.
+  blobs: Vec<BlobColumn>,
   /// By attribute place, the collation each character column a key is
   /// hashed through is put through, where one is known: a table's
   /// distribution key columns, an index's own key columns.
@@ -159,6 +174,7 @@ impl TableDef {
       valid: AtomicBool::new(true),
       attr_index,
       has_blob,
+      blobs: Vec::new(),
       collations: Vec::new(),
       encodings: Vec::new(),
       counter,
@@ -180,6 +196,42 @@ impl TableDef {
   /// (chapter 06 §8.6).
   pub fn collation_at(&self, place: usize) -> Option<&Arc<CollationMap>> {
     self.collations.get(place)?.as_ref()
+  }
+
+  /// The table with its blob columns bound (chapter 06, phase 12).
+  pub(crate) fn with_blob_columns(
+    mut self,
+    blobs: Vec<BlobColumn>,
+  ) -> TableDef {
+    self.blobs = blobs;
+    self
+  }
+
+  /// A blob column, by its field id, with its sizes and its parts
+  /// table, or why it cannot be used; `None` for a field that is not a
+  /// blob.
+  pub fn blob_column(&self, field_id: u32) -> Option<&BlobColumn> {
+    self.blobs.iter().find(|blob| blob.column_id() == field_id)
+  }
+
+  /// Every blob column, in attribute order.
+  pub fn blob_columns(&self) -> &[BlobColumn] {
+    &self.blobs
+  }
+
+  /// True if one of the table's blob columns has this version of this
+  /// table as its parts table.
+  fn holds_parts_table(&self, table_id: u32, table_version: u32) -> bool {
+    for blob in &self.blobs {
+      if let Some(parts) = blob.parts_table() {
+        if parts.table_id() == table_id
+          && parts.table_version() == table_version
+        {
+          return true;
+        }
+      }
+    }
+    false
   }
 
   /// The table with how the text of its character columns is converted.
@@ -257,8 +309,14 @@ impl TableDef {
     self.valid.load(Ordering::Acquire)
   }
 
+  /// No longer valid, nor are its parts tables.
   fn invalidate(&self) {
     self.valid.store(false, Ordering::Release);
+    for blob in &self.blobs {
+      if let Some(parts) = blob.parts_table() {
+        parts.invalidate();
+      }
+    }
   }
 }
 
@@ -582,7 +640,25 @@ impl DictCache {
       }
     }
     // Even if the table itself had already gone, its indexes may not.
-    dropped + let_go_of_indexes(&mut state, table_id, table_version)
+    dropped += let_go_of_indexes(&mut state, table_id, table_version);
+    // A parts table lives with the table holding it.
+    let mut holders: Vec<(String, u32, u32)> = Vec::new();
+    for (entry_name, entry) in &state.entries {
+      if let Entry::Table(def) = entry {
+        if def.holds_parts_table(table_id, table_version) {
+          let held = (def.table_id(), def.table_version());
+          holders.push((entry_name.clone(), held.0, held.1));
+        }
+      }
+    }
+    for (holder, id, version) in &holders {
+      if let Some(entry) = state.entries.remove(holder) {
+        entry.invalidate();
+        dropped += 1;
+      }
+      dropped += let_go_of_indexes(&mut state, *id, *version);
+    }
+    dropped
   }
 
   /// Let go of everything but what is being fetched. Returns how many
@@ -736,11 +812,96 @@ fn fetch_table(
   let hash_map = hash_map_of(cache, conn, &info)?;
   let collations = key_collations(cache, conn, &info, false);
   let encodings = text_encodings(cache, conn, &info);
+  let blobs = blob_columns(cache, conn, &info)?;
   Ok(
     TableDef::new(info, hash_map)
       .with_collations(collations)
-      .with_text_encodings(encodings),
+      .with_text_encodings(encodings)
+      .with_blob_columns(blobs),
   )
+}
+
+/// Each blob column of a table, in attribute order: its sizes from its
+/// description, and its parts table, fetched, checked against the
+/// column and bound as a table of its own; or why it cannot be used
+/// (chapter 06, phase 12, "Dictionary and records"). A column that
+/// cannot be used is refused when a record names it, and says why in
+/// the log; it does not stop the table being bound. A parts table that
+/// cannot be fetched for another reason than its absence fails the
+/// bind, as the table's own would.
+fn blob_columns(
+  cache: &DictCache,
+  conn: &mut ApidConnection,
+  info: &TableProps,
+) -> Result<Vec<BlobColumn>, IcError> {
+  let mut out: Vec<BlobColumn> = Vec::new();
+  let table_refusal = blob::table_refusal(info);
+  for attr in &info.attributes {
+    if !attr.is_blob() {
+      continue;
+    }
+    let column = match (blob::column_sizes(attr), table_refusal) {
+      (Ok(sizes), None) => blob_column(cache, conn, info, attr, sizes)?,
+      (Ok(sizes), Some(why)) => {
+        BlobColumn::refused(attr.column_id, Some(sizes), why)
+      }
+      (Err(why), _) => {
+        BlobColumn::refused(attr.column_id, BlobSizes::of(attr), why)
+      }
+    };
+    if let Some(why) = column.refusal() {
+      ic_port::debug_print!(
+        IC_NDB_MESSAGE_LEVEL,
+        "Blob column {} of {} cannot be used: {}",
+        attr.name,
+        info.name,
+        why.text()
+      );
+    }
+    out.push(column);
+  }
+  Ok(out)
+}
+
+/// A blob column of these sizes, which the table's options and the
+/// column's description allow, with its parts table if it has parts,
+/// or why its parts table cannot be used.
+fn blob_column(
+  cache: &DictCache,
+  conn: &mut ApidConnection,
+  info: &TableProps,
+  attr: &ColumnProps,
+  sizes: BlobSizes,
+) -> Result<BlobColumn, IcError> {
+  if !sizes.has_parts() {
+    return Ok(BlobColumn::usable(attr.column_id, sizes, None));
+  }
+  let name =
+    blob::parts_table_name(info.database(), info.table_id, attr.column_id);
+  let found = match dict_client::get_table_named(conn, &name) {
+    Ok(parts) => blob::check_parts_table(info, attr, sizes, &parts)
+      .map(|part_column| (parts, part_column)),
+    Err(e) if e.code == err::IC_ERROR_NO_SUCH_TABLE => {
+      Err(blob::BlobRefusal::NoPartsTable)
+    }
+    Err(e) => return Err(e),
+  };
+  let (parts, part_column) = match found {
+    Ok(found) => found,
+    Err(why) => {
+      return Ok(BlobColumn::refused(attr.column_id, Some(sizes), why))
+    }
+  };
+  // Placed, and its key hashed, by its own description, as an index's
+  // own table is.
+  let hash_map = hash_map_of(cache, conn, &parts)?;
+  let collations = key_collations(cache, conn, &parts, false);
+  let parts = TableDef::new(parts, hash_map).with_collations(collations);
+  Ok(BlobColumn::usable(
+    attr.column_id,
+    sizes,
+    Some((Arc::new(parts), part_column)),
+  ))
 }
 
 /// By attribute place, the collations of the character columns a key
@@ -1043,6 +1204,61 @@ mod tests {
     assert_eq!(cache.table_changed("db/def/t1", 13, 1), 0);
     assert!(!def.is_valid());
     assert!(matches!(cache.lookup("db/def/t1"), Lookup::Fetch));
+  }
+
+  /// The table `db/def/t1`, id 13, with one blob column whose parts
+  /// table is id 14; and that parts table.
+  fn table_with_parts(version: u32) -> (TableDef, Arc<TableDef>) {
+    let parts = Arc::new(table("db/def/NDB$BLOB_13_1", 14, version));
+    // Cache behaviour only: the sizes are not looked at.
+    let sizes = BlobSizes {
+      inline: 1,
+      part: 1,
+      stripe: 0,
+    };
+    let part_column = blob::PartColumn {
+      data: blob::PartData::Var,
+      size: 1,
+    };
+    let column =
+      BlobColumn::usable(1, sizes, Some((Arc::clone(&parts), part_column)));
+    let main = table("db/def/t1", 13, version).with_blob_columns(vec![column]);
+    (main, parts)
+  }
+
+  #[test]
+  fn a_notice_for_a_parts_table_lets_go_of_its_table() {
+    let cache = DictCache::new();
+    let (main, parts) = table_with_parts(1);
+    let def = put(&cache, main);
+    let blob = def.blob_column(1).expect("the blob column");
+    assert!(Arc::ptr_eq(blob.parts_table().expect("parts"), &parts));
+    assert!(def.blob_column(0).is_none());
+    // Another version of the parts table is passed over.
+    assert_eq!(cache.table_changed("db/def/NDB$BLOB_13_1", 14, 2), 0);
+    assert!(def.is_valid() && parts.is_valid());
+    assert_eq!(cache.table_changed("db/def/NDB$BLOB_13_1", 14, 1), 1);
+    assert!(!def.is_valid());
+    assert!(!parts.is_valid());
+    assert!(matches!(cache.lookup("db/def/t1"), Lookup::Fetch));
+  }
+
+  #[test]
+  fn a_table_let_go_of_takes_its_parts_tables_with_it() {
+    let cache = DictCache::new();
+    let (main, parts) = table_with_parts(1);
+    let def = put(&cache, main);
+    assert_eq!(cache.table_changed("db/def/t1", 13, 1), 1);
+    assert!(!parts.is_valid());
+    let (main, parts) = table_with_parts(2);
+    let def2 = put(&cache, main);
+    cache.forget_table(&def2);
+    assert!(!parts.is_valid());
+    let (main, parts) = table_with_parts(3);
+    put(&cache, main);
+    assert_eq!(cache.invalidate_all(), 1);
+    assert!(!parts.is_valid());
+    assert!(!def.is_valid());
   }
 
   #[test]

@@ -539,7 +539,8 @@ pub struct IcFieldInfo {
   pub primary_key: bool,
   /// Part of the distribution key.
   pub distribution_key: bool,
-  /// A BLOB, TEXT or other blob column, which records leave out.
+  /// A BLOB, TEXT or other blob column, which a default record leaves
+  /// out unless it is named.
   pub blob: bool,
   /// The table's AUTO_INCREMENT column, a hidden key included.
   pub auto_increment: bool,
@@ -1848,8 +1849,12 @@ pub unsafe extern "C" fn ic_index_def_table(
 /// `IC_ERROR_DUPLICATE_FIELD_IDS` for a field named twice;
 /// `IC_ERROR_TOO_MANY_FIELDS`; `IC_ERROR_RECORD_LAYOUT` when values or null
 /// bits overlap or lie outside the row; `IC_ERROR_NO_NULL_BIT` for a nullable
-/// field given no null bit; `IC_ERROR_NOT_SUPPORTED` for a blob column. The
-/// record is the caller's, freed with `ic_record_free`; any thread may use it.
+/// field given no null bit; `IC_ERROR_NOT_SUPPORTED` for a blob column
+/// that cannot be read or written. A blob field takes no room in the row
+/// and has no null bit: its offset and null bit are not used, and its
+/// value is kept apart; an operation that takes no blob values refuses a
+/// record naming one. The record is the caller's, freed with
+/// `ic_record_free`; any thread may use it.
 ///
 /// # Safety
 ///
@@ -1900,7 +1905,8 @@ pub unsafe extern "C" fn ic_record_create(
 
 /// A record laid out by the library over the fields named, or over
 /// every field but the blob columns when `field_ids` is NULL or `count`
-/// is 0; `ic_record_field` tells where each field went.
+/// is 0: a blob column is in it only when named, and then takes no room;
+/// `ic_record_field` tells where each field went.
 ///
 /// Errors: as `ic_record_create`. The record is the caller's, freed with
 /// `ic_record_free`; any thread may use it.

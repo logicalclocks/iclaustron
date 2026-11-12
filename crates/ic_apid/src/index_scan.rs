@@ -223,6 +223,7 @@ impl IndexShape {
     if !index.is_ordered() {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
+    key_rec.refuse_blob_fields()?;
     let table = index.table();
     check_scan_record(table, key_rec)?;
     let mut columns: Vec<BoundColumn> = Vec::new();

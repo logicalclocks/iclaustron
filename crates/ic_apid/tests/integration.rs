@@ -50,9 +50,11 @@
 //! scans and key reads by drawn conditions and compares the rows with
 //! what MySQL selects, and `assign`, which runs drawn conditional
 //! updates and deletes on one of twin tables while MySQL runs them on
-//! the other, and compares the twins (chapter 06 §9.1). The `big_rows`
-//! group makes a log file group and a tablespace if the cluster has
-//! none, and keeps them.
+//! the other, and compares the twins (chapter 06 §9.1); `blob`, which
+//! binds tables with every kind of blob column a MySQL server makes,
+//! with their parts tables (chapter 06, phase 12). The `big_rows` and
+//! `blob` groups make a log file group and a tablespace if the cluster
+//! has none, and keep them.
 //! Each test is its own program against the cluster, as an application
 //! would be: it takes an API node id, binds its tables, does its work
 //! through the public API and lets go.
@@ -71,6 +73,11 @@ use ic_apid::apid_conn::ApidConnection;
 use ic_apid::apid_conn::IC_COORD_ALLOC_WAIT_MS;
 use ic_apid::apid_global::ApidGlobal;
 use ic_apid::apid_global::GlobalOptions;
+use ic_apid::blob;
+use ic_apid::blob::BlobColumn;
+use ic_apid::blob::BlobRefusal;
+use ic_apid::blob::PartColumn;
+use ic_apid::blob::PartData;
 use ic_apid::collation_client;
 use ic_apid::collation_client::Collation;
 use ic_apid::dict_cache::IndexDef;
@@ -2671,6 +2678,175 @@ fn blob_guard_leaves_the_text_alone_on_insert_update_and_write() {
   // MySQL deletes the rows, parts and all.
   mysql(&format!("DELETE FROM {}.bt", IC_IT_DB));
   assert!(read_by_id(&mut conn, &t, 20).is_none());
+}
+
+// ---- blob (chapter 06, phase 12) ----
+
+/// The tables of the `blob` group, made afresh, with the tablespace a
+/// disk column needs: every kind of blob column a MySQL server makes,
+/// in memory and on disk, one under a key of two columns, and one in a
+/// table partitioned by the user, which phase 12 leaves out. `None`
+/// without a MySQL client.
+fn setup_blob_kinds() -> Option<()> {
+  setup_tablespace()?;
+  let sql = format!(
+    "CREATE DATABASE IF NOT EXISTS {db};
+     DROP TABLE IF EXISTS {db}.bl_kinds;
+     CREATE TABLE {db}.bl_kinds (
+       id INT NOT NULL PRIMARY KEY,
+       t TEXT, j JSON, b LONGBLOB, m MEDIUMBLOB, tiny TINYBLOB
+     ) ENGINE=NDB;
+     DROP TABLE IF EXISTS {db}.bl_disk;
+     CREATE TABLE {db}.bl_disk (
+       id INT NOT NULL PRIMARY KEY,
+       b BLOB STORAGE DISK,
+       t TEXT STORAGE DISK
+     ) TABLESPACE {space} ENGINE=NDB;
+     DROP TABLE IF EXISTS {db}.bl_key2;
+     CREATE TABLE {db}.bl_key2 (
+       a INT NOT NULL,
+       s VARCHAR(10) NOT NULL,
+       t TEXT,
+       PRIMARY KEY (a, s)
+     ) ENGINE=NDB;
+     DROP TABLE IF EXISTS {db}.bl_ranged;
+     CREATE TABLE {db}.bl_ranged (
+       id INT NOT NULL PRIMARY KEY,
+       t TEXT
+     ) ENGINE=NDB
+       PARTITION BY RANGE (id) (
+         PARTITION p0 VALUES LESS THAN (100),
+         PARTITION p1 VALUES LESS THAN MAXVALUE
+       );",
+    db = IC_IT_DB,
+    space = IC_IT_TABLESPACE
+  );
+  mysql(&sql)?;
+  Some(())
+}
+
+/// A blob column of a bound table, by its name.
+fn blob_column_of<'a>(t: &'a Table, column: &str) -> &'a BlobColumn {
+  let id = t.def.field_id(column).expect("the column");
+  t.def.blob_column(id).expect("a blob column")
+}
+
+#[test]
+fn blob_parts_tables_are_bound_with_the_sizes_mysql_gave() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  // (column, inline size, part size), as a MySQL server sizes each
+  // type (chapter 05 §6.10); the bound table read them from the
+  // dictionary.
+  let kinds: [(&str, u32, u32); 5] = [
+    ("t", 256, 2000),
+    ("j", 4000, 8100),
+    ("b", 256, 13948),
+    ("m", 256, 4000),
+    ("tiny", 256, 0),
+  ];
+  for (column, inline, part) in kinds {
+    let blob = blob_column_of(&t, column);
+    assert!(blob.is_usable(), "{} can be used: {:?}", column, blob);
+    let sizes = blob.sizes().expect("its sizes");
+    assert_eq!(
+      (sizes.inline, sizes.part, sizes.stripe),
+      (inline, part, 0),
+      "{}'s sizes",
+      column
+    );
+    if part == 0 {
+      assert!(blob.parts_table().is_none(), "{} has no parts", column);
+      continue;
+    }
+    let parts = blob.parts_table().expect("its parts table");
+    let name =
+      blob::parts_table_name(IC_IT_DB, t.def.table_id(), blob.column_id());
+    assert_eq!(parts.name(), name);
+    assert_ne!(parts.table_id(), t.def.table_id());
+    // The key copied, the part number, the part key id, the bytes.
+    assert_eq!(parts.num_fields(), 4, "{}'s parts table", column);
+    let data = PartColumn {
+      data: PartData::Var,
+      size: part,
+    };
+    assert_eq!(blob.part_column(), Some(data), "{}'s parts", column);
+  }
+
+  // On disk, each part fixed at the part size and padded.
+  let d = bind(&mut conn, "bl_disk");
+  for (column, kind) in
+    [("b", PartData::FixedBinary), ("t", PartData::FixedText)]
+  {
+    let blob = blob_column_of(&d, column);
+    assert!(
+      blob.is_usable(),
+      "{} on disk can be used: {:?}",
+      column,
+      blob
+    );
+    let part = blob.sizes().expect("its sizes").part;
+    let data = PartColumn {
+      data: kind,
+      size: part,
+    };
+    assert_eq!(blob.part_column(), Some(data), "{} on disk", column);
+  }
+
+  // Under a key of two columns, both copied into the parts table.
+  let k = bind(&mut conn, "bl_key2");
+  let blob = blob_column_of(&k, "t");
+  assert!(blob.is_usable(), "{:?}", blob);
+  let parts = blob.parts_table().expect("its parts table");
+  assert_eq!(parts.num_fields(), 5);
+
+  // A record may name a blob column; until phase 12 reads and writes
+  // them (12.3), every operation refuses it, as a scan always will.
+  let id = t.def.field_id("id").expect("id");
+  let text = t.def.field_id("t").expect("t");
+  let rec = Record::default_for(&t.def, Some(&[id, text])).expect("a record");
+  assert!(rec.has_blob_fields());
+  let key_rec = Record::default_for(&t.def, Some(&[id])).expect("its key");
+  match conn.create_query(&t.def, &key_rec, &rec) {
+    Ok(_) => panic!("a query naming a blob field was taken"),
+    Err(e) => assert_eq!(e.code, err::IC_ERROR_NOT_SUPPORTED),
+  }
+  match conn.create_scan(&t.def, &rec) {
+    Ok(_) => panic!("a scan naming a blob field was taken"),
+    Err(e) => assert_eq!(e.code, err::IC_ERROR_NOT_SUPPORTED),
+  }
+}
+
+#[test]
+fn blob_columns_that_cannot_be_used_are_refused_by_name() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let r = bind(&mut conn, "bl_ranged");
+  let blob = blob_column_of(&r, "t");
+  assert_eq!(blob.refusal(), Some(BlobRefusal::NotHashMapped));
+  assert!(blob.parts_table().is_none());
+  let id = r.def.field_id("id").expect("id");
+  let text = r.def.field_id("t").expect("t");
+  match Record::default_for(&r.def, Some(&[id, text])) {
+    Ok(_) => panic!("a record naming t was made"),
+    Err(e) => assert_eq!(e.code, err::IC_ERROR_NOT_SUPPORTED),
+  }
+  // The rest of the table is used as before.
+  assert!(r.rec.position_of(text).is_none());
+  assert!(r.rec.position_of(id).is_some());
 }
 
 // ---- timeout ----

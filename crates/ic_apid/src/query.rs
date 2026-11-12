@@ -248,7 +248,9 @@ pub(crate) fn over_table(rec: &Record, table: &TableDef) -> bool {
 
 /// Refuse records that do not fit a key operation over `table`: both
 /// must be over this version of it, and the key record must hold every
-/// primary key column.
+/// primary key column. Neither may name a blob field: a key record
+/// never, an attribute record not until phase 12 reads and writes them
+/// (chapter 06, 12.3).
 pub(crate) fn check_records(
   table: &TableDef,
   key_rec: &Record,
@@ -260,7 +262,8 @@ pub(crate) fn check_records(
   if !fits {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  Ok(())
+  key_rec.refuse_blob_fields()?;
+  attr_rec.refuse_blob_fields()
 }
 
 /// As [`check_records`], for an operation through a unique index: the
@@ -279,7 +282,8 @@ pub(crate) fn check_unique_records(
   if !over_table(key_rec, table) || !over_table(attr_rec, table) {
     return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
   }
-  Ok(())
+  key_rec.refuse_blob_fields()?;
+  attr_rec.refuse_blob_fields()
 }
 
 /// One key operation, defined once and used many times
@@ -551,6 +555,7 @@ impl ApidQuery {
         if !over_table(rec, &self.table) {
           return Err(IcError::new(err::IC_ERROR_KEY_RECORD));
         }
+        rec.refuse_blob_fields()?;
         self.after_row = vec![0; rec.row_size() as usize];
         self.after_rec = Some(rec.clone());
       }
