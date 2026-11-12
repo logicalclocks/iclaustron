@@ -429,6 +429,8 @@ mod tests {
   use std::net::TcpListener;
   use std::net::TcpStream;
   use std::os::unix::io::AsRawFd;
+  use std::time::Duration;
+  use std::time::Instant;
 
   /// A connected pair of sockets over the loopback interface.
   fn socket_pair() -> (TcpStream, TcpStream) {
@@ -498,8 +500,11 @@ mod tests {
     client_a.flush().expect("flush");
     let mut seen_a = false;
     let mut seen_b = false;
-    let mut spins = 0;
-    while (!seen_a || !seen_b) && spins < 100 {
+    // Bounded by time, not by checks: B is never drained, so it stays
+    // ready and every check returns at once, often before A's bytes
+    // have crossed the loopback.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (!seen_a || !seen_b) && Instant::now() < deadline {
       set.check(50).expect("check");
       while let Some(conn) = set.next_connection() {
         if conn.user_obj == 1 {
@@ -509,7 +514,6 @@ mod tests {
           seen_b = true;
         }
       }
-      spins += 1;
     }
     assert!(seen_a);
     assert!(seen_b);
