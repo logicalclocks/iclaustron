@@ -544,7 +544,7 @@ while !conn.scan_done(scan) {
 ```c
 ret = ic_apid_scan_create(conn, table, rec, &scan);
 ic_scan_args_init(&args, sizeof args);
-args.lock = IC_SCAN_LOCK_COMMITTED;   /* COMMITTED, SHARED or EXCLUSIVE */
+args.lock = IC_SCAN_LOCK_COMMITTED;   /* or IC_SCAN_LOCK_SHARED, _EXCLUSIVE */
 ret = ic_apid_conn_start_scan(conn, scan, &args);
 ret = ic_apid_conn_send(conn, false); /* the request goes with the next send */
 while (!ic_apid_scan_is_done(conn, scan)) {
