@@ -2642,8 +2642,8 @@ right; many TEXT rows inserted in one transaction in one round, seen in
 a capture.
 
 Done 2026-11-12, every test passing; the hundred rows' one round is
-counted by the test, and the capture of it is still the author's to
-take:
+counted by the test, and was seen in a capture on 2026-11-13, inline
+and with parts (chapter 05 §6.10, "Our client's rounds, seen"):
 
 - **The planner** (`blob.rs`), pure: a run's first round, and each
   next, part by part and value by value while the round's part data
@@ -2690,7 +2690,8 @@ take:
   round, inserts that ignore errors with the row there and not, rounds
   in a transaction left open, committed and rolled back, and a TEXT
   under a key of two columns; each read back by MySQL by its length
-  and CRC-32. The capture of the hundred rows is the author's to take.
+  and CRC-32. The hundred rows' one round was seen in a capture on
+  2026-11-13 (`tools/blob_rounds_capture.sh`).
 - First run (2026-11-12): every value read back whole, 10 MiB too, but
   a TINYBLOB of 256 bytes, its column's inline size, which MySQL read
   as its first 255: MySQL's type holds 255. The test now writes 255
@@ -2770,7 +2771,10 @@ of the same rows, with values that check themselves, give no torn value
 and no 266; a committed read of an inline value takes one round, and
 one with `blob_lock_first` two, seen in a capture.
 
-Done 2026-11-12, every test passing, the capture still to be taken:
+Done 2026-11-12, every test passing; the rounds were seen in a
+capture on 2026-11-13 (chapter 05 §6.10, "Our client's rounds, seen"):
+a committed read of an inline value in one round, one with the lock
+first, and a locked one, in two, the second the commit alone:
 
 - **The reads** of chapter 06's table: a locked read's row with its
   lock, then its parts; a committed read's row committed, all for an
@@ -2837,7 +2841,9 @@ Done 2026-11-12, every test passing, the capture still to be taken:
   there; parts on disk read without their padding; and readers and
   writers of the same rows, each its own way, meeting no torn value and
   no failure. The capture of a committed read's one round, and a
-  locking one's two, is the author's to take.
+  locking one's two, was taken on 2026-11-13 with
+  `tools/blob_rounds_capture.sh`, which `ic_trans --bytes` and
+  `ic_read --lock-first` and `--locked` make possible.
 
 ### 12.6 The executor and the synchronous helpers (3 days)
 

@@ -24,6 +24,19 @@
 //!
 //! Debug level 1024 traces every signal: one `KEY_OP_REQ` per row, the
 //! confirmations packed together, and the rows coming back.
+//!
+//! **Blob columns** get `--bytes` bytes each, or NULL without it, and
+//! are read back with the rest, each printed as its length and its
+//! first bytes. After each transaction the rounds its blob queries sent
+//! after their first are counted (doc/rust/06, phase 12): none for the
+//! inserts, whose parts go with their rows, in one round however many
+//! rows there are; the reads, several in one transaction, take their
+//! locks first and go on in a second; the deletes read the heads first.
+//!
+//! ```text
+//!   ic_trans -c localhost:1186 -d ictest ttext --from 1 --count 100 \
+//!     --bytes 200 --keep
+//! ```
 
 use std::sync::Arc;
 
@@ -49,7 +62,10 @@ use ic_signals::table_props;
 /// How long to wait for one transaction to finish.
 const IC_TRANS_WAIT_MS: u64 = 10_000;
 
-const OPTIONS: [OptionEntry; 8] = [
+/// How many of a blob value's bytes are printed.
+const IC_TRANS_BLOB_SHOWN: usize = 16;
+
+const OPTIONS: [OptionEntry; 9] = [
   OptionEntry {
     long_name: "ndb-connectstring",
     short_name: b'c',
@@ -85,6 +101,12 @@ const OPTIONS: [OptionEntry; 8] = [
     short_name: b'k',
     kind: OptionKind::Flag,
     help: "Leave the rows in the table: no delete",
+  },
+  OptionEntry {
+    long_name: "bytes",
+    short_name: b'b',
+    kind: OptionKind::Int,
+    help: "Bytes in each blob column; without it they are NULL",
   },
   OptionEntry {
     long_name: "node-id",
@@ -168,14 +190,19 @@ fn run() -> i32 {
       return 1;
     }
   };
-  let plan = Plan {
+  let mut plan = Plan {
     database: &database,
     table: &args[0],
     from,
     count: count as usize,
     auto_increment: parser.get_flag("auto-increment"),
     keep: parser.get_flag("keep"),
+    bytes: None,
   };
+  let bytes = parser.get_int_or("bytes", -1);
+  if bytes >= 0 {
+    plan.bytes = Some(bytes as usize);
+  }
   let code = run_all(&global, &plan);
   global.stop();
   code
@@ -192,6 +219,16 @@ struct Plan<'a> {
   auto_increment: bool,
   /// No delete at the end.
   keep: bool,
+  /// Bytes in each blob column, or NULL.
+  bytes: Option<usize>,
+}
+
+/// The records the queries go by.
+struct Records {
+  /// Every column but the blob ones, which a key record may not name.
+  key: Record,
+  /// Every column, the blob ones too.
+  attr: Record,
 }
 
 fn run_all(global: &ApidGlobal, plan: &Plan) -> i32 {
@@ -214,14 +251,22 @@ fn run_all(global: &ApidGlobal, plan: &Plan) -> i32 {
       return 1;
     }
   };
-  let rec = match Record::default_for(&def, None) {
-    Ok(rec) => rec,
-    Err(e) => {
+  let mut ids: Vec<u32> = Vec::with_capacity(def.info().attributes.len());
+  for attr in &def.info().attributes {
+    ids.push(attr.column_id);
+  }
+  let made = (
+    Record::default_for(&def, None),
+    Record::default_for(&def, Some(ids.as_slice())),
+  );
+  let recs = match made {
+    (Ok(key), Ok(attr)) => Records { key, attr },
+    (Err(e), _) | (_, Err(e)) => {
       report("Could not make a record", &e);
       return 1;
     }
   };
-  if let Err(text) = check_columns(&def) {
+  if let Err(text) = check_columns(&def, plan.bytes.is_some()) {
     println!("{}", text);
     return 1;
   }
@@ -239,7 +284,7 @@ fn run_all(global: &ApidGlobal, plan: &Plan) -> i32 {
   let mut queries: Vec<QueryId> = Vec::with_capacity(count);
   let mut i: usize = 0;
   while i < count {
-    match conn.create_query(&def, &rec, &rec) {
+    match conn.create_query(&def, &recs.key, &recs.attr) {
       Ok(id) => queries.push(id),
       Err(e) => {
         report("Could not make a query", &e);
@@ -252,14 +297,21 @@ fn run_all(global: &ApidGlobal, plan: &Plan) -> i32 {
     ("Inserted", WriteKind::Insert),
     ("Deleted", WriteKind::Delete),
   ];
-  let mut code = write_run(&mut conn, &def, &rec, &queries, from, steps[0]);
+  let run = Run {
+    def: &def,
+    recs: &recs,
+    queries: &queries,
+    from,
+    bytes: plan.bytes,
+  };
+  let mut code = write_run(&mut conn, &run, steps[0]);
   if code == 0 {
-    code = read_run(&mut conn, &def, &rec, &queries, from);
+    code = read_run(&mut conn, &run);
   }
   if code == 0 && plan.keep {
     println!("Kept the rows");
   } else if code == 0 {
-    code = write_run(&mut conn, &def, &rec, &queries, from, steps[1]);
+    code = write_run(&mut conn, &run, steps[1]);
   }
   if conn.unexpected() > 0 {
     println!(
@@ -270,10 +322,26 @@ fn run_all(global: &ApidGlobal, plan: &Plan) -> i32 {
   code
 }
 
-/// Every column other than the key must be an integer, or nullable.
-fn check_columns(def: &Arc<TableDef>) -> Result<(), String> {
+/// What a run of transactions goes over.
+struct Run<'a> {
+  def: &'a Arc<TableDef>,
+  recs: &'a Records,
+  /// One query per row.
+  queries: &'a [QueryId],
+  /// The first row's key.
+  from: i64,
+  /// Bytes in each blob column, or NULL.
+  bytes: Option<usize>,
+}
+
+/// Every column other than the key must be an integer, or nullable, or
+/// a blob column given bytes.
+fn check_columns(def: &Arc<TableDef>, bytes: bool) -> Result<(), String> {
   for attr in &def.info().attributes {
     if attr.primary_key || attr.nullable || is_integer(attr.type_code) {
+      continue;
+    }
+    if attr.is_blob() && bytes {
       continue;
     }
     return Err(format!(
@@ -331,11 +399,12 @@ fn is_integer(type_code: u32) -> bool {
   integers.contains(&type_code)
 }
 
-/// The key, and for an insert every other column, into a query's rows.
+/// The key, and for an insert every other column, into a query's rows:
+/// the key row by the key record, the attribute row and the blob values
+/// by the attribute record.
 fn fill_query(
   conn: &mut ApidConnection,
-  def: &Arc<TableDef>,
-  rec: &Record,
+  run: &Run,
   id: QueryId,
   key: i64,
   values_too: bool,
@@ -344,18 +413,32 @@ fn fill_query(
     Some(query) => query,
     None => return Err("The query is gone".to_string()),
   };
-  for attr in &def.info().attributes {
+  let key_rec = &run.recs.key;
+  let rec = &run.recs.attr;
+  for attr in &run.def.info().attributes {
     let position = match rec.position_of(attr.column_id) {
       Some(position) => position,
       None => continue,
     };
     if attr.primary_key {
       let text = key.to_string();
-      text_row::put_value(rec, position, &text, query.key_row_mut())?;
+      if let Some(at) = key_rec.position_of(attr.column_id) {
+        text_row::put_value(key_rec, at, &text, query.key_row_mut())?;
+      }
       text_row::put_value(rec, position, &text, query.attr_row_mut())?;
       continue;
     }
     if !values_too {
+      continue;
+    }
+    if attr.is_blob() {
+      let set = match run.bytes {
+        Some(bytes) => query.set_blob(position, &blob_value(key, bytes)),
+        None => query.set_blob_null(position),
+      };
+      if let Err(e) = set {
+        return Err(format!("{}: {} ({})", attr.name, e.message(), e.code));
+      }
       continue;
     }
     let text = if is_integer(attr.type_code) {
@@ -368,16 +451,62 @@ fn fill_query(
   Ok(())
 }
 
+/// A blob value of `bytes` bytes for the row with key `key`: letters,
+/// the first naming the key, so that a capture shows which row it is.
+fn blob_value(key: i64, bytes: usize) -> Vec<u8> {
+  let mut value = Vec::with_capacity(bytes);
+  let mut i: usize = 0;
+  while i < bytes {
+    value.push(b'a' + ((key as usize).wrapping_add(i) % 26) as u8);
+    i += 1;
+  }
+  value
+}
+
+/// A blob value as its length and its first bytes.
+fn blob_text(value: Option<&[u8]>) -> String {
+  let bytes = match value {
+    Some(bytes) => bytes,
+    None => return text_row::IC_NULL_TEXT.to_string(),
+  };
+  let mut shown = String::with_capacity(IC_TRANS_BLOB_SHOWN);
+  for byte in &bytes[..bytes.len().min(IC_TRANS_BLOB_SHOWN)] {
+    if byte.is_ascii_graphic() || *byte == b' ' {
+      shown.push(*byte as char);
+    } else {
+      shown.push('.');
+    }
+  }
+  let more = if bytes.len() > IC_TRANS_BLOB_SHOWN {
+    "..."
+  } else {
+    ""
+  };
+  format!("{} bytes {}{}", bytes.len(), shown, more)
+}
+
+/// The rounds the blob queries sent after their first since `before`,
+/// as a clause for the line that reports a transaction; nothing for a
+/// table without blob columns.
+fn rounds_text(conn: &ApidConnection, run: &Run, before: u64) -> String {
+  if !run.recs.attr.has_blob_fields() {
+    return String::new();
+  }
+  format!(
+    ", {} round(s) of its blob queries after their first",
+    conn.blob_rounds() - before
+  )
+}
+
 /// Every row written in one transaction.
 fn write_run(
   conn: &mut ApidConnection,
-  def: &Arc<TableDef>,
-  rec: &Record,
-  queries: &[QueryId],
-  from: i64,
+  run: &Run,
   step: (&str, WriteKind),
 ) -> i32 {
   let (what, kind) = step;
+  let queries = run.queries;
+  let rounds_before = conn.blob_rounds();
   let trans = match conn.start_transaction(TransactionHint::Any, None) {
     Ok(trans) => trans,
     Err(e) => {
@@ -387,9 +516,9 @@ fn write_run(
   };
   let mut i: usize = 0;
   while i < queries.len() {
-    let key = from + i as i64;
+    let key = run.from + i as i64;
     let insert = kind == WriteKind::Insert;
-    if let Err(text) = fill_query(conn, def, rec, queries[i], key, insert) {
+    if let Err(text) = fill_query(conn, run, queries[i], key, insert) {
       println!("{}", text);
       return 1;
     }
@@ -417,10 +546,11 @@ fn write_run(
         None => 0,
       };
       println!(
-        "{} {} row(s) in one transaction, global checkpoint {}",
+        "{} {} row(s) in one transaction, global checkpoint {}{}",
         what,
         queries.len(),
-        gci
+        gci,
+        rounds_text(conn, run, rounds_before)
       );
     }
     Some(other) => {
@@ -441,13 +571,10 @@ fn write_run(
 }
 
 /// Every row read back with a committed read, all in one batch.
-fn read_run(
-  conn: &mut ApidConnection,
-  def: &Arc<TableDef>,
-  rec: &Record,
-  queries: &[QueryId],
-  from: i64,
-) -> i32 {
+fn read_run(conn: &mut ApidConnection, run: &Run) -> i32 {
+  let queries = run.queries;
+  let rec = &run.recs.attr;
+  let rounds_before = conn.blob_rounds();
   let trans = match conn.start_transaction(TransactionHint::Any, None) {
     Ok(trans) => trans,
     Err(e) => {
@@ -457,8 +584,8 @@ fn read_run(
   };
   let mut i: usize = 0;
   while i < queries.len() {
-    let key = from + i as i64;
-    if let Err(text) = fill_query(conn, def, rec, queries[i], key, false) {
+    let key = run.from + i as i64;
+    if let Err(text) = fill_query(conn, run, queries[i], key, false) {
       println!("{}", text);
       return 1;
     }
@@ -493,13 +620,29 @@ fn read_run(
     let mut parts: Vec<String> = Vec::new();
     let mut position: u32 = 0;
     while position < rec.num_fields() {
-      parts.push(text_row::value_text(rec, position, query.attr_row()));
+      let blob = match rec.field(position) {
+        Some(field) => field.is_blob(),
+        None => false,
+      };
+      if blob {
+        let text = match query.blob(position) {
+          Ok(value) => blob_text(value),
+          Err(e) => format!("{} ({})", e.message(), e.code),
+        };
+        parts.push(text);
+      } else {
+        parts.push(text_row::value_text(rec, position, query.attr_row()));
+      }
       position += 1;
     }
     println!("row {}: {}", query.user_ref(), parts.join(", "));
     shown += 1;
   }
-  println!("Read {} row(s) back in one batch", shown);
+  println!(
+    "Read {} row(s) back in one batch{}",
+    shown,
+    rounds_text(conn, run, rounds_before)
+  );
   let _ = conn.close_transaction(trans);
   if outcome == Some(CommitState::Committed) && failed == 0 {
     0

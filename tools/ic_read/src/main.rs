@@ -38,6 +38,21 @@
 //!
 //! Debug level 1024 traces every signal, which shows the allocate of a
 //! transaction record, the request, and the replies, packed or not.
+//!
+//! **Blob columns.** By primary key the row is read through a query on
+//! a transaction of its own, which reads the blob columns too: each is
+//! printed as its length and its first bytes, and the read's rounds
+//! after its first are counted (doc/rust/06, phase 12). A committed
+//! read takes one round for inline values and three for values with
+//! parts; `--lock-first` has it take the lock in its first round, two
+//! rounds whatever the values; `--locked` reads with a shared lock held
+//! to the commit. Through `--index` the blob columns are left out.
+//!
+//! ```text
+//!   ic_read -c localhost:1186 -d ictest ttext 1
+//!   ic_read -c localhost:1186 -d ictest ttext 1 --lock-first
+//!   ic_read -c localhost:1186 -d ictest ttext 1 --locked
+//! ```
 
 use std::sync::Arc;
 
@@ -48,14 +63,24 @@ use ic_apid::dict_cache::IndexDef;
 use ic_apid::dict_cache::TableDef;
 use ic_apid::hash;
 use ic_apid::key_op;
+use ic_apid::query::QueryId;
+use ic_apid::query::ReadKeyArgs;
+use ic_apid::query::ReadKind;
+use ic_apid::query::TransId;
 use ic_apid::record::Record;
 use ic_apid::text_row;
+use ic_apid::transaction::CommitState;
 use ic_port::options::OptionEntry;
 use ic_port::options::OptionKind;
 use ic_port::options::OptionParser;
 use ic_port::IcError;
 
-const OPTIONS: [OptionEntry; 6] = [
+/// How long to wait for a read's transaction to finish.
+const IC_READ_WAIT_MS: u64 = 10_000;
+/// How many of a blob value's bytes are printed.
+const IC_READ_BLOB_SHOWN: usize = 32;
+
+const OPTIONS: [OptionEntry; 8] = [
   OptionEntry {
     long_name: "ndb-connectstring",
     short_name: b'c',
@@ -92,7 +117,28 @@ const OPTIONS: [OptionEntry; 6] = [
     kind: OptionKind::Str,
     help: "Read through this unique index; the values are its columns'",
   },
+  OptionEntry {
+    long_name: "lock-first",
+    short_name: 0,
+    kind: OptionKind::Flag,
+    help: "A committed read of blob values takes its lock first",
+  },
+  OptionEntry {
+    long_name: "locked",
+    short_name: 0,
+    kind: OptionKind::Flag,
+    help: "Read with a shared lock, held to the commit",
+  },
 ];
+
+/// How a read by primary key goes.
+#[derive(Clone, Copy)]
+struct How {
+  /// A shared lock held to the commit, not a committed read.
+  locked: bool,
+  /// A committed read of blob values takes its lock in its first round.
+  lock_first: bool,
+}
 
 fn main() {
   std::process::exit(run());
@@ -156,8 +202,24 @@ fn run() -> i32 {
   };
   let partition = parser.get_flag("partition");
   let index = parser.get_string_or("index", "");
-  let code =
-    read_row(&global, &database, &args[0], &args[1..], partition, &index);
+  let how = How {
+    locked: parser.get_flag("locked"),
+    lock_first: parser.get_flag("lock-first"),
+  };
+  if !index.is_empty() && (how.locked || how.lock_first) {
+    println!("--locked and --lock-first are for reads by primary key");
+    global.stop();
+    return 1;
+  }
+  let code = read_row(
+    &global,
+    &database,
+    &args[0],
+    &args[1..],
+    partition,
+    &index,
+    how,
+  );
   global.stop();
   code
 }
@@ -169,6 +231,7 @@ fn read_row(
   keys: &[String],
   partition: bool,
   index_name: &str,
+  how: How,
 ) -> i32 {
   if global.wait_for_first_started(15_000) == 0 {
     println!("No data node is started, so there is nobody to ask");
@@ -225,16 +288,19 @@ fn read_row(
   }
   let mut row = vec![0u8; rec.row_size() as usize];
   let read = match &index {
-    Some(index) => key_op::read_unique_committed(
-      &mut conn, index, &rec, &key_row, &rec, &mut row,
-    ),
-    None => key_op::read_committed(&mut conn, &rec, &key_row, &rec, &mut row),
+    Some(index) => {
+      let read = key_op::read_unique_committed(
+        &mut conn, index, &rec, &key_row, &rec, &mut row,
+      );
+      if let Ok(true) = read {
+        print_row(&def, &rec, &row);
+      }
+      read
+    }
+    None => read_by_query(&mut conn, &def, &rec, &key_row, how),
   };
   let mut code = match read {
-    Ok(true) => {
-      print_row(&def, &rec, &row);
-      0
-    }
+    Ok(true) => 0,
     Ok(false) => {
       println!("No row with that key");
       1
@@ -254,6 +320,160 @@ fn read_row(
     );
   }
   code
+}
+
+/// The row read by its primary key through a query on a transaction of
+/// its own, every column read, the blob columns too, and printed. The
+/// key record is the default one, which leaves the blob columns out, as
+/// a key record must. False if there is no such row.
+fn read_by_query(
+  conn: &mut ApidConnection,
+  def: &Arc<TableDef>,
+  key_rec: &Record,
+  key_row: &[u8],
+  how: How,
+) -> Result<bool, IcError> {
+  let mut ids: Vec<u32> = Vec::with_capacity(def.info().attributes.len());
+  for attr in &def.info().attributes {
+    ids.push(attr.column_id);
+  }
+  let attr_rec = Record::default_for(def, Some(ids.as_slice()))?;
+  let id = conn.create_query(def, key_rec, &attr_rec)?;
+  let read = read_on_query(conn, def, key_rec, &attr_rec, key_row, how, id);
+  let _ = conn.free_query(id);
+  read
+}
+
+/// [`read_by_query`]'s read, on the query `id`.
+fn read_on_query(
+  conn: &mut ApidConnection,
+  def: &Arc<TableDef>,
+  key_rec: &Record,
+  attr_rec: &Record,
+  key_row: &[u8],
+  how: How,
+  id: QueryId,
+) -> Result<bool, IcError> {
+  match conn.query_mut(id) {
+    Some(query) => {
+      query.key_row_mut().copy_from_slice(key_row);
+      if how.lock_first {
+        query.set_blob_lock_first(true)?;
+      }
+    }
+    None => return Err(IcError::new(ic_port::err::IC_ERROR_NO_SUCH_FIELD)),
+  }
+  let hint = conn.hint_for_key(def, key_rec, key_row);
+  let trans = conn.start_transaction(hint, Some(def))?;
+  let rounds_before = conn.blob_rounds();
+  let kind = if how.locked {
+    ReadKind::Locked
+  } else {
+    ReadKind::Committed
+  };
+  let args = ReadKeyArgs {
+    kind,
+    ..ReadKeyArgs::default()
+  };
+  let mut outcome = conn.read_key(id, trans, &args);
+  if outcome.is_ok() {
+    outcome = conn.commit_transaction(trans);
+  }
+  if outcome.is_ok() && wait_for(conn, trans).is_none() {
+    outcome = Err(IcError::new(ic_port::err::IC_ERROR_TIMEOUT));
+  }
+  while conn.get_next_executed_query().is_some() {}
+  let rounds = conn.blob_rounds() - rounds_before;
+  let read = match outcome {
+    Ok(()) => match conn.query(id) {
+      Some(query) => match query.error() {
+        Some(e) if e.code == key_op::IC_NDB_ERROR_NO_SUCH_ROW as i32 => {
+          Ok(false)
+        }
+        Some(e) => Err(e),
+        None => {
+          print_query_row(def, attr_rec, query);
+          Ok(true)
+        }
+      },
+      None => Err(IcError::new(ic_port::err::IC_ERROR_NO_SUCH_FIELD)),
+    },
+    Err(e) => Err(e),
+  };
+  if attr_rec.has_blob_fields() {
+    println!("{} round(s) after the first", rounds);
+  }
+  let _ = conn.close_transaction(trans);
+  read
+}
+
+/// Send, then poll until the transaction is done or the wait runs out.
+fn wait_for(conn: &mut ApidConnection, trans: TransId) -> Option<CommitState> {
+  let start = ic_port::time::gethrtime();
+  loop {
+    if let Err(e) = conn.flush(100, false) {
+      report("Could not send", &e);
+    }
+    if let Some(t) = conn.transaction(trans) {
+      if t.is_done() {
+        return Some(t.commit_state());
+      }
+    }
+    let waited =
+      ic_port::time::millis_elapsed(start, ic_port::time::gethrtime());
+    if waited >= IC_READ_WAIT_MS {
+      return None;
+    }
+  }
+}
+
+/// Each column of a query's row, a line each; a blob column as its
+/// length and first bytes.
+fn print_query_row(
+  def: &Arc<TableDef>,
+  rec: &Record,
+  query: &ic_apid::query::ApidQuery,
+) {
+  let mut position: u32 = 0;
+  while position < rec.num_fields() {
+    if let Some(field) = rec.field(position) {
+      if let Some(attr) = def.field(field.field_id()) {
+        let text = if field.is_blob() {
+          match query.blob(position) {
+            Ok(value) => blob_text(value),
+            Err(e) => format!("{} ({})", e.message(), e.code),
+          }
+        } else {
+          text_row::value_text(rec, position, query.attr_row())
+        };
+        println!("{}: {}", attr.name, text);
+      }
+    }
+    position += 1;
+  }
+}
+
+/// A blob value as its length and its first bytes, a byte that is not
+/// printable as a dot.
+fn blob_text(value: Option<&[u8]>) -> String {
+  let bytes = match value {
+    Some(bytes) => bytes,
+    None => return text_row::IC_NULL_TEXT.to_string(),
+  };
+  let mut shown = String::with_capacity(IC_READ_BLOB_SHOWN);
+  for byte in &bytes[..bytes.len().min(IC_READ_BLOB_SHOWN)] {
+    if byte.is_ascii_graphic() || *byte == b' ' {
+      shown.push(*byte as char);
+    } else {
+      shown.push('.');
+    }
+  }
+  let more = if bytes.len() > IC_READ_BLOB_SHOWN {
+    "..."
+  } else {
+    ""
+  };
+  format!("{} bytes: {}{}", bytes.len(), shown, more)
 }
 
 /// The unique hash index of the name given: the name itself if that is

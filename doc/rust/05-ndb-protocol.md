@@ -1300,6 +1300,29 @@ table, and knows nothing joining them.
     the main insert (chapter 06, phase 12);
   - about 64 KiB of part data in a batch: five LONGBLOB parts written,
     then three; four read at a time. Deletes go all at once.
+- **Our client's rounds, seen (2026-11-13)**, `tools/blob_rounds_capture.sh`
+  against the release cluster, a TEXT of 200 bytes (inline) and of
+  4 000 (two parts), a round being one send of ours and its replies:
+  - a hundred rows inserted in one transaction, inline or with parts,
+    in one round: every row's insert, and with parts its two part
+    writes, three hundred operations in 27 frames within 0.3 ms, the
+    commit on the last; then the confirmations and
+    `COMMIT_MARKER_FREE_ORD`;
+  - a hundred reads in one transaction, taking their locks first since
+    they are many: inline, the reads and then `COMMIT_REQ` alone; with
+    parts, the reads and then every part, the commit on the last;
+  - a committed read alone of an inline value: one round, a dirty
+    simple read, no commit and no record kept;
+  - the same with the lock first, and a locked read: the read, then
+    `COMMIT_REQ` alone;
+  - a committed read alone of a value with parts: three rounds, the
+    dirty read; the row read again with bit 20 and Start, asking for
+    the lock reference, a new transaction at the data nodes under the
+    same transaction object (chapter 06, 12.5); then the two parts by
+    simple reads, the commit on the last and no unlock, the commit
+    letting the lock go;
+  - with the lock first, and a locked read, two rounds: the row, then
+    the parts with the commit.
 - **Not seen**: an empty value; the sizes of MEDIUMBLOB and GEOMETRY; a
   binary column on disk padded with 0x00; a stripe other than 0, and
   `NDB$DIST`; the parts table's settings past its columns, which the
