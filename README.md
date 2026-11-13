@@ -4,15 +4,16 @@ A client library for RonDB 26.10 data nodes (an API node speaking the
 NDB protocol) written in C-like Rust, MIT licensed, usable from Rust, C,
 C++ and any language that can call C.
 
-Status: release 1.0.0, on branch `1.0.0`, which takes the fixes to
-the release; development goes on in `trunk`. It needs data nodes of
-RonDB 26.10.0 or later. What each release brought is in
+Status: release 1.1.0, on branch `1.1.0`; development goes on in
+`trunk`, and a released branch takes no further changes. It needs data
+nodes of RonDB 26.10.0 or later. What each release brought is in
 [`CHANGELOG.md`](CHANGELOG.md), and how one is made in
 [`doc/releasing.md`](doc/releasing.md).
 
 Rows are read and written by primary key and unique key, in
 transactions, synchronously or asynchronously with callbacks, every row
-size RonDB allows, with node failures handled; threads without a
+size RonDB allows, BLOB, TEXT and JSON columns whole, with node
+failures handled; threads without a
 connection of their own run their transactions through executors,
 which send many threads' calls together. Tables and ordered indexes
 are scanned, on a connection or through an executor, and the rows a

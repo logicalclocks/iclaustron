@@ -102,7 +102,7 @@
 
 | Topic | Decision |
 |---|---|
-| Released branches | take no further changes, fixes included: `1.0.0` stays as released, work goes on in `trunk`, and the branch `1.1.0` is made from it once blob handling is ready to release (`doc/releasing.md`) |
+| Released branches | take no further changes, fixes included: `1.0.0` stays as released, work goes on in `trunk`, and the branch `1.1.0` was made from it on 2026-11-13, blob handling ready to release, for release 1.1.0 (`doc/releasing.md`) |
 | How a part is written | always with the write operation (type 4), an insert's parts too, as the reference does, seen on the wire the same day: it costs what an insert costs, and an orphan part left by a write racing an insert is written over, where inserting it would fail with 630 and roll the transaction back (chapter 06, phase 12) |
 | The longest blob value (was Q15) | the MySQL type's limit, not only the column's: a value longer than the column's MySQL type holds is refused, as one too long for a column without parts is (4266). Asked after a TINYBLOB of 256 bytes, which its column takes and the data node keeps, was read by a MySQL server as its first 255 (12.3). MySQL's types hold 255 bytes (TINY), 65 535 (TEXT, BLOB), 16 MiB less a byte (MEDIUM) and 4 GiB less a byte (LONG) |
 | A column's MySQL type | told by its sizes, as a MySQL server gives each type its own: 256 inline bytes and no parts for the TINY types, parts of 2 000 for TEXT and BLOB, of 4 000 for the MEDIUM types; a column with other sizes, LONG and JSON among them and any whose sizes a column comment changed, counts as LONG (4 GiB less a byte). Chosen by the author over reading MySQL's own description of the table (key 30), whose layout is not yet known |

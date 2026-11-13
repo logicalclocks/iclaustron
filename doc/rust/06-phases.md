@@ -2346,7 +2346,8 @@ Phase 12 is built on `trunk` alone, not on `1.0.0`, and is released
 from `trunk` as 1.1.0, blob support for key operations (the author,
 2026-11-11). `1.0.0` is released and takes no further changes, fixes
 included; the branch `1.1.0` is made from `trunk` once blob handling is
-ready to release (the author, 2026-11-12).
+ready to release (the author, 2026-11-12). It was made, and 1.1.0
+released from it, on 2026-11-13.
 
 ### How each operation goes
 
@@ -3103,6 +3104,10 @@ is made: `doc/releasing.md`.
 Before the tag `legacy-c/` was removed from both branches, as chapter
 09 foresaw; the C code is on branch `main` (`doc/rust/README.md`, "Reference
 trees").
+
+**Release 1.1.0** (the author, 2026-11-13) is cut after phase 12, on
+its branch `1.1.0` made from `trunk`: blob columns by key, nothing
+removed or changed from 1.0.0.
 
 **Data nodes of RonDB 26.02** (looked at 2026-11-05). Release 1.0
 needs data nodes of 26.10.0 or later; the author asked whether the bar

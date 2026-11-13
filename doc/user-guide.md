@@ -37,13 +37,13 @@ From Rust, depend on the crates by path or git, at a release's tag:
 
 ```toml
 [dependencies]
-ic_apid = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.0.0" }
-ic_port = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.0.0" }
+ic_apid = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.1.0" }
+ic_port = { git = "https://github.com/logicalclocks/iclaustron", tag = "v1.1.0" }
 ```
 
-A release's fixes go to its branch (`1.0.0`), and development to
-`trunk`; name `branch = "1.0.0"` in place of the tag to follow the
-fixes.
+Each release has a branch of its own (`1.1.0`), which takes no further
+changes once released; development goes on in `trunk`, and fixes reach
+programs in the next release.
 
 and name each item from its module, as the examples do:
 
@@ -1114,10 +1114,11 @@ transaction that goes to a cluster with no started node fails with
   application asks for the value (section 7).
 - Rows a scan has locked are taken over on a connection only, not
   through an executor.
-- Blob columns are read and written by key only: a scan, and a row a
-  scan hands over, take no blob field (section 8). Only the second
-  version of the blob layout, the one MySQL servers have made since
-  5.1, is read.
+- Blob columns are read and written whole, and by key only: a scan,
+  and a row a scan hands over, take no blob field, and no part of a
+  value is read or written alone (section 8). Only the second version
+  of the blob layout, the one MySQL servers have made since 5.1, is
+  read.
 - No schema changes: tables and indexes are made through a MySQL
   server.
 - No TLS between the API node and the cluster, and no choosing data

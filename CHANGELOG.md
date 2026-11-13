@@ -3,6 +3,66 @@
 What each release of iClaustron brought. How a release is made:
 [`doc/releasing.md`](doc/releasing.md).
 
+## 1.1.0 (2026-11-13)
+
+Blob columns, read and written whole by key. Nothing of 1.0.0 is
+removed or changed: a C program built against it runs unchanged, and a
+Rust program builds unchanged but in one case below.
+
+### What it needs
+
+As 1.0.0: a RonDB cluster whose data nodes are of version 26.10.0 or
+later.
+
+### New since 1.0.0
+
+- BLOB, TEXT and JSON columns, and GEOMETRY, which the dictionary
+  describes as blobs, read and written whole by primary key and through
+  a unique index: inserted, written, updated and deleted, read
+  committed and read locked, on a connection, through an executor, and
+  with the synchronous helpers `read_committed_blobs` and
+  `write_key_blobs`. Deletes from a table with blob columns now take
+  the parts with the row, where 1.0 refused them with 7153 (user guide,
+  section 8, "Blob columns").
+- A value's first bytes are kept in its row and the rest in a parts
+  table, which the client keeps in step: an insert goes in one round
+  trip, a write, an update or a delete in two, and a committed read in
+  one when the value is all inline and in three when it has parts, or
+  in two with `blob_lock_first`. At most `blob_round_bytes`, 1 MiB by
+  default, of part data goes in one round for one query.
+- Writes are held to the MySQL type's limit, 4266 past it; a value
+  whose parts are not all there is 4267 when read.
+- The C API: 21 functions, all additions. On a query and on a request's
+  operation, a blob value is read, set, set NULL or filled in place,
+  and a read made to take its lock first or a write to probe for parts
+  left past its value; `IC_BLOB_VALUES` holds the values for
+  `ic_apid_conn_read_committed_blobs` and `ic_apid_conn_write_blobs`.
+  C names a blob field by its field id. `IC_GLOBAL_OPTIONS` gains
+  `blob_round_bytes` and `IC_EXECUTOR_STATS` `blob_rounds`, at their
+  ends; 4266 and 4267 are `IC_NDB_ERROR_BLOB_TOO_LONG` and
+  `IC_NDB_ERROR_BLOB_DAMAGED`.
+- A data node's word that a transaction or a scan it holds is still
+  running restarts that one's wait for its replies, so that a scan
+  running long without a batch no longer ends with 4012 after six
+  minutes while its coordinator says it runs.
+- A twelfth example, `blobs`, in Rust and in C, and the user guide's
+  section 8.
+- What blob columns cost, measured (`doc/rust/12-performance-model.md`,
+  "Blob columns"); `ic_bench`, `ic_trans` and `ic_read` take tables
+  with blob columns.
+
+### Changed: Rust programs built against 1.0.0
+
+- `GlobalOptions` gains `blob_round_bytes` and `ExecutorStats`
+  `blob_rounds`. A program that makes either with every field named,
+  without `..Default::default()`, names the new one too.
+
+### Not done yet
+
+Blob columns in scans and in rows a scan hands over, parts of a value
+read or written alone, TLS, location domains, events and schema
+changes, among others: user guide, "What is not done yet".
+
 ## 1.0.0 (2026-11-05)
 
 The first version. It talks to RonDB 26.10 data nodes and is the same
