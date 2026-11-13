@@ -2945,6 +2945,44 @@ Done 2026-11-12, every test passing:
 Exit: the C API test reads and writes blob values; the examples build
 and run.
 
+Done 2026-11-13, every test passing:
+
+- **C calls** for values, every one an addition: on a query
+  `ic_apid_query_blob`, `_set_blob`, `_set_blob_null`, `_blob_buffer`,
+  `_set_blob_lock_first` and `_set_blob_probe`; on a request's
+  operation `ic_request_blob` and the same setters; a holder,
+  `IC_BLOB_VALUES` (`ic_blob_values_create`, `_free`, `_get`, `_set`,
+  `_set_null`, `_buffer`, `_clear`); and the helpers
+  `ic_apid_conn_read_committed_blobs` and `ic_apid_conn_write_blobs`.
+  Ours to choose: C names a blob field by its id, as every C record
+  call does, where Rust names it by its position
+  (`BlobValues::position_of` maps one to the other); a value comes back
+  as a pointer and a length, NULL for NULL and never NULL for an empty
+  value; a buffer is made the length asked for, its old bytes kept as
+  far as they reach, for C to fill; and the write helper is named after
+  `ic_apid_conn_write`, the C form of `write_key`, not
+  `_write_key_blobs` as planned above, since `ic_apid_conn_write_key`
+  defines a query on a transaction.
+- `IC_GLOBAL_OPTIONS` gained `blob_round_bytes` and `IC_EXECUTOR_STATS`
+  `blob_rounds`, read and written field by field; 4266 and 4267 are
+  named (`IC_NDB_ERROR_BLOB_TOO_LONG`, `_BLOB_DAMAGED`). The guards
+  that kept C queries and shapes from blob fields are gone.
+- **Docs**: the header's preamble (handles, blob values, sizes);
+  chapter 04's blob section with the C calls and an example in both
+  languages; the user guide's new section 8, "Blob columns", in both
+  languages, the sections after it renumbered; the examples' README.
+- **The `blobs` example**, in Rust and C, on `ic_ex.t4` (added to
+  `setup.sql`): a TEXT and a LONGBLOB written and read back with a
+  holder, updated by primary key with the TEXT set NULL and the
+  LONGBLOB filled in place, read through the unique index, then read
+  and deleted through an executor, every result checked.
+- Tests: `BlobValues::position_of` and the C names of 4266 and 4267 in
+  unit tests; in the C API test, values on a connection, set and filled
+  in place, read committed and locking first, through the unique index
+  read and updated to empty and NULL, through an executor written and
+  read, and with a holder written, read and deleted, at 16 KiB a round
+  so that each takes several.
+
 ### 12.9 Measured (2 days)
 
 `ic_bench` with a TEXT column of 200 B, 4 KB and 100 KB; chapter 12

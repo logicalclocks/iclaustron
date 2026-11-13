@@ -36,6 +36,7 @@ use std::sync::OnceLock;
 use ic_apid::apid_conn::ApidConnection;
 use ic_apid::apid_global::ApidGlobal;
 use ic_apid::apid_global::GlobalOptions;
+use ic_apid::blob::BlobValues;
 use ic_apid::dict_cache::IndexDef;
 use ic_apid::dict_cache::TableDef;
 use ic_apid::executor::Executor;
@@ -225,6 +226,13 @@ pub const IC_NDB_ERROR_ROW_EXISTS: i32 = 630;
 pub const IC_NDB_ERROR_NO_REPLY: i32 = 4012;
 /// A NULL in a key (an NDB error).
 pub const IC_NDB_ERROR_NULL_KEY: i32 = 4316;
+/// A blob value longer than its column's MySQL type holds, refused
+/// before anything is sent (the client's own, in NDB's range).
+pub const IC_NDB_ERROR_BLOB_TOO_LONG: i32 = 4266;
+/// A blob value whose parts are not all there, or whose head disagrees
+/// with its column: a read fails with it, its transaction going on (the
+/// client's own, in NDB's range).
+pub const IC_NDB_ERROR_BLOB_DAMAGED: i32 = 4267;
 /// The row would break a unique index, which the error data names (an
 /// NDB error).
 pub const IC_NDB_ERROR_UNIQUE_DUPLICATE: i32 = 893;
@@ -429,6 +437,12 @@ pub struct IcProgram {
   _private: [u8; 0],
 }
 
+/// The values of a record's blob fields, kept apart from its row, for
+/// the synchronous calls that take them (`IC_BLOB_VALUES`). Opaque.
+pub struct IcBlobValues {
+  _private: [u8; 0],
+}
+
 /// A value's id in its program builder (`IC_PROGRAM_VALUE`).
 pub type IcProgramValue = u32;
 
@@ -494,6 +508,11 @@ pub struct IcGlobalOptions {
   /// `auto_increment_offset`; 1 by default, zero or one above the step
   /// counting as one.
   pub auto_increment_offset: u32,
+  /// Bytes of part data a BLOB query sends or asks for in one round, a
+  /// longer value going on in rounds of its own; 1 MiB by default, zero
+  /// counting as the default. Added in 1.1: left out for a program
+  /// built against an older header.
+  pub blob_round_bytes: u32,
 }
 
 /// Where one field lies in a row (`IC_FIELD_SPEC`).
@@ -638,6 +657,9 @@ pub struct IcExecutorStats {
   /// Scans started, each for a reader. Added after 0.1: left out for a
   /// program built against 0.1.
   pub scans: u64,
+  /// Rounds of BLOB queries sent after their first; a request of
+  /// several rounds counts once among the admitted. Added in 1.1.
+  pub blob_rounds: u64,
 }
 
 /// What a takeover of a scanned row asks for (`IC_TAKEOVER_ARGS`).
@@ -986,6 +1008,102 @@ unsafe fn record_of<'a>(rec: *const IcRecord) -> Option<&'a Record> {
   unsafe { (rec as *const Record).as_ref() }
 }
 
+// ---- Blob values ----
+
+/// A blob value as C gets it: NULL for NULL, else its bytes, an empty
+/// value's at a byte never read; and its length.
+fn blob_parts(found: Option<&[u8]>) -> (*const u8, usize) {
+  // Where an empty value's pointer points: not NULL, which would say
+  // the value is NULL. Inside the function, so that cbindgen, which
+  // reads every static of the module, does not see it.
+  static EMPTY: [u8; 1] = [0];
+  match found {
+    Some([]) => (EMPTY.as_ptr(), 0),
+    Some(bytes) => (bytes.as_ptr(), bytes.len()),
+    None => (std::ptr::null(), 0),
+  }
+}
+
+/// A blob value out to C, as [`blob_parts`] gives it.
+///
+/// # Safety
+///
+/// `value` points to a writable pointer; a non-null `len` to a writable
+/// `size_t`.
+unsafe fn blob_out(
+  parts: (*const u8, usize),
+  value: *mut *const u8,
+  len: *mut usize,
+) {
+  // SAFETY: the caller's promise.
+  unsafe {
+    value.write(parts.0);
+    if !len.is_null() {
+      len.write(parts.1);
+    }
+  }
+}
+
+/// A blob value in from C, `len` bytes at `value`, which may be NULL
+/// only for an empty value (`IC_ERROR_NULL_POINTER` otherwise).
+///
+/// # Safety
+///
+/// A non-null `value` points to `len` readable bytes that outlive the
+/// returned slice.
+unsafe fn blob_in<'a>(value: *const u8, len: usize) -> Result<&'a [u8], i32> {
+  if value.is_null() {
+    if len == 0 {
+      return Ok(&[]);
+    }
+    return Err(err::IC_ERROR_NULL_POINTER);
+  }
+  // SAFETY: the caller's promise.
+  Ok(unsafe { std::slice::from_raw_parts(value, len) })
+}
+
+/// A blob value's buffer made `len` bytes long, for C to fill in place:
+/// what it held, as far as it reaches, then zeros; NULL for an empty
+/// buffer.
+fn fill_buffer(buf: &mut Vec<u8>, len: usize) -> *mut u8 {
+  buf.resize(len, 0);
+  if len == 0 {
+    return std::ptr::null_mut();
+  }
+  buf.as_mut_ptr()
+}
+
+/// The position in `rec` of the field `field_id`: the library names a
+/// blob field by its position, the C ABI every field by its id.
+/// `IC_ERROR_NO_SUCH_FIELD` when the record does not hold it.
+fn field_position(rec: &Record, field_id: u32) -> Result<u32, IcError> {
+  match rec.position_of(field_id) {
+    Some(position) => Ok(position),
+    None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+  }
+}
+
+/// As [`field_position`], in the record a holder was made for.
+fn holder_position(holder: &BlobValues, field_id: u32) -> Result<u32, IcError> {
+  match holder.position_of(field_id) {
+    Some(position) => Ok(position),
+    None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+  }
+}
+
+/// The holder behind a handle.
+///
+/// # Safety
+///
+/// A non-null `values` is a holder handle not yet freed, used by one
+/// thread at a time.
+unsafe fn blob_values_of<'a>(
+  values: *mut IcBlobValues,
+) -> Option<&'a mut BlobValues> {
+  // SAFETY: the caller's promise.
+  unsafe { (values as *mut BlobValues).as_mut() }
+}
+
 /// The global behind a handle.
 ///
 /// # Safety
@@ -1243,7 +1361,7 @@ pub unsafe extern "C" fn ic_global_options_init(
     return;
   }
   let defaults = GlobalOptions::default();
-  let fields: [(usize, u32); 7] = [
+  let fields: [(usize, u32); 8] = [
     (std::mem::offset_of!(IcGlobalOptions, size), size as u32),
     (
       std::mem::offset_of!(IcGlobalOptions, receive_threads),
@@ -1268,6 +1386,10 @@ pub unsafe extern "C" fn ic_global_options_init(
     (
       std::mem::offset_of!(IcGlobalOptions, auto_increment_offset),
       defaults.auto_increment_offset,
+    ),
+    (
+      std::mem::offset_of!(IcGlobalOptions, blob_round_bytes),
+      defaults.blob_round_bytes,
     ),
   ];
   let base = options as *mut u8;
@@ -1330,7 +1452,7 @@ pub unsafe extern "C" fn ic_apid_global_connect(
     if size < global_options_0_1() {
       return err::IC_ERROR_INCONSISTENT_DATA;
     }
-    let fields: [(usize, &mut u32); 6] = [
+    let fields: [(usize, &mut u32); 7] = [
       (
         std::mem::offset_of!(IcGlobalOptions, receive_threads),
         &mut opts.receive_threads,
@@ -1354,6 +1476,10 @@ pub unsafe extern "C" fn ic_apid_global_connect(
       (
         std::mem::offset_of!(IcGlobalOptions, auto_increment_offset),
         &mut opts.auto_increment_offset,
+      ),
+      (
+        std::mem::offset_of!(IcGlobalOptions, blob_round_bytes),
+        &mut opts.blob_round_bytes,
       ),
     ];
     for (offset, field) in fields {
@@ -2217,12 +2343,6 @@ pub unsafe extern "C" fn ic_apid_query_create(
   if query.is_null() {
     return err::IC_ERROR_NULL_POINTER;
   }
-  // A blob field's value is set and read through calls C does not have
-  // yet (chapter 06, 12.8): until then, a C query takes no blob field,
-  // as the header says.
-  if attr.has_blob_fields() {
-    return err::IC_ERROR_NOT_SUPPORTED;
-  }
   // SAFETY: the caller's promise.
   match unsafe { on_conn(conn, |c| c.create_query(&table.def, key, attr)) } {
     Ok(Ok(id)) => {
@@ -2263,11 +2383,6 @@ pub unsafe extern "C" fn ic_apid_query_create_unique(
     };
   if query.is_null() {
     return err::IC_ERROR_NULL_POINTER;
-  }
-  // As for a query by primary key: C has no calls for blob values until
-  // 12.8.
-  if attr.has_blob_fields() {
-    return err::IC_ERROR_NOT_SUPPORTED;
   }
   // SAFETY: the caller's promise.
   match unsafe {
@@ -2452,6 +2567,216 @@ pub unsafe extern "C" fn ic_apid_query_user_ref(
     })
   };
   found.unwrap_or(0) as *mut c_void
+}
+
+/// The value of the blob field `field_id` of the query's attribute
+/// record: what a write is to send, or what a read brought once the
+/// query has completed. `value` is set to NULL for NULL, else to the
+/// value's bytes, `len` long, valid until the value is set again, the
+/// query is defined again, or it is freed.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` for an id that names no query, or a
+/// position that names no blob field.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed; `value` points to a
+/// writable pointer; a non-null `len` to a writable `size_t`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_query_blob(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  field_id: u32,
+  value: *mut *const u8,
+  len: *mut usize,
+) -> i32 {
+  if value.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  let found = unsafe {
+    on_conn(conn, |c| match c.query(QueryId::from_u64(query)) {
+      Some(q) => match field_position(q.attr_record(), field_id)
+        .and_then(|position| q.blob(position))
+      {
+        Ok(bytes) => Ok(blob_parts(bytes)),
+        Err(e) => Err(e.code),
+      },
+      None => Err(err::IC_ERROR_NO_SUCH_FIELD),
+    })
+  };
+  match found {
+    Ok(Ok(parts)) => {
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { blob_out(parts, value, len) };
+      0
+    }
+    Ok(Err(code)) | Err(code) => code,
+  }
+}
+
+/// Set the blob field `field_id` to a copy of `len` bytes at `value`,
+/// which may be NULL for an empty value, for the executions defined from
+/// now on.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_apid_query_blob`;
+/// `IC_NDB_ERROR_BLOB_TOO_LONG` for a value longer than its column's MySQL
+/// type holds; `IC_ERROR_TRANSACTION_ACTIVE` while the query is defined or
+/// sent.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed; a non-null `value`
+/// points to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_query_set_blob(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  field_id: u32,
+  value: *const u8,
+  len: usize,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let bytes = match unsafe { blob_in(value, len) } {
+    Ok(bytes) => bytes,
+    Err(code) => return code,
+  };
+  // SAFETY: the caller's promise.
+  unsafe {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
+      Some(q) => {
+        let position = field_position(q.attr_record(), field_id)?;
+        q.set_blob(position, bytes)
+      }
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    })
+  }
+}
+
+/// Set the blob field `field_id` NULL.
+///
+/// Errors: as `ic_apid_query_set_blob`.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_query_set_blob_null(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  field_id: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
+      Some(q) => {
+        let position = field_position(q.attr_record(), field_id)?;
+        q.set_blob_null(position)
+      }
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    })
+  }
+}
+
+/// The blob field `field_id` made `len` bytes long, to fill in place:
+/// `buffer` is set to its bytes, which hold the last value set or read
+/// as far as it reaches and zeros after, NULL for an empty value, valid
+/// as `ic_apid_query_blob`'s. The field is no longer NULL. A value
+/// longer than its column's MySQL type holds fails the query's definition
+/// with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+///
+/// Errors: as `ic_apid_query_set_blob`.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed; `buffer` points to a
+/// writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_query_blob_buffer(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  field_id: u32,
+  len: usize,
+  buffer: *mut *mut u8,
+) -> i32 {
+  if buffer.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  let found = unsafe {
+    on_conn(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
+      Some(q) => {
+        let found = field_position(q.attr_record(), field_id)
+          .and_then(|position| q.blob_buf_mut(position));
+        match found {
+          Ok(buf) => Ok(fill_buffer(buf, len)),
+          Err(e) => Err(e.code),
+        }
+      }
+      None => Err(err::IC_ERROR_NO_SUCH_FIELD),
+    })
+  };
+  match found {
+    Ok(Ok(at)) => {
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { buffer.write(at) };
+      0
+    }
+    Ok(Err(code)) | Err(code) => code,
+  }
+}
+
+/// Have a committed read take the shared lock and its lock reference in
+/// its first round, for the executions defined from now on: two rounds,
+/// whatever the value. Without it a committed read alone in its
+/// transaction reads committed first, all of it for an inline value,
+/// and three rounds for a value with parts.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` for an id that names no query;
+/// `IC_ERROR_TRANSACTION_ACTIVE` while the query is defined or sent.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_query_set_blob_lock_first(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  lock_first: bool,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
+      Some(q) => q.set_blob_lock_first(lock_first),
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    })
+  }
+}
+
+/// Have a write that finds no row also delete, if there, the part past
+/// its new value's last, and the next while one is, for the executions
+/// defined from now on: an insert racing the write may otherwise leave
+/// parts past the value, never read. Off by default; such a write
+/// commits a round later.
+///
+/// Errors: as `ic_apid_query_set_blob_lock_first`.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_query_set_blob_probe(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  probe: bool,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    conn_code(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
+      Some(q) => q.set_blob_probe(probe),
+      None => Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    })
+  }
 }
 
 /// Fill `args`, `size` bytes, with the defaults: a simple read, the
@@ -3261,6 +3586,322 @@ pub unsafe extern "C" fn ic_apid_conn_write(
   unsafe {
     conn_code(conn, |c| {
       key_op::write_key(c, operation, key, key_bytes, attr, attr_bytes)
+    })
+  }
+}
+
+/// A holder for the values of the blob fields of `rec`, every value NULL,
+/// for the synchronous calls that take them
+/// (`ic_apid_conn_read_committed_blobs`, `ic_apid_conn_write_blobs`). A
+/// field is named by its id, as every record call names it. The holder
+/// is the caller's, freed with `ic_blob_values_free`; its buffers keep
+/// their capacity from call to call.
+///
+/// # Safety
+///
+/// `rec` is a record handle not yet freed; `values` points to writable
+/// storage for a pointer.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_create(
+  rec: *const IcRecord,
+  values: *mut *mut IcBlobValues,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let rec = match unsafe { record_of(rec) } {
+    Some(rec) => rec,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if values.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  guarded(|| {
+    let made = Box::new(BlobValues::new(rec));
+    let handle = Box::into_raw(made) as *mut IcBlobValues;
+    // SAFETY: checked non-null above; the caller's promise.
+    unsafe { values.write(handle) };
+    0
+  })
+}
+
+/// Free a holder, its values with it.
+///
+/// # Safety
+///
+/// A non-null `values` is a holder handle not yet freed, freed here.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_free(values: *mut IcBlobValues) {
+  if values.is_null() {
+    return;
+  }
+  // SAFETY: the caller's promise; the handle is the box made for it.
+  let owned = unsafe { Box::from_raw(values as *mut BlobValues) };
+  let _ = guarded(move || {
+    drop(owned);
+    0
+  });
+}
+
+/// The value of the blob field `field_id`, as `ic_apid_query_blob`
+/// gives a query's: `value` NULL for NULL, else at its bytes, `len`
+/// long, valid until the value is set again, the holder is used by a
+/// call, or it is freed.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` for a field id that names no blob
+/// field.
+///
+/// # Safety
+///
+/// `values` is a holder handle not yet freed; `value` points to a
+/// writable pointer; a non-null `len` to a writable `size_t`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_get(
+  values: *mut IcBlobValues,
+  field_id: u32,
+  value: *mut *const u8,
+  len: *mut usize,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let holder = match unsafe { blob_values_of(values) } {
+    Some(holder) => holder,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if value.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  match holder_position(holder, field_id)
+    .and_then(|position| holder.blob(position))
+  {
+    Ok(bytes) => {
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { blob_out(blob_parts(bytes), value, len) };
+      0
+    }
+    Err(e) => e.code,
+  }
+}
+
+/// Set the blob field `field_id` to a copy of `len` bytes at `value`,
+/// which may be NULL for an empty value.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`;
+/// `IC_NDB_ERROR_BLOB_TOO_LONG` for a value longer than its column's MySQL
+/// type holds.
+///
+/// # Safety
+///
+/// `values` is a holder handle not yet freed; a non-null `value` points
+/// to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_set(
+  values: *mut IcBlobValues,
+  field_id: u32,
+  value: *const u8,
+  len: usize,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let holder = match unsafe { blob_values_of(values) } {
+    Some(holder) => holder,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  // SAFETY: the caller's promise.
+  let bytes = match unsafe { blob_in(value, len) } {
+    Ok(bytes) => bytes,
+    Err(code) => return code,
+  };
+  guarded(|| {
+    let position = holder_position(holder, field_id);
+    code_of(position.and_then(|position| holder.set_blob(position, bytes)))
+  })
+}
+
+/// Set the blob field `field_id` NULL.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`.
+///
+/// # Safety
+///
+/// `values` is a holder handle not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_set_null(
+  values: *mut IcBlobValues,
+  field_id: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  match unsafe { blob_values_of(values) } {
+    Some(holder) => {
+      let position = holder_position(holder, field_id);
+      code_of(position.and_then(|position| holder.set_blob_null(position)))
+    }
+    None => err::IC_ERROR_NULL_POINTER,
+  }
+}
+
+/// The blob field `field_id` made `len` bytes long, to fill in place,
+/// as `ic_apid_query_blob_buffer` does a query's: `buffer` is set to its
+/// bytes, NULL for an empty value, valid as `ic_blob_values_get`'s.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`.
+///
+/// # Safety
+///
+/// `values` is a holder handle not yet freed; `buffer` points to a
+/// writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_buffer(
+  values: *mut IcBlobValues,
+  field_id: u32,
+  len: usize,
+  buffer: *mut *mut u8,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let holder = match unsafe { blob_values_of(values) } {
+    Some(holder) => holder,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if buffer.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  let position = match holder_position(holder, field_id) {
+    Ok(position) => position,
+    Err(e) => return e.code,
+  };
+  match holder.blob_buf_mut(position) {
+    Ok(buf) => {
+      let at = fill_buffer(buf, len);
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { buffer.write(at) };
+      0
+    }
+    Err(e) => e.code,
+  }
+}
+
+/// Set every value NULL, keeping each buffer's capacity.
+///
+/// # Safety
+///
+/// A non-null `values` is a holder handle not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_blob_values_clear(values: *mut IcBlobValues) {
+  // SAFETY: the caller's promise.
+  if let Some(holder) = unsafe { blob_values_of(values) } {
+    holder.clear();
+  }
+}
+
+/// As `ic_apid_conn_read_committed`, with the values of the attribute
+/// record's blob fields read into `values`, a holder made for
+/// `attr_rec`. The read is a transaction of its own: an inline value
+/// takes one round, one with parts three. A row not there is no error:
+/// `found` is false.
+///
+/// Errors: as `ic_apid_conn_read_committed`; `IC_ERROR_RECORD_LAYOUT` for
+/// a holder not made for `attr_rec`; `IC_NDB_ERROR_BLOB_DAMAGED` for a
+/// value whose parts are not all there.
+///
+/// # Safety
+///
+/// As `ic_apid_conn_read_committed`, with `values` a holder handle not
+/// yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_conn_read_committed_blobs(
+  conn: *mut IcApidConnection,
+  key_rec: *const IcRecord,
+  key_row: *const u8,
+  key_len: usize,
+  attr_rec: *const IcRecord,
+  attr_row: *mut u8,
+  attr_len: usize,
+  values: *mut IcBlobValues,
+  found: *mut bool,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let (key, attr) = match unsafe { (record_of(key_rec), record_of(attr_rec)) } {
+    (Some(key), Some(attr)) => (key, attr),
+    _ => return err::IC_ERROR_NULL_POINTER,
+  };
+  // SAFETY: the caller's promise.
+  let holder = match unsafe { blob_values_of(values) } {
+    Some(holder) => holder,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if found.is_null() || attr_row.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  if key_len < key.row_size() as usize || attr_len < attr.row_size() as usize {
+    return err::IC_ERROR_RECORD_LAYOUT;
+  }
+  // The key first, copied aside if it is in the row to be written.
+  let mut copy = KeyCopy::new();
+  // SAFETY: the caller's promise; nothing is written yet.
+  let key_bytes =
+    unsafe { key_arg(key_row, key_len, attr_row, attr_len, &mut copy) };
+  // SAFETY: the caller's promise; the key is no longer read from here.
+  let attr_bytes = unsafe { row_arg_mut(attr_row, attr_len) };
+  // SAFETY: the caller's promise.
+  match unsafe {
+    on_conn(conn, |c| {
+      key_op::read_committed_blobs(c, key, key_bytes, attr, attr_bytes, holder)
+    })
+  } {
+    Ok(Ok(there)) => {
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { found.write(there) };
+      0
+    }
+    Ok(Err(e)) => e.code,
+    Err(code) => code,
+  }
+}
+
+/// As `ic_apid_conn_write`, with the values of the attribute record's
+/// blob fields from `values`, a holder made for `attr_rec`, which is
+/// lent to the write and given back as it was. A transaction of its
+/// own, in as many rounds as its values take.
+///
+/// Errors: as `ic_apid_conn_write`; `IC_ERROR_RECORD_LAYOUT` for a holder
+/// not made for `attr_rec`; `IC_NDB_ERROR_BLOB_TOO_LONG` for a value
+/// longer than its column's MySQL type holds.
+///
+/// # Safety
+///
+/// As `ic_apid_conn_write`, with `values` a holder handle not yet freed.
+#[no_mangle]
+pub unsafe extern "C" fn ic_apid_conn_write_blobs(
+  conn: *mut IcApidConnection,
+  kind: u32,
+  key_rec: *const IcRecord,
+  key_row: *const u8,
+  key_len: usize,
+  attr_rec: *const IcRecord,
+  attr_row: *const u8,
+  attr_len: usize,
+  values: *mut IcBlobValues,
+) -> i32 {
+  let kind = match write_kind_from_c(kind) {
+    Some(kind) => kind,
+    None => return err::IC_ERROR_NOT_SUPPORTED,
+  };
+  // SAFETY: the caller's promise.
+  let (key, attr) = match unsafe { (record_of(key_rec), record_of(attr_rec)) } {
+    (Some(key), Some(attr)) => (key, attr),
+    _ => return err::IC_ERROR_NULL_POINTER,
+  };
+  // SAFETY: the caller's promise.
+  let holder = match unsafe { blob_values_of(values) } {
+    Some(holder) => holder,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if key_len < key.row_size() as usize || attr_len < attr.row_size() as usize {
+    return err::IC_ERROR_RECORD_LAYOUT;
+  }
+  // SAFETY: the caller's promise.
+  let (key_bytes, attr_bytes) =
+    unsafe { (row_arg(key_row, key_len), row_arg(attr_row, attr_len)) };
+  // SAFETY: the caller's promise.
+  unsafe {
+    conn_code(conn, |c| {
+      key_op::write_key_blobs(c, kind, key, key_bytes, attr, attr_bytes, holder)
     })
   }
 }
@@ -4543,7 +5184,7 @@ pub unsafe extern "C" fn ic_apid_executor_stats(
   }
   let now = e.stats();
   let base = stats as *mut u8;
-  let counts: [(usize, u64); 8] = [
+  let counts: [(usize, u64); 9] = [
     (
       std::mem::offset_of!(IcExecutorStats, submitted),
       now.submitted,
@@ -4561,6 +5202,10 @@ pub unsafe extern "C" fn ic_apid_executor_stats(
     (std::mem::offset_of!(IcExecutorStats, sends), now.sends),
     (std::mem::offset_of!(IcExecutorStats, passes), now.passes),
     (std::mem::offset_of!(IcExecutorStats, scans), now.scans),
+    (
+      std::mem::offset_of!(IcExecutorStats, blob_rounds),
+      now.blob_rounds,
+    ),
   ];
   // SAFETY: the caller's promise; each field is written only if it lies
   // within `size` bytes.
@@ -4726,10 +5371,10 @@ pub unsafe extern "C" fn ic_apid_submitter_index_bind(
 ///
 /// Errors: `IC_ERROR_KEY_RECORD` when the key record does not hold every
 /// primary key field, or a record is over another table or another version of
-/// it; `IC_ERROR_NOT_SUPPORTED` for a record naming a blob field, until the
-/// calls for its values come. The shape is the caller's, freed with
-/// `ic_op_shape_free`; any thread may use it, and a request keeps what it
-/// needs of it.
+/// it. The attribute record may name blob fields, whose values each
+/// operation holds (`ic_request_blob`). The shape is the caller's, freed
+/// with `ic_op_shape_free`; any thread may use it, and a request keeps
+/// what it needs of it.
 ///
 /// # Safety
 ///
@@ -4750,10 +5395,6 @@ pub unsafe extern "C" fn ic_op_shape_create(
     };
   if shape.is_null() {
     return err::IC_ERROR_NULL_POINTER;
-  }
-  // As for a query: C has no calls for blob values until 12.8.
-  if attr.has_blob_fields() {
-    return err::IC_ERROR_NOT_SUPPORTED;
   }
   guarded(|| match OpShape::new(&table.def, key, attr) {
     Ok(made) => {
@@ -4792,11 +5433,6 @@ pub unsafe extern "C" fn ic_op_shape_create_unique(
   };
   if shape.is_null() {
     return err::IC_ERROR_NULL_POINTER;
-  }
-  // As for a shape by primary key: C has no calls for blob values until
-  // 12.8.
-  if attr.has_blob_fields() {
-    return err::IC_ERROR_NOT_SUPPORTED;
   }
   guarded(|| match OpShape::new_unique(&index.def, key, attr) {
     Ok(made) => {
@@ -5172,6 +5808,224 @@ pub unsafe extern "C" fn ic_request_op_result_len(
   match unsafe { op_ref(request, op) } {
     Some(found) => found.result_len(),
     None => 0,
+  }
+}
+
+/// Operation `op` of a request, to change.
+///
+/// # Safety
+///
+/// As [`request_of`].
+unsafe fn op_mut<'a>(
+  request: *mut IcRequest,
+  op: u32,
+) -> Option<&'a mut KeyOp> {
+  // SAFETY: the caller's promise.
+  let found = unsafe { request_of(request) }?;
+  found.ops_mut().get_mut(op as usize)
+}
+
+/// The value of the blob field `field_id` of operation `op`'s
+/// attribute record, as `ic_apid_query_blob` gives a query's: a write's
+/// value, or what a read brought once the request has run. Valid until
+/// the value is set again, the request runs again, or it is freed or
+/// cleared.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` for an `op` the request does not
+/// have, or a field id that names no blob field.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run; `value`
+/// points to a writable pointer; a non-null `len` to a writable `size_t`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_request_blob(
+  request: *const IcRequest,
+  op: u32,
+  field_id: u32,
+  value: *mut *const u8,
+  len: *mut usize,
+) -> i32 {
+  if request.is_null() || value.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  let found = match unsafe { op_ref(request, op) } {
+    Some(found) => found,
+    None => return err::IC_ERROR_NO_SUCH_FIELD,
+  };
+  match field_position(found.shape().attr_record(), field_id)
+    .and_then(|position| found.blob(position))
+  {
+    Ok(bytes) => {
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { blob_out(blob_parts(bytes), value, len) };
+      0
+    }
+    Err(e) => e.code,
+  }
+}
+
+/// Set the blob field `field_id` of operation `op` to a copy of `len`
+/// bytes at `value`, which may be NULL for an empty value.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`;
+/// `IC_NDB_ERROR_BLOB_TOO_LONG` for a value longer than its column's MySQL
+/// type holds.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run; a
+/// non-null `value` points to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn ic_request_set_blob(
+  request: *mut IcRequest,
+  op: u32,
+  field_id: u32,
+  value: *const u8,
+  len: usize,
+) -> i32 {
+  if request.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  let bytes = match unsafe { blob_in(value, len) } {
+    Ok(bytes) => bytes,
+    Err(code) => return code,
+  };
+  // SAFETY: the caller's promise.
+  match unsafe { op_mut(request, op) } {
+    Some(found) => guarded(|| {
+      let position = field_position(found.shape().attr_record(), field_id);
+      code_of(position.and_then(|position| found.set_blob(position, bytes)))
+    }),
+    None => err::IC_ERROR_NO_SUCH_FIELD,
+  }
+}
+
+/// Set the blob field `field_id` of operation `op` NULL.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run.
+#[no_mangle]
+pub unsafe extern "C" fn ic_request_set_blob_null(
+  request: *mut IcRequest,
+  op: u32,
+  field_id: u32,
+) -> i32 {
+  if request.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  match unsafe { op_mut(request, op) } {
+    Some(found) => {
+      let position = field_position(found.shape().attr_record(), field_id);
+      code_of(position.and_then(|position| found.set_blob_null(position)))
+    }
+    None => err::IC_ERROR_NO_SUCH_FIELD,
+  }
+}
+
+/// The blob field `field_id` of operation `op` made `len` bytes long,
+/// to fill in place, as `ic_apid_query_blob_buffer` does a query's:
+/// `buffer` is set to its bytes, NULL for an empty value, valid as
+/// `ic_request_blob`'s. A value longer than its column's MySQL type holds
+/// fails the operation with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run; `buffer`
+/// points to a writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn ic_request_blob_buffer(
+  request: *mut IcRequest,
+  op: u32,
+  field_id: u32,
+  len: usize,
+  buffer: *mut *mut u8,
+) -> i32 {
+  if request.is_null() || buffer.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  let found = match unsafe { op_mut(request, op) } {
+    Some(found) => found,
+    None => return err::IC_ERROR_NO_SUCH_FIELD,
+  };
+  let position = match field_position(found.shape().attr_record(), field_id) {
+    Ok(position) => position,
+    Err(e) => return e.code,
+  };
+  match found.blob_buf_mut(position) {
+    Ok(buf) => {
+      let at = fill_buffer(buf, len);
+      // SAFETY: checked non-null above; the caller's promise.
+      unsafe { buffer.write(at) };
+      0
+    }
+    Err(e) => e.code,
+  }
+}
+
+/// Have operation `op`, a committed read, take the shared lock and its
+/// lock reference in its first round, as
+/// `ic_apid_query_set_blob_lock_first` does a query. A committed read in
+/// a request of several operations always does.
+///
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` for an `op` the request does not
+/// have.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run.
+#[no_mangle]
+pub unsafe extern "C" fn ic_request_set_blob_lock_first(
+  request: *mut IcRequest,
+  op: u32,
+  lock_first: bool,
+) -> i32 {
+  if request.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  match unsafe { op_mut(request, op) } {
+    Some(found) => {
+      found.set_blob_lock_first(lock_first);
+      0
+    }
+    None => err::IC_ERROR_NO_SUCH_FIELD,
+  }
+}
+
+/// Have operation `op`, a write that finds no row, probe for parts a
+/// racing insert left, as `ic_apid_query_set_blob_probe` does a query.
+///
+/// Errors: as `ic_request_set_blob_lock_first`.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run.
+#[no_mangle]
+pub unsafe extern "C" fn ic_request_set_blob_probe(
+  request: *mut IcRequest,
+  op: u32,
+  probe: bool,
+) -> i32 {
+  if request.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  // SAFETY: the caller's promise.
+  match unsafe { op_mut(request, op) } {
+    Some(found) => {
+      found.set_blob_probe(probe);
+      0
+    }
+    None => err::IC_ERROR_NO_SUCH_FIELD,
   }
 }
 
@@ -6997,6 +7851,14 @@ mod tests {
       key_op::IC_NDB_ERROR_NO_SUCH_ROW
     );
     assert_eq!(
+      IC_NDB_ERROR_BLOB_TOO_LONG,
+      ic_apid::blob::IC_NDB_ERROR_BLOB_TOO_LONG
+    );
+    assert_eq!(
+      IC_NDB_ERROR_BLOB_DAMAGED,
+      ic_apid::blob::IC_NDB_ERROR_BLOB_DAMAGED
+    );
+    assert_eq!(
       IC_NDB_ERROR_ROW_EXISTS as u32,
       key_op::IC_NDB_ERROR_ROW_EXISTS
     );
@@ -7513,6 +8375,7 @@ mod tests {
     assert_eq!(opts.auto_increment_prefetch, 4096);
     assert_eq!(opts.auto_increment_step, 1);
     assert_eq!(opts.auto_increment_offset, 1);
+    assert_eq!(opts.blob_round_bytes, 1 << 20);
     assert_eq!(read.kind, IC_READ_KIND_SIMPLE);
     assert!(read.callback.is_none());
     assert_eq!(write.kind, IC_WRITE_KIND_UPDATE);

@@ -36,14 +36,14 @@ after_includes = """
  * Handles. IC_APID_GLOBAL, IC_APID_CONNECTION, IC_TABLE_DEF,
  * IC_INDEX_DEF, IC_RECORD, IC_APID_EXECUTOR, IC_APID_SUBMITTER,
  * IC_OP_SHAPE, IC_REQUEST, IC_SCAN_SHAPE, IC_SCAN_READER,
- * IC_PROGRAM_BUILDER and IC_PROGRAM are made by one function and given
- * back to their _free; the caller owns each until then. A connection,
- * and an executor, is freed before its global; a table, index or record
- * handle may outlive the connection that made it, a query or scan keeps
- * what it needs of its records, a request or reader what it needs of
- * its shapes, and each what it needs of its program. A NULL
- * handle or out pointer gives IC_ERROR_NULL_POINTER; a handle freed, or
- * never made, is undefined behaviour.
+ * IC_PROGRAM_BUILDER, IC_PROGRAM and IC_BLOB_VALUES are made by one
+ * function and given back to their _free; the caller owns each until
+ * then. A connection, and an executor, is freed before its global; a
+ * table, index or record handle may outlive the connection that made
+ * it, a query or scan keeps what it needs of its records, a request or
+ * reader what it needs of its shapes, and each what it needs of its
+ * program. A NULL handle or out pointer gives IC_ERROR_NULL_POINTER; a
+ * handle freed, or never made, is undefined behaviour.
  *
  * Ids. A query (IC_QUERY_ID), a transaction (IC_TRANS_ID) and a scan
  * (IC_SCAN_ID) are named by a 64-bit id in their connection, and each
@@ -67,6 +67,19 @@ after_includes = """
  * each row read; the _into calls read into the program's row instead.
  * The synchronous calls take the program's own rows, and copy.
  *
+ * Blob values. A BLOB, TEXT, JSON or GEOMETRY field named in an
+ * attribute record takes no room in the row and has no null bit: its
+ * value, NULL included, is kept beside the row, by the query
+ * (ic_apid_query_blob(), _set_blob(), _set_blob_null(),
+ * _blob_buffer()), by a request's operation (ic_request_blob() and the
+ * like) or, for the synchronous calls, by an IC_BLOB_VALUES holder made
+ * for the record (ic_blob_values_create()). A field is named by its
+ * id, as in every record call. A value read is valid until it is set
+ * again or its query, operation or holder is used again; a buffer keeps
+ * its capacity, so a run after the first allocates nothing. Such an
+ * operation goes in rounds, the commit riding on the last; see
+ * doc/user-guide.md, "Blob columns".
+ *
  * Strings. Strings in are NUL-terminated UTF-8, and copied. A string
  * out, a table's or a field's name, lives as long as the handle it came
  * from; an error's text is copied into the caller's buffer.
@@ -81,7 +94,9 @@ after_includes = """
  * built against an older header gets the fields it knows:
  * IC_EXECUTOR_OPTIONS and IC_EXECUTOR_STATS gained `scans` after 0.1,
  * IC_GLOBAL_OPTIONS its three AUTO_INCREMENT fields, and IC_FIELD_INFO
- * its `auto_increment` and `hidden_key` flags, in what was its padding.
+ * its `auto_increment` and `hidden_key` flags, in what was its padding;
+ * in 1.1 IC_GLOBAL_OPTIONS gained `blob_round_bytes` and
+ * IC_EXECUTOR_STATS `blob_rounds`.
  * The argument structs are taken whole, and one shorter than this
  * header's is refused with IC_ERROR_INCONSISTENT_DATA: a program is
  * built again against the header of a release that grows one.
@@ -164,6 +179,7 @@ include = ["IcApidCallback", "IcScanCallback"]
 "IcTableDef" = "IC_TABLE_DEF"
 "IcIndexDef" = "IC_INDEX_DEF"
 "IcRecord" = "IC_RECORD"
+"IcBlobValues" = "IC_BLOB_VALUES"
 "IcQueryId" = "IC_QUERY_ID"
 "IcTransId" = "IC_TRANS_ID"
 "IcApidCallback" = "IC_APID_CALLBACK"

@@ -1,6 +1,7 @@
 -- The tables of the examples: t1 for every example but auto_increment,
--- whose tables are t2 and t3. Run it through a MySQL server of the
--- cluster, for instance on the development cluster (doc/dev-cluster.md):
+-- whose tables are t2 and t3, and blobs, whose table is t4. Run it
+-- through a MySQL server of the cluster, for instance on the
+-- development cluster (doc/dev-cluster.md):
 --
 --   $BIN/mysql -uroot --protocol=tcp --host=127.0.0.1 --port 13000 \
 --     < examples/setup.sql
@@ -26,4 +27,14 @@ CREATE TABLE ic_ex.t2 (
 DROP TABLE IF EXISTS ic_ex.t3;
 CREATE TABLE ic_ex.t3 (
   val INT
+) ENGINE=NDB;
+
+-- blobs': a TEXT and a LONGBLOB beside the key, and a unique code.
+DROP TABLE IF EXISTS ic_ex.t4;
+CREATE TABLE ic_ex.t4 (
+  id   INT UNSIGNED NOT NULL PRIMARY KEY,
+  code INT UNSIGNED NOT NULL,
+  doc  TEXT,
+  data LONGBLOB,
+  UNIQUE KEY t4_code (code)
 ) ENGINE=NDB;

@@ -51,8 +51,8 @@
 //! ```
 //!
 //! The user guide, `doc/user-guide.md`, explains records, queries,
-//! transactions, callbacks, errors and when to try again, and node
-//! failure; `examples/rust` has five whole programs.
+//! transactions, callbacks, errors and when to try again, node failure
+//! and blob columns; `examples/rust` has twelve whole programs.
 //!
 //! Threading model (doc/rust/02-architecture.md): receive threads only
 //! receive signals and route them to the user thread that owns the

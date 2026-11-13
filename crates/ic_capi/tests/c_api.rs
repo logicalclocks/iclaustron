@@ -2116,3 +2116,529 @@ fn c_api_auto_increment_on_a_connection_and_through_an_executor() {
     ic_apid_global_free(global);
   }
 }
+
+/// The table of the blob group: a TEXT and a LONGBLOB, and a unique
+/// code.
+fn setup_capi_blob_table() -> Option<()> {
+  mysql(&format!(
+    "CREATE DATABASE IF NOT EXISTS {db};
+     DROP TABLE IF EXISTS {db}.capi_blob;
+     CREATE TABLE {db}.capi_blob (
+       id INT NOT NULL PRIMARY KEY,
+       code INT NOT NULL,
+       doc TEXT,
+       data LONGBLOB,
+       UNIQUE KEY capi_blob_code (code)
+     ) ENGINE=NDB;",
+    db = IC_IT_DB
+  ))?;
+  Some(())
+}
+
+/// A value of `len` bytes that differs from `seed` to `seed`, letters
+/// for a TEXT.
+fn pattern(len: usize, seed: u32, text: bool) -> Vec<u8> {
+  let mut value = Vec::with_capacity(len);
+  let mut i: u32 = 0;
+  while value.len() < len {
+    let n = i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 13;
+    if text {
+      value.push(b'a' + (n % 26) as u8);
+    } else {
+      value.push(n as u8);
+    }
+    i += 1;
+  }
+  value
+}
+
+/// The CRC-32 MySQL's CRC32() gives.
+fn crc32(bytes: &[u8]) -> u32 {
+  let mut table = [0u32; 256];
+  for (i, entry) in table.iter_mut().enumerate() {
+    let mut c = i as u32;
+    for _ in 0..8 {
+      if c & 1 != 0 {
+        c = 0xEDB8_8320 ^ (c >> 1);
+      } else {
+        c >>= 1;
+      }
+    }
+    *entry = c;
+  }
+  let mut crc: u32 = 0xFFFF_FFFF;
+  for byte in bytes {
+    crc = table[((crc ^ *byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+  }
+  crc ^ 0xFFFF_FFFF
+}
+
+/// What MySQL reads of a value: its length and CRC-32, tab separated,
+/// `NULL\tNULL` for NULL.
+fn read_back(value: Option<&[u8]>) -> String {
+  match value {
+    Some(bytes) => format!("{}\t{}", bytes.len(), crc32(bytes)),
+    None => "NULL\tNULL".to_string(),
+  }
+}
+
+/// What MySQL reads of row `id`'s doc and data.
+fn mysql_blobs(id: u32) -> String {
+  mysql(&format!(
+    "SELECT LENGTH(doc), CRC32(doc), LENGTH(data), CRC32(data)
+       FROM {}.capi_blob WHERE id = {}",
+    IC_IT_DB, id
+  ))
+  .expect("a MySQL client")
+}
+
+/// A blob value as C was given it, copied: `None` for NULL.
+///
+/// # Safety
+///
+/// A non-null `value` points to `len` readable bytes.
+unsafe fn c_value(value: *const u8, len: usize) -> Option<Vec<u8>> {
+  if value.is_null() {
+    return None;
+  }
+  // SAFETY: the caller's promise.
+  Some(unsafe { std::slice::from_raw_parts(value, len) }.to_vec())
+}
+
+/// A query's blob value, copied.
+///
+/// # Safety
+///
+/// `conn` is a connection handle not yet freed.
+unsafe fn query_value(
+  conn: *mut IcApidConnection,
+  query: IcQueryId,
+  field_id: u32,
+) -> Option<Vec<u8>> {
+  let mut value: *const u8 = std::ptr::null();
+  let mut len: usize = 0;
+  // SAFETY: the caller's promise; the rest are locals.
+  unsafe {
+    let ret = ic_apid_query_blob(conn, query, field_id, &mut value, &mut len);
+    assert_eq!(ret, 0, "field {}: {}", field_id, message(ret));
+    c_value(value, len)
+  }
+}
+
+/// A request operation's blob value, copied.
+///
+/// # Safety
+///
+/// `request` is a request handle not yet freed, not being run.
+unsafe fn op_value(
+  request: *const IcRequest,
+  op: u32,
+  field_id: u32,
+) -> Option<Vec<u8>> {
+  let mut value: *const u8 = std::ptr::null();
+  let mut len: usize = 0;
+  // SAFETY: the caller's promise; the rest are locals.
+  unsafe {
+    let ret = ic_request_blob(request, op, field_id, &mut value, &mut len);
+    assert_eq!(ret, 0, "op {} field {}: {}", op, field_id, message(ret));
+    c_value(value, len)
+  }
+}
+
+/// What [`run_alone`] defines: a read or a write, of an `IC_READ_KIND_*`
+/// or `IC_WRITE_KIND_*` kind.
+enum Define {
+  Read(u32),
+  Write(u32),
+}
+
+/// Run a query as a transaction of its own over `table`, defined as
+/// `define` says, and give how the transaction ended.
+///
+/// # Safety
+///
+/// `conn` and `table` are handles not yet freed.
+unsafe fn run_alone(
+  conn: *mut IcApidConnection,
+  table: *const IcTableDef,
+  query: IcQueryId,
+  define: Define,
+) -> u32 {
+  let any = IcTransactionHint {
+    kind: IC_HINT_ANY,
+    value: 0,
+  };
+  let mut trans: IcTransId = 0;
+  // SAFETY: the caller's promise; the rest are locals.
+  unsafe {
+    assert_eq!(
+      ic_apid_conn_start_transaction(conn, any, table, &mut trans),
+      0
+    );
+    let ret = match define {
+      Define::Read(kind) => {
+        let mut read = std::mem::MaybeUninit::<IcReadKeyArgs>::uninit();
+        ic_read_key_args_init(
+          read.as_mut_ptr(),
+          std::mem::size_of::<IcReadKeyArgs>(),
+        );
+        let mut read = read.assume_init();
+        read.kind = kind;
+        ic_apid_conn_read_key(conn, query, trans, &read)
+      }
+      Define::Write(kind) => {
+        let mut write = std::mem::MaybeUninit::<IcWriteKeyArgs>::uninit();
+        ic_write_key_args_init(
+          write.as_mut_ptr(),
+          std::mem::size_of::<IcWriteKeyArgs>(),
+        );
+        let mut write = write.assume_init();
+        write.kind = kind;
+        ic_apid_conn_write_key(conn, query, trans, &write)
+      }
+    };
+    assert_eq!(ret, 0, "define: {}", message(ret));
+    assert_eq!(ic_apid_conn_commit_transaction(conn, trans), 0);
+    let state = finish(conn, trans);
+    let mut done: IcQueryId = 0;
+    while ic_apid_conn_get_next_executed_query(conn, &mut done) {}
+    assert_eq!(ic_apid_conn_close_transaction(conn, trans), 0);
+    state
+  }
+}
+
+#[test]
+fn c_api_blob_values_on_a_connection_through_an_executor_and_the_helpers() {
+  // A small round, so that the values below go in several.
+  let global = match connect_with(|options| options.blob_round_bytes = 16_384) {
+    Some(global) => global,
+    None => return,
+  };
+  if setup_capi_blob_table().is_none() {
+    // SAFETY: the handle connect made.
+    unsafe { ic_apid_global_free(global) };
+    return;
+  }
+  let db = cs(IC_IT_DB);
+  let table_name = cs("capi_blob");
+  let index_name = cs("capi_blob_code$unique");
+  let doc_value = pattern(5_000, 1, true);
+  let data_value = pattern(40_000, 2, false);
+  // SAFETY: every handle below is used while alive and freed once;
+  // every pointer is to a local, or to a row or value the library gave.
+  unsafe {
+    let mut conn: *mut IcApidConnection = std::ptr::null_mut();
+    assert_eq!(ic_apid_global_create_connection(global, &mut conn), 0);
+    let mut table: *mut IcTableDef = std::ptr::null_mut();
+    let ret = ic_apid_conn_table_bind(
+      conn,
+      db.as_ptr(),
+      table_name.as_ptr(),
+      &mut table,
+    );
+    assert_eq!(ret, 0, "bind: {}", message(ret));
+    let id = field(table, "id");
+    let code = field(table, "code");
+    let doc = field(table, "doc");
+    let data = field(table, "data");
+    let mut key_rec: *mut IcRecord = std::ptr::null_mut();
+    assert_eq!(ic_record_create_default(table, &id, 1, &mut key_rec), 0);
+    let fields = [id, code, doc, data];
+    let mut rec: *mut IcRecord = std::ptr::null_mut();
+    assert_eq!(
+      ic_record_create_default(table, fields.as_ptr(), 4, &mut rec),
+      0
+    );
+
+    // An insert on a connection: one value set, one filled in place.
+    let mut query: IcQueryId = 0;
+    let ret = ic_apid_query_create(conn, table, key_rec, rec, &mut query);
+    assert_eq!(ret, 0, "a query naming blob fields: {}", message(ret));
+    let mut len: usize = 0;
+    let key = ic_apid_query_key_row(conn, query, &mut len);
+    put(key_rec, key, len, &[(id, "1")]);
+    let attr = ic_apid_query_attr_row(conn, query, &mut len);
+    put(rec, attr, len, &[(id, "1"), (code, "101")]);
+    let ret = ic_apid_query_set_blob(
+      conn,
+      query,
+      doc,
+      doc_value.as_ptr(),
+      doc_value.len(),
+    );
+    assert_eq!(ret, 0, "set: {}", message(ret));
+    let mut buffer: *mut u8 = std::ptr::null_mut();
+    let ret = ic_apid_query_blob_buffer(
+      conn,
+      query,
+      data,
+      data_value.len(),
+      &mut buffer,
+    );
+    assert_eq!(ret, 0, "buffer: {}", message(ret));
+    std::ptr::copy_nonoverlapping(
+      data_value.as_ptr(),
+      buffer,
+      data_value.len(),
+    );
+    let ret = ic_apid_query_set_blob(conn, query, code, std::ptr::null(), 0);
+    assert_eq!(ret, IC_ERROR_NO_SUCH_FIELD, "code is no blob field");
+    let state =
+      run_alone(conn, table, query, Define::Write(IC_WRITE_KIND_INSERT));
+    assert_eq!(state, IC_COMMIT_STATE_COMMITTED);
+    assert_eq!(ic_apid_query_error(conn, query), 0);
+    let want = format!(
+      "{}\t{}",
+      read_back(Some(&doc_value)),
+      read_back(Some(&data_value))
+    );
+    assert_eq!(mysql_blobs(1), want);
+
+    // Read back on the same query, committed, then locking first: the
+    // values come back whole, an empty one not NULL.
+    for lock_first in [false, true] {
+      assert_eq!(ic_apid_query_set_blob_null(conn, query, doc), 0);
+      assert_eq!(
+        ic_apid_query_set_blob(conn, query, data, b"x".as_ptr(), 1),
+        0
+      );
+      assert_eq!(
+        ic_apid_query_set_blob_lock_first(conn, query, lock_first),
+        0
+      );
+      let state =
+        run_alone(conn, table, query, Define::Read(IC_READ_KIND_COMMITTED));
+      assert_eq!(state, IC_COMMIT_STATE_COMMITTED);
+      assert_eq!(ic_apid_query_error(conn, query), 0);
+      assert!(query_value(conn, query, doc) == Some(doc_value.clone()));
+      assert!(query_value(conn, query, data) == Some(data_value.clone()));
+    }
+    assert_eq!(ic_apid_query_set_blob_lock_first(conn, query, false), 0);
+    assert_eq!(ic_apid_query_set_blob_probe(conn, query, false), 0);
+
+    // Through the unique index, a read and an update.
+    let mut index: *mut IcIndexDef = std::ptr::null_mut();
+    let ret = ic_apid_conn_index_bind(
+      conn,
+      db.as_ptr(),
+      index_name.as_ptr(),
+      table_name.as_ptr(),
+      &mut index,
+    );
+    assert_eq!(ret, 0, "index bind: {}", message(ret));
+    let mut code_rec: *mut IcRecord = std::ptr::null_mut();
+    assert_eq!(ic_record_create_default(table, &code, 1, &mut code_rec), 0);
+    let value_fields = [doc, data];
+    let mut value_rec: *mut IcRecord = std::ptr::null_mut();
+    assert_eq!(
+      ic_record_create_default(table, value_fields.as_ptr(), 2, &mut value_rec),
+      0
+    );
+    let mut unique: IcQueryId = 0;
+    let ret = ic_apid_query_create_unique(
+      conn,
+      index,
+      code_rec,
+      value_rec,
+      &mut unique,
+    );
+    assert_eq!(
+      ret,
+      0,
+      "a unique query naming blob fields: {}",
+      message(ret)
+    );
+    let key = ic_apid_query_key_row(conn, unique, &mut len);
+    put(code_rec, key, len, &[(code, "101")]);
+    let state =
+      run_alone(conn, table, unique, Define::Read(IC_READ_KIND_LOCKED));
+    assert_eq!(state, IC_COMMIT_STATE_COMMITTED);
+    assert!(query_value(conn, unique, doc) == Some(doc_value.clone()));
+    assert!(query_value(conn, unique, data) == Some(data_value.clone()));
+    let empty = ic_apid_query_set_blob(conn, unique, doc, std::ptr::null(), 0);
+    assert_eq!(empty, 0);
+    assert_eq!(ic_apid_query_set_blob_null(conn, unique, data), 0);
+    let state =
+      run_alone(conn, table, unique, Define::Write(IC_WRITE_KIND_UPDATE));
+    assert_eq!(state, IC_COMMIT_STATE_COMMITTED);
+    assert_eq!(mysql_blobs(1), "0\t0\tNULL\tNULL");
+    let empty = query_value(conn, unique, doc);
+    assert!(empty == Some(Vec::new()), "empty, not NULL");
+
+    // Through an executor: one request writes row 1 again and inserts
+    // row 2, another reads both.
+    let mut options = std::mem::MaybeUninit::<IcExecutorOptions>::uninit();
+    ic_executor_options_init(
+      options.as_mut_ptr(),
+      std::mem::size_of::<IcExecutorOptions>(),
+    );
+    let options = options.assume_init();
+    let mut executor: *mut IcApidExecutor = std::ptr::null_mut();
+    let ret = ic_apid_executor_start(global, &options, &mut executor);
+    assert_eq!(ret, 0, "start: {}", message(ret));
+    let mut submitter: *mut IcApidSubmitter = std::ptr::null_mut();
+    assert_eq!(ic_apid_executor_submitter(executor, &mut submitter), 0);
+    let mut shape: *mut IcOpShape = std::ptr::null_mut();
+    let ret = ic_op_shape_create(table, key_rec, rec, &mut shape);
+    assert_eq!(ret, 0, "a shape naming blob fields: {}", message(ret));
+    let mut request: *mut IcRequest = std::ptr::null_mut();
+    assert_eq!(ic_request_create(&mut request), 0);
+    for (key, unique_code, kind) in [
+      ("1", "101", IC_WRITE_KIND_WRITE),
+      ("2", "102", IC_WRITE_KIND_INSERT),
+    ] {
+      let mut op: u32 = 0;
+      assert_eq!(ic_request_add_write(request, shape, kind, &mut op), 0);
+      let row = ic_request_key_row(request, op, &mut len);
+      put(key_rec, row, len, &[(id, key)]);
+      let row = ic_request_attr_row(request, op, &mut len);
+      put(rec, row, len, &[(id, key), (code, unique_code)]);
+      let ret = ic_request_set_blob(
+        request,
+        op,
+        doc,
+        doc_value.as_ptr(),
+        doc_value.len(),
+      );
+      assert_eq!(ret, 0, "set: {}", message(ret));
+      let mut buffer: *mut u8 = std::ptr::null_mut();
+      let ret = ic_request_blob_buffer(
+        request,
+        op,
+        data,
+        data_value.len(),
+        &mut buffer,
+      );
+      assert_eq!(ret, 0, "buffer: {}", message(ret));
+      std::ptr::copy_nonoverlapping(
+        data_value.as_ptr(),
+        buffer,
+        data_value.len(),
+      );
+      assert_eq!(ic_request_set_blob_probe(request, op, true), 0);
+    }
+    let ret = ic_apid_submitter_execute(submitter, request);
+    assert_eq!(ret, 0, "the writes: {}", message(ret));
+    assert_eq!(mysql_blobs(1), want);
+    assert_eq!(mysql_blobs(2), want);
+    assert_eq!(ic_request_clear(request), 0);
+    for key in ["1", "2"] {
+      let mut op: u32 = 0;
+      assert_eq!(
+        ic_request_add_read(request, shape, IC_READ_KIND_COMMITTED, &mut op),
+        0
+      );
+      assert_eq!(ic_request_set_blob_lock_first(request, op, true), 0);
+      let row = ic_request_key_row(request, op, &mut len);
+      put(key_rec, row, len, &[(id, key)]);
+    }
+    let ret = ic_apid_submitter_execute(submitter, request);
+    assert_eq!(ret, 0, "the reads: {}", message(ret));
+    for op in [0, 1] {
+      assert_eq!(ic_request_op_error(request, op), 0);
+      assert!(op_value(request, op, doc) == Some(doc_value.clone()));
+      assert!(op_value(request, op, data) == Some(data_value.clone()));
+    }
+    let mut stats = std::mem::MaybeUninit::<IcExecutorStats>::uninit();
+    let ret = ic_apid_executor_stats(
+      executor,
+      stats.as_mut_ptr(),
+      std::mem::size_of::<IcExecutorStats>(),
+    );
+    assert_eq!(ret, 0);
+    let stats = stats.assume_init();
+    assert!(stats.blob_rounds > 0, "values of several rounds");
+
+    // The synchronous calls, with a holder: row 3 written, read back,
+    // and every row deleted with its parts.
+    let mut values: *mut IcBlobValues = std::ptr::null_mut();
+    assert_eq!(ic_blob_values_create(rec, &mut values), 0);
+    let ret =
+      ic_blob_values_set(values, doc, doc_value.as_ptr(), doc_value.len());
+    assert_eq!(ret, 0, "set: {}", message(ret));
+    assert_eq!(ic_blob_values_set_null(values, data), 0);
+    let mut row = vec![0u8; ic_record_row_size(rec) as usize];
+    put(
+      rec,
+      row.as_mut_ptr(),
+      row.len(),
+      &[(id, "3"), (code, "103")],
+    );
+    let mut key = vec![0u8; ic_record_row_size(key_rec) as usize];
+    put(key_rec, key.as_mut_ptr(), key.len(), &[(id, "3")]);
+    let ret = ic_apid_conn_write_blobs(
+      conn,
+      IC_WRITE_KIND_INSERT,
+      key_rec,
+      key.as_ptr(),
+      key.len(),
+      rec,
+      row.as_ptr(),
+      row.len(),
+      values,
+    );
+    assert_eq!(ret, 0, "write: {}", message(ret));
+    assert_eq!(
+      mysql_blobs(3),
+      format!("{}\tNULL\tNULL", read_back(Some(&doc_value)))
+    );
+    ic_blob_values_clear(values);
+    let mut found = false;
+    let mut out = vec![0u8; row.len()];
+    let ret = ic_apid_conn_read_committed_blobs(
+      conn,
+      key_rec,
+      key.as_ptr(),
+      key.len(),
+      rec,
+      out.as_mut_ptr(),
+      out.len(),
+      values,
+      &mut found,
+    );
+    assert_eq!(ret, 0, "read: {}", message(ret));
+    assert!(found);
+    assert_eq!(get(rec, out.as_ptr(), out.len(), code), "103");
+    let mut value: *const u8 = std::ptr::null();
+    assert_eq!(ic_blob_values_get(values, doc, &mut value, &mut len), 0);
+    assert!(c_value(value, len) == Some(doc_value.clone()));
+    assert_eq!(ic_blob_values_get(values, data, &mut value, &mut len), 0);
+    assert!(value.is_null(), "NULL");
+    let ret = ic_blob_values_get(values, code, &mut value, &mut len);
+    assert_eq!(ret, IC_ERROR_NO_SUCH_FIELD);
+    for key_text in ["1", "2", "3"] {
+      put(key_rec, key.as_mut_ptr(), key.len(), &[(id, key_text)]);
+      let ret = ic_apid_conn_write(
+        conn,
+        IC_WRITE_KIND_DELETE,
+        key_rec,
+        key.as_ptr(),
+        key.len(),
+        key_rec,
+        key.as_ptr(),
+        key.len(),
+      );
+      assert_eq!(ret, 0, "delete {}: {}", key_text, message(ret));
+    }
+    assert_eq!(
+      mysql(&format!("SELECT COUNT(*) FROM {}.capi_blob", IC_IT_DB)),
+      Some("0".to_string())
+    );
+
+    ic_blob_values_free(values);
+    ic_request_free(request);
+    ic_op_shape_free(shape);
+    ic_apid_submitter_free(submitter);
+    ic_apid_executor_free(executor);
+    assert_eq!(ic_apid_query_free(conn, unique), 0);
+    assert_eq!(ic_apid_query_free(conn, query), 0);
+    ic_record_free(value_rec);
+    ic_record_free(code_rec);
+    ic_record_free(rec);
+    ic_record_free(key_rec);
+    ic_index_def_free(index);
+    ic_table_def_free(table);
+    ic_apid_conn_free(conn);
+    ic_apid_global_free(global);
+  }
+}

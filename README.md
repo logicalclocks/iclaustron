@@ -21,7 +21,7 @@ updates run on the data nodes, and AUTO_INCREMENT values are handed
 out.
 
 - **Using it**: the user guide, [`doc/user-guide.md`](doc/user-guide.md),
-  and the same eleven example programs in Rust and C in
+  and the same twelve example programs in Rust and C in
   [`examples/`](examples/README.md).
 - **The C API**: `include/iclaustron/ic_apid.h`, generated from
   `crates/ic_capi`; `cargo xtask install` installs `libiclaustron` with

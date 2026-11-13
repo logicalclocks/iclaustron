@@ -35,14 +35,14 @@
  * Handles. IC_APID_GLOBAL, IC_APID_CONNECTION, IC_TABLE_DEF,
  * IC_INDEX_DEF, IC_RECORD, IC_APID_EXECUTOR, IC_APID_SUBMITTER,
  * IC_OP_SHAPE, IC_REQUEST, IC_SCAN_SHAPE, IC_SCAN_READER,
- * IC_PROGRAM_BUILDER and IC_PROGRAM are made by one function and given
- * back to their _free; the caller owns each until then. A connection,
- * and an executor, is freed before its global; a table, index or record
- * handle may outlive the connection that made it, a query or scan keeps
- * what it needs of its records, a request or reader what it needs of
- * its shapes, and each what it needs of its program. A NULL
- * handle or out pointer gives IC_ERROR_NULL_POINTER; a handle freed, or
- * never made, is undefined behaviour.
+ * IC_PROGRAM_BUILDER, IC_PROGRAM and IC_BLOB_VALUES are made by one
+ * function and given back to their _free; the caller owns each until
+ * then. A connection, and an executor, is freed before its global; a
+ * table, index or record handle may outlive the connection that made
+ * it, a query or scan keeps what it needs of its records, a request or
+ * reader what it needs of its shapes, and each what it needs of its
+ * program. A NULL handle or out pointer gives IC_ERROR_NULL_POINTER; a
+ * handle freed, or never made, is undefined behaviour.
  *
  * Ids. A query (IC_QUERY_ID), a transaction (IC_TRANS_ID) and a scan
  * (IC_SCAN_ID) are named by a 64-bit id in their connection, and each
@@ -66,6 +66,19 @@
  * each row read; the _into calls read into the program's row instead.
  * The synchronous calls take the program's own rows, and copy.
  *
+ * Blob values. A BLOB, TEXT, JSON or GEOMETRY field named in an
+ * attribute record takes no room in the row and has no null bit: its
+ * value, NULL included, is kept beside the row, by the query
+ * (ic_apid_query_blob(), _set_blob(), _set_blob_null(),
+ * _blob_buffer()), by a request's operation (ic_request_blob() and the
+ * like) or, for the synchronous calls, by an IC_BLOB_VALUES holder made
+ * for the record (ic_blob_values_create()). A field is named by its
+ * id, as in every record call. A value read is valid until it is set
+ * again or its query, operation or holder is used again; a buffer keeps
+ * its capacity, so a run after the first allocates nothing. Such an
+ * operation goes in rounds, the commit riding on the last; see
+ * doc/user-guide.md, "Blob columns".
+ *
  * Strings. Strings in are NUL-terminated UTF-8, and copied. A string
  * out, a table's or a field's name, lives as long as the handle it came
  * from; an error's text is copied into the caller's buffer.
@@ -80,7 +93,9 @@
  * built against an older header gets the fields it knows:
  * IC_EXECUTOR_OPTIONS and IC_EXECUTOR_STATS gained `scans` after 0.1,
  * IC_GLOBAL_OPTIONS its three AUTO_INCREMENT fields, and IC_FIELD_INFO
- * its `auto_increment` and `hidden_key` flags, in what was its padding.
+ * its `auto_increment` and `hidden_key` flags, in what was its padding;
+ * in 1.1 IC_GLOBAL_OPTIONS gained `blob_round_bytes` and
+ * IC_EXECUTOR_STATS `blob_rounds`.
  * The argument structs are taken whole, and one shorter than this
  * header's is refused with IC_ERROR_INCONSISTENT_DATA: a program is
  * built again against the header of a release that grows one.
@@ -456,6 +471,19 @@
 #define IC_NDB_ERROR_NULL_KEY 4316
 
 /*
+ A blob value longer than its column's MySQL type holds, refused
+ before anything is sent (the client's own, in NDB's range).
+ */
+#define IC_NDB_ERROR_BLOB_TOO_LONG 4266
+
+/*
+ A blob value whose parts are not all there, or whose head disagrees
+ with its column: a read fails with it, its transaction going on (the
+ client's own, in NDB's range).
+ */
+#define IC_NDB_ERROR_BLOB_DAMAGED 4267
+
+/*
  The row would break a unique index, which the error data names (an
  NDB error).
  */
@@ -760,6 +788,12 @@ typedef struct IC_APID_GLOBAL IC_APID_GLOBAL;
 typedef struct IC_APID_SUBMITTER IC_APID_SUBMITTER;
 
 /*
+ The values of a record's blob fields, kept apart from its row, for
+ the synchronous calls that take them (`IC_BLOB_VALUES`). Opaque.
+ */
+typedef struct IC_BLOB_VALUES IC_BLOB_VALUES;
+
+/*
  A unique index's description (`IC_INDEX_DEF`). Opaque.
  */
 typedef struct IC_INDEX_DEF IC_INDEX_DEF;
@@ -848,6 +882,13 @@ typedef struct {
    counting as one.
    */
   uint32_t auto_increment_offset;
+  /*
+   Bytes of part data a BLOB query sends or asks for in one round, a
+   longer value going on in rounds of its own; 1 MiB by default, zero
+   counting as the default. Added in 1.1: left out for a program
+   built against an older header.
+   */
+  uint32_t blob_round_bytes;
 } IC_GLOBAL_OPTIONS;
 
 /*
@@ -1239,6 +1280,11 @@ typedef struct {
    program built against 0.1.
    */
   uint64_t scans;
+  /*
+   Rounds of BLOB queries sent after their first; a request of
+   several rounds counts once among the admitted. Added in 1.1.
+   */
+  uint64_t blob_rounds;
 } IC_EXECUTOR_STATS;
 
 /*
@@ -1862,6 +1908,117 @@ uint32_t ic_apid_query_error_data(IC_APID_CONNECTION *conn, IC_QUERY_ID query);
 void *ic_apid_query_user_ref(IC_APID_CONNECTION *conn, IC_QUERY_ID query);
 
 /*
+ The value of the blob field `field_id` of the query's attribute
+ record: what a write is to send, or what a read brought once the
+ query has completed. `value` is set to NULL for NULL, else to the
+ value's bytes, `len` long, valid until the value is set again, the
+ query is defined again, or it is freed.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` for an id that names no query, or a
+ position that names no blob field.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed; `value` points to a
+ writable pointer; a non-null `len` to a writable `size_t`.
+ */
+int32_t ic_apid_query_blob(IC_APID_CONNECTION *conn,
+                           IC_QUERY_ID query,
+                           uint32_t field_id,
+                           const uint8_t **value,
+                           size_t *len);
+
+/*
+ Set the blob field `field_id` to a copy of `len` bytes at `value`,
+ which may be NULL for an empty value, for the executions defined from
+ now on.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_apid_query_blob`;
+ `IC_NDB_ERROR_BLOB_TOO_LONG` for a value longer than its column's MySQL
+ type holds; `IC_ERROR_TRANSACTION_ACTIVE` while the query is defined or
+ sent.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed; a non-null `value`
+ points to `len` readable bytes.
+ */
+int32_t ic_apid_query_set_blob(IC_APID_CONNECTION *conn,
+                               IC_QUERY_ID query,
+                               uint32_t field_id,
+                               const uint8_t *value,
+                               size_t len);
+
+/*
+ Set the blob field `field_id` NULL.
+
+ Errors: as `ic_apid_query_set_blob`.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed.
+ */
+int32_t ic_apid_query_set_blob_null(IC_APID_CONNECTION *conn,
+                                    IC_QUERY_ID query,
+                                    uint32_t field_id);
+
+/*
+ The blob field `field_id` made `len` bytes long, to fill in place:
+ `buffer` is set to its bytes, which hold the last value set or read
+ as far as it reaches and zeros after, NULL for an empty value, valid
+ as `ic_apid_query_blob`'s. The field is no longer NULL. A value
+ longer than its column's MySQL type holds fails the query's definition
+ with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+
+ Errors: as `ic_apid_query_set_blob`.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed; `buffer` points to a
+ writable pointer.
+ */
+int32_t ic_apid_query_blob_buffer(IC_APID_CONNECTION *conn,
+                                  IC_QUERY_ID query,
+                                  uint32_t field_id,
+                                  size_t len,
+                                  uint8_t **buffer);
+
+/*
+ Have a committed read take the shared lock and its lock reference in
+ its first round, for the executions defined from now on: two rounds,
+ whatever the value. Without it a committed read alone in its
+ transaction reads committed first, all of it for an inline value,
+ and three rounds for a value with parts.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` for an id that names no query;
+ `IC_ERROR_TRANSACTION_ACTIVE` while the query is defined or sent.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed.
+ */
+int32_t ic_apid_query_set_blob_lock_first(IC_APID_CONNECTION *conn,
+                                          IC_QUERY_ID query,
+                                          bool lock_first);
+
+/*
+ Have a write that finds no row also delete, if there, the part past
+ its new value's last, and the next while one is, for the executions
+ defined from now on: an insert racing the write may otherwise leave
+ parts past the value, never read. Off by default; such a write
+ commits a round later.
+
+ Errors: as `ic_apid_query_set_blob_lock_first`.
+
+ # Safety
+
+ `conn` is a connection handle not yet freed.
+ */
+int32_t ic_apid_query_set_blob_probe(IC_APID_CONNECTION *conn,
+                                     IC_QUERY_ID query,
+                                     bool probe);
+
+/*
  Fill `args`, `size` bytes, with the defaults: a simple read, the
  default abort option, no callback.
 
@@ -2241,6 +2398,154 @@ int32_t ic_apid_conn_write(IC_APID_CONNECTION *conn,
                            const IC_RECORD *attr_rec,
                            const uint8_t *attr_row,
                            size_t attr_len);
+
+/*
+ A holder for the values of the blob fields of `rec`, every value NULL,
+ for the synchronous calls that take them
+ (`ic_apid_conn_read_committed_blobs`, `ic_apid_conn_write_blobs`). A
+ field is named by its id, as every record call names it. The holder
+ is the caller's, freed with `ic_blob_values_free`; its buffers keep
+ their capacity from call to call.
+
+ # Safety
+
+ `rec` is a record handle not yet freed; `values` points to writable
+ storage for a pointer.
+ */
+int32_t ic_blob_values_create(const IC_RECORD *rec, IC_BLOB_VALUES **values);
+
+/*
+ Free a holder, its values with it.
+
+ # Safety
+
+ A non-null `values` is a holder handle not yet freed, freed here.
+ */
+void ic_blob_values_free(IC_BLOB_VALUES *values);
+
+/*
+ The value of the blob field `field_id`, as `ic_apid_query_blob`
+ gives a query's: `value` NULL for NULL, else at its bytes, `len`
+ long, valid until the value is set again, the holder is used by a
+ call, or it is freed.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` for a field id that names no blob
+ field.
+
+ # Safety
+
+ `values` is a holder handle not yet freed; `value` points to a
+ writable pointer; a non-null `len` to a writable `size_t`.
+ */
+int32_t ic_blob_values_get(IC_BLOB_VALUES *values,
+                           uint32_t field_id,
+                           const uint8_t **value,
+                           size_t *len);
+
+/*
+ Set the blob field `field_id` to a copy of `len` bytes at `value`,
+ which may be NULL for an empty value.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`;
+ `IC_NDB_ERROR_BLOB_TOO_LONG` for a value longer than its column's MySQL
+ type holds.
+
+ # Safety
+
+ `values` is a holder handle not yet freed; a non-null `value` points
+ to `len` readable bytes.
+ */
+int32_t ic_blob_values_set(IC_BLOB_VALUES *values,
+                           uint32_t field_id,
+                           const uint8_t *value,
+                           size_t len);
+
+/*
+ Set the blob field `field_id` NULL.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`.
+
+ # Safety
+
+ `values` is a holder handle not yet freed.
+ */
+int32_t ic_blob_values_set_null(IC_BLOB_VALUES *values, uint32_t field_id);
+
+/*
+ The blob field `field_id` made `len` bytes long, to fill in place,
+ as `ic_apid_query_blob_buffer` does a query's: `buffer` is set to its
+ bytes, NULL for an empty value, valid as `ic_blob_values_get`'s.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`.
+
+ # Safety
+
+ `values` is a holder handle not yet freed; `buffer` points to a
+ writable pointer.
+ */
+int32_t ic_blob_values_buffer(IC_BLOB_VALUES *values,
+                              uint32_t field_id,
+                              size_t len,
+                              uint8_t **buffer);
+
+/*
+ Set every value NULL, keeping each buffer's capacity.
+
+ # Safety
+
+ A non-null `values` is a holder handle not yet freed.
+ */
+void ic_blob_values_clear(IC_BLOB_VALUES *values);
+
+/*
+ As `ic_apid_conn_read_committed`, with the values of the attribute
+ record's blob fields read into `values`, a holder made for
+ `attr_rec`. The read is a transaction of its own: an inline value
+ takes one round, one with parts three. A row not there is no error:
+ `found` is false.
+
+ Errors: as `ic_apid_conn_read_committed`; `IC_ERROR_RECORD_LAYOUT` for
+ a holder not made for `attr_rec`; `IC_NDB_ERROR_BLOB_DAMAGED` for a
+ value whose parts are not all there.
+
+ # Safety
+
+ As `ic_apid_conn_read_committed`, with `values` a holder handle not
+ yet freed.
+ */
+int32_t ic_apid_conn_read_committed_blobs(IC_APID_CONNECTION *conn,
+                                          const IC_RECORD *key_rec,
+                                          const uint8_t *key_row,
+                                          size_t key_len,
+                                          const IC_RECORD *attr_rec,
+                                          uint8_t *attr_row,
+                                          size_t attr_len,
+                                          IC_BLOB_VALUES *values,
+                                          bool *found);
+
+/*
+ As `ic_apid_conn_write`, with the values of the attribute record's
+ blob fields from `values`, a holder made for `attr_rec`, which is
+ lent to the write and given back as it was. A transaction of its
+ own, in as many rounds as its values take.
+
+ Errors: as `ic_apid_conn_write`; `IC_ERROR_RECORD_LAYOUT` for a holder
+ not made for `attr_rec`; `IC_NDB_ERROR_BLOB_TOO_LONG` for a value
+ longer than its column's MySQL type holds.
+
+ # Safety
+
+ As `ic_apid_conn_write`, with `values` a holder handle not yet freed.
+ */
+int32_t ic_apid_conn_write_blobs(IC_APID_CONNECTION *conn,
+                                 uint32_t kind,
+                                 const IC_RECORD *key_rec,
+                                 const uint8_t *key_row,
+                                 size_t key_len,
+                                 const IC_RECORD *attr_rec,
+                                 const uint8_t *attr_row,
+                                 size_t attr_len,
+                                 IC_BLOB_VALUES *values);
 
 /*
  Fill `args`, `size` bytes, with the defaults: a committed read of
@@ -2812,10 +3117,10 @@ int32_t ic_apid_submitter_index_bind(IC_APID_SUBMITTER *submitter,
 
  Errors: `IC_ERROR_KEY_RECORD` when the key record does not hold every
  primary key field, or a record is over another table or another version of
- it; `IC_ERROR_NOT_SUPPORTED` for a record naming a blob field, until the
- calls for its values come. The shape is the caller's, freed with
- `ic_op_shape_free`; any thread may use it, and a request keeps what it
- needs of it.
+ it. The attribute record may name blob fields, whose values each
+ operation holds (`ic_request_blob`). The shape is the caller's, freed
+ with `ic_op_shape_free`; any thread may use it, and a request keeps
+ what it needs of it.
 
  # Safety
 
@@ -3024,6 +3329,108 @@ uint32_t ic_request_op_error_data(const IC_REQUEST *request, uint32_t op);
  A non-null `request` is a request handle not yet freed.
  */
 uint32_t ic_request_op_result_len(const IC_REQUEST *request, uint32_t op);
+
+/*
+ The value of the blob field `field_id` of operation `op`'s
+ attribute record, as `ic_apid_query_blob` gives a query's: a write's
+ value, or what a read brought once the request has run. Valid until
+ the value is set again, the request runs again, or it is freed or
+ cleared.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` for an `op` the request does not
+ have, or a field id that names no blob field.
+
+ # Safety
+
+ `request` is a request handle not yet freed, not being run; `value`
+ points to a writable pointer; a non-null `len` to a writable `size_t`.
+ */
+int32_t ic_request_blob(const IC_REQUEST *request,
+                        uint32_t op,
+                        uint32_t field_id,
+                        const uint8_t **value,
+                        size_t *len);
+
+/*
+ Set the blob field `field_id` of operation `op` to a copy of `len`
+ bytes at `value`, which may be NULL for an empty value.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`;
+ `IC_NDB_ERROR_BLOB_TOO_LONG` for a value longer than its column's MySQL
+ type holds.
+
+ # Safety
+
+ `request` is a request handle not yet freed, not being run; a
+ non-null `value` points to `len` readable bytes.
+ */
+int32_t ic_request_set_blob(IC_REQUEST *request,
+                            uint32_t op,
+                            uint32_t field_id,
+                            const uint8_t *value,
+                            size_t len);
+
+/*
+ Set the blob field `field_id` of operation `op` NULL.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`.
+
+ # Safety
+
+ `request` is a request handle not yet freed, not being run.
+ */
+int32_t ic_request_set_blob_null(IC_REQUEST *request,
+                                 uint32_t op,
+                                 uint32_t field_id);
+
+/*
+ The blob field `field_id` of operation `op` made `len` bytes long,
+ to fill in place, as `ic_apid_query_blob_buffer` does a query's:
+ `buffer` is set to its bytes, NULL for an empty value, valid as
+ `ic_request_blob`'s. A value longer than its column's MySQL type holds
+ fails the operation with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`.
+
+ # Safety
+
+ `request` is a request handle not yet freed, not being run; `buffer`
+ points to a writable pointer.
+ */
+int32_t ic_request_blob_buffer(IC_REQUEST *request,
+                               uint32_t op,
+                               uint32_t field_id,
+                               size_t len,
+                               uint8_t **buffer);
+
+/*
+ Have operation `op`, a committed read, take the shared lock and its
+ lock reference in its first round, as
+ `ic_apid_query_set_blob_lock_first` does a query. A committed read in
+ a request of several operations always does.
+
+ Errors: `IC_ERROR_NO_SUCH_FIELD` for an `op` the request does not
+ have.
+
+ # Safety
+
+ `request` is a request handle not yet freed, not being run.
+ */
+int32_t ic_request_set_blob_lock_first(IC_REQUEST *request,
+                                       uint32_t op,
+                                       bool lock_first);
+
+/*
+ Have operation `op`, a write that finds no row, probe for parts a
+ racing insert left, as `ic_apid_query_set_blob_probe` does a query.
+
+ Errors: as `ic_request_set_blob_lock_first`.
+
+ # Safety
+
+ `request` is a request handle not yet freed, not being run.
+ */
+int32_t ic_request_set_blob_probe(IC_REQUEST *request, uint32_t op, bool probe);
 
 /*
  Where the last run's transaction ended: `IC_COMMIT_STATE_COMMITTED`

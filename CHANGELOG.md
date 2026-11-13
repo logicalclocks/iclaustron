@@ -29,7 +29,8 @@ character column, and gets some conditions wrong
   connection.
 - Character sets as the data nodes describe them: text in and out of
   rows, and keys of every collation placed by their hash, but three
-  that weigh a character by its neighbours (user guide, section 12).
+  that weigh a character by its neighbours (user guide, "What is not
+  done yet").
 - Programs: conditions and assignments that run on the data nodes, on
   key operations and on scans.
 - AUTO_INCREMENT values from the counter MySQL uses, and tables
@@ -74,7 +75,7 @@ character column, and gets some conditions wrong
 ### Not done yet
 
 Blob columns, TLS, location domains, events and schema changes, among
-others: user guide, section 12.
+others: user guide, "What is not done yet".
 
 ## 0.1.0 (2026-10-15)
 

@@ -13,7 +13,7 @@
 
 PROGRAMS = describe key_ops pipeline unique retry \
   scan range_scan scan_update scan_executor \
-  conditional_update auto_increment
+  conditional_update auto_increment blobs
 
 CFLAGS ?= -O2
 CFLAGS += -std=c11 -D_POSIX_C_SOURCE=200809L -Wall -Wextra

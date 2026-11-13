@@ -30,9 +30,10 @@
 //! phase 12). Naming one says that the operation reads or writes it.
 //! Only a column the table was bound with as usable may be named
 //! ([`BlobColumn`](crate::blob::BlobColumn)); another is refused with
-//! `IC_ERROR_NOT_SUPPORTED`. A query's insert takes a record naming
-//! blob fields (12.3); the other operations refuse one until phase 12
-//! brings them, and scans, takeovers and key records always will.
+//! `IC_ERROR_NOT_SUPPORTED`. Key operations take a record naming blob
+//! fields, by primary or unique key, on a connection, through an
+//! executor and with the helpers named for them; scans, takeovers and
+//! key records refuse one.
 //!
 //! **Checked when made, as the reference checks a record:** every field
 //! exists, no field comes twice, every value and null bit lies inside

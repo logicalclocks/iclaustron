@@ -5,12 +5,13 @@ read and write rows of a RonDB cluster directly, as an API node: by
 primary key and by unique key, in transactions, and by scans of tables
 and of ordered indexes, with conditions and updates that run on the
 data nodes. It is written in Rust and has a C API; this guide covers
-both, against RonDB 26.10, as of release 1.0: the key operations of
-0.1, executors and scans (section 5), programs (section 6), and
-AUTO_INCREMENT and tables without a primary key (section 7). What
-changed from release to release is in [`CHANGELOG.md`](../CHANGELOG.md).
+both, against RonDB 26.10, as of release 1.1: the key operations of
+0.1, executors and scans (section 5), programs (section 6),
+AUTO_INCREMENT and tables without a primary key (section 7), and, new
+in 1.1, blob columns (section 8). What changed from release to release
+is in [`CHANGELOG.md`](../CHANGELOG.md).
 
-The examples in `examples/` are the same eleven programs in Rust and in
+The examples in `examples/` are the same twelve programs in Rust and in
 C, and the guide quotes them. The C API's reference is its header,
 `include/iclaustron/ic_apid.h`; the Rust API's is `cargo doc`; the
 design behind both is `doc/rust/04-api-design.md`.
@@ -208,11 +209,11 @@ the values it reads or writes. The key record holds every primary key
 field, or for a query through a unique index every indexed field. One
 record covering every field serves as both.
 
-**Blob columns** (BLOB, TEXT, JSON, GEOMETRY) are not read or written in
-1.0: a table that has one can be bound and used, but records leave the
-column out (a default record does so by itself), and deleting a row of
-such a table is refused (`IC_ERROR_DELETE_WITH_BLOBS`, 7153), since
-its blob's parts would be left behind.
+**Blob columns** (BLOB, TEXT, JSON, GEOMETRY) are read and written
+whole when a record names them; a default record leaves them out, so a
+program that does not name one never pays for them. A blob field takes
+no room in the row and has no null bit: its value is kept beside the
+row (section 8).
 
 **Tables without a primary key** have a last column of their own,
 `$PK`, BIGINT UNSIGNED, which MySQL adds as the table's key and fills
@@ -370,7 +371,7 @@ them all at once, and polls for the replies:
 
 A completed query goes to the connection's executed list, taken with
 `get_next_executed_query`, or, if it was defined with a callback, has
-its callback called (section 8). A program can keep many transactions
+its callback called (section 9). A program can keep many transactions
 in flight on one connection, and that is where the throughput is: the
 `pipeline` example keeps 32 single-row transactions in flight.
 
@@ -540,7 +541,7 @@ reads the whole index.
   fixes the table's distribution key, its low and high bound taking
   the same values for it, and every range falls in the same partition,
   one the library can work out (not, for instance, for a key in one of
-  the collations section 12 names). On a table made with
+  the collations section 13 names). On a table made with
   `COMMENT="NDB_TABLE=PARTITION_HASH=base:detail:fanout"`, ranges
   that fix only the first `base` columns of the primary key, the same
   in every range, read the fanout's partitions for that base alone.
@@ -575,7 +576,7 @@ too long ends the scan with 296; a lock waited for too long with 274
 or 266; the failure of the coordinator's node with 4028; six minutes
 without a word from the coordinator, while the run waits for it to
 start, to send a batch or to confirm the stop, with 4012, whose
-outcome is unknown (section 9). All are temporary: start the scan
+outcome is unknown (section 10). All are temporary: start the scan
 again.
 
 ## 6. Programs: conditions and updates on the data nodes
@@ -773,7 +774,160 @@ The `auto_increment` example takes values one at a time and as a
 block, inserts an id of its own, and inserts, scans and deletes rows of
 a table without a primary key.
 
-## 8. Callbacks
+## 8. Blob columns
+
+New in 1.1. A BLOB, TEXT, JSON or GEOMETRY column keeps a value's
+first bytes in the row, 256 for most types, and the rest in parts in a
+table of its own, 2 000 bytes each for a TEXT and 13 948 for a
+LONGBLOB, which the client keeps in step. iClaustron reads and writes
+such a value whole, by primary or unique key, in the three ways of
+section 5. A JSON or GEOMETRY value is MySQL's own binary form, given
+and taken as bytes.
+
+**Naming one.** A record that names a blob field says the operation
+reads or writes it. The field takes no room in the row and has no null
+bit: its value, NULL included, is kept beside the row, by the query, by
+an executor's operation, or for the synchronous calls by a holder. In
+Rust a field is named by its position in the record, in C by its id, as
+every C record call names it. A value is NULL until set.
+
+```rust
+let rec = Record::default_for(&table, Some(&[id, code, doc, data]))?;
+let at_doc = rec.position_of(doc).ok_or(no_field)?;
+let qid = conn.create_query(&table, &key_rec, &rec)?;
+let query = conn.query_mut(qid).ok_or(no_field)?;
+query.set_blob(at_doc, b"some text")?;
+let buf = query.blob_buf_mut(at_data)?; // filled in place
+buf.clear();
+buf.extend_from_slice(&bytes);
+// after a read: query.blob(at_doc)? is Some(&[u8]), or None for NULL
+```
+
+```c
+uint32_t fields[] = {id, code, doc, data};
+uint8_t *buffer;
+const uint8_t *value;
+size_t len;
+
+ret = ic_record_create_default(table, fields, 4, &rec);
+ret = ic_apid_query_create(conn, table, key_rec, rec, &query);
+ret = ic_apid_query_set_blob(conn, query, doc, text, text_len);
+ret = ic_apid_query_blob_buffer(conn, query, data, n, &buffer);
+memcpy(buffer, bytes, n);                /* filled in place */
+/* after a read: value is NULL for NULL */
+ret = ic_apid_query_blob(conn, query, doc, &value, &len);
+```
+
+A buffer keeps its capacity, so a query used again allocates nothing
+for its values. A value read is valid until it is set again or the
+query is defined again. The values cannot change while the query is
+defined or sent: its rounds read them as they go.
+
+**Rounds.** A value with parts takes more than one round trip, each at
+most `blob_round_bytes` of part data (1 MiB by default, in the global's
+options), a longer value going on in rounds of its own. The library
+sends each round as the poll sees the last one done, and the commit
+rides on the last round of the transaction's last BLOB query:
+
+- an insert: the row and its parts in one round;
+- an update or a write: the old value's length read, locked, beside
+  the row's write, then the new parts written and the old ones past
+  them deleted;
+- a delete: the old values' lengths, then the row and every part; a
+  delete from a table with blob columns does this whether its record
+  names one or not;
+- a locked read: the row with its lock, then the parts;
+- a committed read alone in its transaction: the row read committed,
+  all for a value without parts; one with parts is read again with a
+  shared lock, then its parts, three rounds. Beside other operations,
+  or with `set_blob_lock_first(true)`
+  (`ic_apid_query_set_blob_lock_first`), it takes the lock first, two
+  rounds whatever the value;
+- through a unique index: the first round goes through the index with
+  the operation's lock and finds the row's primary key, the rest goes
+  by it. A read through an index holds its lock to the commit.
+
+A part not there fails a read with 4267 (`IC_NDB_ERROR_BLOB_DAMAGED`),
+its transaction going on; a value longer than its column's MySQL type
+holds is refused with 4266 (`IC_NDB_ERROR_BLOB_TOO_LONG`) before
+anything is sent: 255 bytes for TINYBLOB and TINYTEXT, 65 535 for BLOB
+and TEXT, 16 MiB less a byte for the MEDIUM types, 4 GiB less a byte
+for the rest.
+
+**A write that finds no row** deletes no part. An insert racing it,
+between its length read and its write, can then leave parts past the
+value it writes, which are never read, and which no later write or
+delete of the row, going by the length it reads, deletes.
+`set_blob_probe(true)` (`ic_apid_query_set_blob_probe`) makes such a
+write look for them, a round later.
+
+**Through an executor** each `KeyOp` holds its values, with the same
+calls (`ic_request_blob`, `ic_request_set_blob` and the like, by
+operation); a request of many BLOB operations is one transaction, and
+`blob_rounds` in the executor's statistics counts the rounds after each
+operation's first.
+
+```rust
+let shape = OpShape::new(&table, &key_rec, &values_rec)?;
+let mut op = KeyOp::read(&shape, ReadKind::Committed);
+put_u32(&key_rec, op.key_row_mut(), id, 1)?;
+let mut request = Request::with_op(op);
+submitter.execute(&mut request)?;
+let data = request.ops()[0].blob(at_data)?;
+```
+
+```c
+ret = ic_op_shape_create(table, key_rec, values_rec, &shape);
+ret = ic_request_add_read(request, shape, IC_READ_KIND_COMMITTED, &op);
+memcpy(ic_request_key_row(request, op, &len), &key, sizeof key);
+ret = ic_apid_submitter_execute(submitter, request);
+ret = ic_request_blob(request, op, data, &value, &len);
+```
+
+**Synchronously** the values are in a holder made for the record, lent
+to the call and given back: `read_committed_blobs` and
+`write_key_blobs` (`ic_apid_conn_read_committed_blobs`,
+`ic_apid_conn_write_blobs`). `write_key`, whose records name no blob
+field, deletes from a table with blob columns all the same.
+
+```rust
+let mut values = BlobValues::new(&rec);
+values.set_blob(at_doc, &text)?;
+key_op::write_key_blobs(
+  &mut conn, WriteKind::Write, &key_rec, &key, &rec, &row, &mut values,
+)?;
+values.clear();
+let found = key_op::read_committed_blobs(
+  &mut conn, &key_rec, &key, &rec, &mut row, &mut values,
+)?;
+```
+
+```c
+ret = ic_blob_values_create(rec, &values);
+ret = ic_blob_values_set(values, doc, text, text_len);
+ret = ic_apid_conn_write_blobs(conn, IC_WRITE_KIND_WRITE, key_rec,
+                               key_row, key_len, rec, row, row_len,
+                               values);
+ic_blob_values_clear(values);
+ret = ic_apid_conn_read_committed_blobs(conn, key_rec, key_row, key_len,
+                                        rec, row, row_len, values,
+                                        &found);
+```
+
+**Not taken**: a scan, and a row a scan hands over, name no blob field
+(`IC_ERROR_NOT_SUPPORTED`), and a delete of a row taken over from a
+scan on such a table is refused (`IC_ERROR_DELETE_WITH_BLOBS`, 7153),
+as is any delete on a table with a blob column the client cannot use
+(`BlobColumn::is_usable`): one of the first version of the layout, a
+striped one, one whose parts table is missing, or one on a table
+partitioned by the user or with a TTL. Naming such a column is
+refused. `read_unique_committed` takes no blob field, and a BLOB query
+runs no program.
+
+The `blobs` example writes, reads and deletes a TEXT and a LONGBLOB in
+the three ways.
+
+## 9. Callbacks
 
 A query defined with a callback has it called when it completes:
 **on the thread that polls, from inside the poll**, with the connection,
@@ -823,7 +977,7 @@ QueryId, usize)`, with `user_ref` its only context; state it shares with
 the rest of the program lives where a plain function can reach it, as
 in the `pipeline` example's statics.
 
-## 9. Errors
+## 10. Errors
 
 ### What an error says
 
@@ -895,7 +1049,7 @@ values. A read may simply be tried again.
 **A user error does not clear up by itself**: the request has to
 change, or the condition is the answer (626 means there is no row).
 
-## 10. Node failure
+## 11. Node failure
 
 The library keeps the API node in the cluster on its own: it exchanges
 heartbeats with every data node, notices a link that goes quiet,
@@ -923,7 +1077,7 @@ In short: retry temporary errors, and treat 4012 as above. A
 transaction that goes to a cluster with no started node fails with
 7142 until one is back.
 
-## 11. Performance
+## 12. Performance
 
 - **Batch.** One send per data node carries every query defined since
   the last; many queries per transaction, and many transactions in
@@ -949,7 +1103,7 @@ transaction that goes to a cluster with no started node fails with
 - **Measure release builds.** The library's checks in a debug build
   cost time a release build does not spend.
 
-## 12. What is not done yet
+## 13. What is not done yet
 
 - Programs are the basic set: comparisons, IS NULL, AND, OR and NOT,
   adding and subtracting integers, and assignments with a condition of
@@ -960,8 +1114,10 @@ transaction that goes to a cluster with no started node fails with
   application asks for the value (section 7).
 - Rows a scan has locked are taken over on a connection only, not
   through an executor.
-- No blob columns (BLOB, TEXT, JSON, GEOMETRY): records leave them out,
-  and deletes on their tables are refused.
+- Blob columns are read and written by key only: a scan, and a row a
+  scan hands over, take no blob field (section 8). Only the second
+  version of the blob layout, the one MySQL servers have made since
+  5.1, is read.
 - No schema changes: tables and indexes are made through a MySQL
   server.
 - No TLS between the API node and the cluster, and no choosing data

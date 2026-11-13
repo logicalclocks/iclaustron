@@ -769,6 +769,21 @@ impl BlobValues {
     count == self.slots.len()
   }
 
+  /// The position in its record of the blob field with id `field_id`,
+  /// as the C ABI names a field by its id; `None` if the record names
+  /// no such blob field.
+  pub fn position_of(&self, field_id: u32) -> Option<u32> {
+    let mut position: usize = 0;
+    while position < self.slot_by_position.len() {
+      let slot = self.slot_by_position[position];
+      if slot != u32::MAX && self.slots[slot as usize].field_id == field_id {
+        return Some(position as u32);
+      }
+      position += 1;
+    }
+    None
+  }
+
   /// The field at `position`'s value: `None` when it is NULL.
   /// `IC_ERROR_NO_SUCH_FIELD` when the position names no blob field.
   pub fn blob(&self, position: u32) -> Result<Option<&[u8]>, IcError> {
@@ -1796,6 +1811,12 @@ mod tests {
     let mut values = BlobValues::new(&rec);
     assert_eq!(values.len(), 2);
     assert!(values.fits(&rec));
+    // By field id, as the C ABI names fields: t at 1, tiny at 2; id is
+    // no blob, and b is not in the record.
+    assert_eq!(values.position_of(1), Some(1));
+    assert_eq!(values.position_of(3), Some(2));
+    assert_eq!(values.position_of(0), None);
+    assert_eq!(values.position_of(2), None);
     let no_such = values.blob(0).expect_err("not a blob");
     assert_eq!(no_such.code, err::IC_ERROR_NO_SUCH_FIELD);
     assert_eq!(values.blob(1).expect("t"), None);

@@ -60,6 +60,10 @@ path = "conditional_update.rs"
 name = "auto_increment"
 path = "auto_increment.rs"
 
+[[example]]
+name = "blobs"
+path = "blobs.rs"
+
 [dependencies]
 ic_apid.workspace = true
 ic_port.workspace = true

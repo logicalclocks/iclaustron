@@ -10,3 +10,4 @@ scan_update
 scan_executor
 conditional_update
 auto_increment
+blobs

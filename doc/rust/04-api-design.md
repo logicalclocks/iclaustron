@@ -200,19 +200,27 @@ then, into the connection's staged buffer, and goes with the next send.
 - Every row size a table can hold is written: a request too large for
   one message goes as a train of fragments (05 §2.2).
 
-### Blob values (phase 12; inserts since 12.3, other writes since 12.4, reads since 12.5, executors and helpers since 12.6, unique keys since 12.7)
+### Blob values (phase 12, release 1.1)
 
 An attribute record may name blob fields (BLOB, TEXT, and a MySQL
 server's JSON and GEOMETRY), and a query over it holds their values
 beside its rows, NULL until set: `query.set_blob(position, &[u8])`,
 `set_blob_null(position)`, `blob_buf_mut(position)` to fill a value's
 buffer in place, and `blob(position)`, `None` for NULL, where a position
-is the field's in the record. A value too long for a column with no
-parts table (MySQL's TINYBLOB and TINYTEXT) is refused with 4266, when
-it is set or when the query is defined. The values cannot change while
-the query is defined or sent (`IC_ERROR_TRANSACTION_ACTIVE`), as its
-rounds read them as they go. A JSON or GEOMETRY value is MySQL's own
-binary form, which the application gives and takes as bytes.
+is the field's in the record. In C the calls take the field's id, as
+every C record call does (ours to choose: C has no call giving a
+position): `ic_apid_query_set_blob(conn, query, field_id, value, len)`,
+`ic_apid_query_set_blob_null`, `ic_apid_query_blob_buffer(conn, query,
+field_id, len, &buffer)`, which makes the value `len` bytes long, its
+old bytes kept as far as they reach, for C to fill, and
+`ic_apid_query_blob(conn, query, field_id, &value, &len)`, `value` NULL
+for NULL and never NULL for an empty value. A value too long for a
+column with no parts table (MySQL's TINYBLOB and TINYTEXT) is refused
+with 4266 (`IC_NDB_ERROR_BLOB_TOO_LONG`), when it is set or when the
+query is defined. The values cannot change while the query is defined
+or sent (`IC_ERROR_TRANSACTION_ACTIVE`), as its rounds read them as
+they go. A JSON or GEOMETRY value is MySQL's own binary form, which the
+application gives and takes as bytes.
 
 A value written is held to its MySQL type's limit (the author,
 2026-11-12; chapter 10), `BlobSizes::max_length`, which can be narrower
@@ -262,8 +270,10 @@ transaction, counted once towards `in_flight`; its commit, asked for at
 admission, waits inside the connection for the last round, and
 `ExecutorStats::blob_rounds` counts the rounds after each query's
 first. A committed read alone in its request reads committed first;
-beside other operations it takes the lock first. In C,
-`ic_request_blob` and its setters come with 12.8.
+beside other operations it takes the lock first. In C, by operation:
+`ic_request_blob`, `ic_request_set_blob`, `ic_request_set_blob_null`,
+`ic_request_blob_buffer`, `ic_request_set_blob_lock_first` and
+`ic_request_set_blob_probe`; `IC_EXECUTOR_STATS` gained `blob_rounds`.
 
 The synchronous helpers, each a transaction of its own on the
 transaction API, take the values in a `BlobValues` holder made for the
@@ -276,12 +286,55 @@ API does (ours to choose, where `write_key` takes the operation's
 number). A write's holder is lent to it and given back as it was,
 hence taken mutably. `key_op::write_key`, whose records name no blob
 field, deletes from a table with blob columns in two rounds, the parts
-with the row. In C, `IC_BLOB_VALUES`,
-`ic_apid_conn_read_committed_blobs` and `ic_apid_conn_write_key_blobs`
-come with 12.8, and examples in both languages with them.
+with the row. In C the holder is an `IC_BLOB_VALUES` handle
+(`ic_blob_values_create(rec, &values)`, `_free`, `_get`, `_set`,
+`_set_null`, `_buffer`, `_clear`), and the helpers are
+`ic_apid_conn_read_committed_blobs` and `ic_apid_conn_write_blobs`,
+named after `ic_apid_conn_write`, the C form of `write_key`, as the
+transaction API's `ic_apid_conn_write_key` defines a query (ours to
+choose, where chapter 06 planned `_write_key_blobs`).
+
+```rust
+let rec = Record::default_for(&table, Some(&[id, code, doc, data]))?;
+let at_doc = rec.position_of(doc).ok_or(no_field)?;
+let mut values = BlobValues::new(&rec);
+values.set_blob(at_doc, &text)?;
+key_op::write_key_blobs(
+  &mut conn, WriteKind::Write, &key_rec, &key, &rec, &row, &mut values,
+)?;
+values.clear();
+let found = key_op::read_committed_blobs(
+  &mut conn, &key_rec, &key, &rec, &mut row, &mut values,
+)?;
+let read = values.blob(at_doc)?; // None for NULL
+```
+
+```c
+uint32_t fields[] = {id, code, doc, data};
+const uint8_t *value;
+size_t len;
+bool found;
+
+ret = ic_record_create_default(table, fields, 4, &rec);
+ret = ic_blob_values_create(rec, &values);
+ret = ic_blob_values_set(values, doc, text, text_len);
+ret = ic_apid_conn_write_blobs(conn, IC_WRITE_KIND_WRITE, key_rec,
+                               key_row, key_len, rec, row, row_len,
+                               values);
+ic_blob_values_clear(values);
+ret = ic_apid_conn_read_committed_blobs(conn, key_rec, key_row, key_len,
+                                        rec, row, row_len, values,
+                                        &found);
+ret = ic_blob_values_get(values, doc, &value, &len); /* NULL for NULL */
+```
+
+The `blobs` example (`examples/rust/blobs.rs`, `examples/c/blobs.c`)
+does this, and the same through a query by primary key and through
+the unique index, and through an executor.
 
 Every write goes in rounds (chapter 06, phase 12), at most
-`GlobalOptions::blob_round_bytes` (1 MiB by default) of part data in a
+`GlobalOptions::blob_round_bytes` (1 MiB by default; in C a field
+appended to `IC_GLOBAL_OPTIONS`, read field by field) of part data in a
 round, a delete counting a whole part, a longer value going on in
 rounds of its own:
 
@@ -316,8 +369,9 @@ rounds of its own:
 
 A column with no parts table takes no head read, and a read of only
 such columns is the program's own read, in one round. The values a
-read brings are the query's, `blob(position)`, once it completes. An update or a delete
-of a row not there fails in its first round, and sends nothing more.
+read brings are the query's, `blob(position)`, once it completes. An
+update or a delete of a row not there fails in its first round, and
+sends nothing more.
 Two BLOB queries on one row in one transaction run one after the
 other, in the order they were defined. The query itself goes on no
 wire: its run's operations carry it, and it completes once, when its
@@ -326,9 +380,7 @@ saw the one before it done, with whatever else is defined on the
 connection. A commit asked for waits for the last round of every BLOB
 query of its transaction and rides on it, or goes alone once none has
 another. `conn.blob_rounds()` counts the rounds sent after a query's
-first. In C the calls for values come with 12.8; until then
-`ic_apid_query_create` refuses a record naming a blob field, while a
-delete by primary key from a table with blob columns goes through.
+first.
 
 ### Transactions
 
@@ -1374,7 +1426,8 @@ node), no events.
   `IC_EXECUTOR_OPTIONS`) and `IC_EXECUTOR_STATS` are read and written
   field by field, so a program built against an older header gets the
   fields it knows; `IC_FIELD_INFO`'s new flags took its padding, so its
-  size has not changed. The argument structs (`IC_READ_KEY_ARGS`,
+  size has not changed. In 1.1 `IC_GLOBAL_OPTIONS` gained
+  `blob_round_bytes` and `IC_EXECUTOR_STATS` `blob_rounds`. The argument structs (`IC_READ_KEY_ARGS`,
   `IC_WRITE_KEY_ARGS`, `IC_SCAN_ARGS`, `IC_SCAN_RANGE`,
   `IC_TAKEOVER_ARGS`) are copied whole, once their size field, read
   alone first, says they are this header's length: a shorter one is
@@ -1431,6 +1484,7 @@ node), no events.
 | `IC_PROGRAM_BUILDER*` | `ProgramBuilder` | `ic_program_builder_create` | `ic_program_builder_free` |
 | `IC_PROGRAM*` | `Arc<Program>` | `ic_program_builder_finish`, `_finish_no_condition` | `ic_program_free` |
 | `IC_PROGRAM_VALUE`, `IC_PROGRAM_COND` | `Value`, `Cond` | the builder's functions | with the builder |
+| `IC_BLOB_VALUES*` | `BlobValues` | `ic_blob_values_create` | `ic_blob_values_free` |
 
 A connection, and an executor, is freed before its global, a query,
 transaction or scan with its connection. A table, index or record
