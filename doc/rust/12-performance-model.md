@@ -240,6 +240,141 @@ costs from a profile; then adjust `node_signal_ns`, `node_exec_ns`,
 the run-to-run spread, and change the defaults' comment in
 `tools/ic_model/src/main.rs` if it is the new reference.
 
+## Blob columns
+
+A blob value with parts is read or written in rounds (chapter 06,
+phase 12, "How each operation goes"), and every round is a batch of
+its own to both sides: defined and completed in the user thread,
+written and read once per data node, executed in a round at the data
+nodes. An operation of `r` rounds holds its batch for `r` round trips,
+and costs the client what its key operations cost:
+
+| Operation, `p` parts | Rounds | Key operations |
+|---|---|---|
+| Read, all inline | 1 | 1 |
+| Read with parts, committed first | 3 | 3 + p: the row committed, the row locked, the parts and the unlock |
+| Read with parts, lock first | 2 | 2 + p: the row locked, the parts and the unlock |
+| Update, all inline | 1, then the commit alone | 2: the head read and the row |
+| Update with parts | 2 | 2 + p: the head read and the row, then the parts with the commit |
+
+A TEXT of 4 000 bytes has 2 parts, a MEDIUMTEXT of 100 000 has 25.
+`ic_model` has no rounds; to the laws above a blob operation is its
+key operations, `n · d`.
+
+### Measured
+
+`tools/blob_bench.sh`, 2026-11-13, on the Mac (M5 Pro) against two
+release data nodes built that day, with a redo log of four 1 GB files.
+Every operation a transaction of its own, batches of 200 with two in
+flight a thread (10 at 100 000 bytes); operations a second, and the
+client's CPU an operation:
+
+| Reads | 1 thread | CPU | 8 threads | CPU |
+|---|---|---|---|---|
+| VARCHAR, 200 B | 1 734 000 | 607 ns | 5 610 000 | 705 ns |
+| TEXT, 200 B inline | 1 751 000 | 712 ns | 4 636 000 | 1 313 ns |
+| TEXT, 200 B inline, lock first | 721 000 | 1 537 ns | 2 279 000 | 2 060 ns |
+| TEXT, 4 000 B, committed first | 261 000 | 5.2 µs | 547 000 | 7.2 µs |
+| TEXT, 4 000 B, lock first | 324 000 | 3.9 µs | 619 000 | 5.7 µs |
+| MEDIUMTEXT, 100 000 B, committed first | 24 700 | 40.5 µs | 33 600 | 54.1 µs |
+| MEDIUMTEXT, 100 000 B, lock first | 27 000 | 34.9 µs | 34 600 | 47.5 µs |
+
+| Updates | 1 thread | CPU | 8 threads | CPU |
+|---|---|---|---|---|
+| VARCHAR, 200 B | 307 000 | 1.2 µs | 649 000 | 1.7 µs |
+| TEXT, 200 B inline | 181 000 | 3.8 µs | 216 000 | 5.6 µs |
+| TEXT, 4 000 B | 101 000 | 8.3 µs | 131 000 | 10.8 µs |
+| MEDIUMTEXT, 100 000 B | 8 260 | 109 µs | 12 500 | 131 µs |
+
+Through executors, each application thread making one blocking call
+at a time, calls a second (a third run, 13:46 that day, the baseline
+beside each):
+
+| Through executors | 64 callers, 1 executor | 256, 1 | 1 024, 1 | 1 024, 2 |
+|---|---|---|---|---|
+| VARCHAR, 200 B, reads | 244 000 | 284 000 | 207 000 | 223 000 |
+| TEXT, 4 000 B, reads | 57 200 | 104 000 | 97 000 | 111 000 |
+| VARCHAR, 200 B, updates | 45 700 | 109 000 | 106 000 | 118 000 |
+| TEXT, 4 000 B, updates | 21 600 | 28 100 | 53 400 | 47 900 |
+
+Built with `count-allocs`, one thread made 4.1 allocations a
+4 000-byte read and 4.2 an update, 535 and 390 bytes, where a plain
+operation makes none.
+Every run's rounds were the table's: 0, 2 and 1 after the first for
+reads, 1 for updates with parts, and 0 for an inline update, whose
+commit alone is not a round of the value's, nor is the commit alone
+of an inline read that took its lock first. The inline reads with the
+lock first come from a second run 20 minutes later, whose other runs
+were within 5 % of these.
+
+### What it shows
+
+- **An inline value costs a read little on one thread**: 105 ns of
+  client CPU, at the same rate. On eight threads it costs 600 ns and
+  17 % of the rate, so something the blob path shares between
+  threads scales badly; it is not found yet.
+- **A value with parts is bound by the client.** By the laws above a
+  4 000-byte read costs its key operations, 5 · 607 ns = 3.0 µs
+  committed first and 2.4 µs lock first; it measured 5.2 and 3.9 µs.
+  The blob path costs 1.6 to 1.7 times what its key operations cost
+  as plain ones, more of it in system time than in user time. Rate
+  times CPU is 1.35 cores on one thread against 1.05 for plain reads:
+  the user thread is full.
+- **Taking the lock first is faster whenever the value has parts**:
+  24 % more reads at 4 000 bytes on one thread, 13 % on eight, 9 % and
+  3 % at 100 000. **Reading the row committed first is faster for a
+  value all inline, and by more**: 2.2 times the reads on one thread
+  and 2.0 on eight, since the read is done in one round where the lock
+  first takes a second for its commit. Inline values being the common
+  case, the measurement bears out committed first as the default
+  (chapter 06, phase 12, item 4).
+- **An inline update pays a round trip for its commit**, which cannot
+  ride the row's write, since the old head may name parts to delete:
+  41 % of the VARCHAR's rate on one thread, 3.2 times the client CPU.
+  It hardly scales, 216 000 on eight threads against 649 000.
+- **An update with parts is not bound by the client on eight
+  threads** (1.4 cores) but by the data nodes, which write three rows
+  an update, two of them of 2 000 bytes.
+- **At 100 000 bytes the bytes are what counts**: reads move 2.5 GB/s
+  on one thread and 3.4 on eight, committed first and lock first alike
+  there; updates 0.8 and 1.25 GB/s. Eight threads gain a third. A
+  second client receive thread gains nothing (32 800 reads a second
+  against 33 400), so the one thread reading 3.4 GB/s is not what
+  holds them.
+- **Through an executor, 64 callers measure a call's time, not the
+  executor.** Each makes one call at a time, so by Little's law the
+  rate is 64 over a call's time: 64 / 1 104 µs = 58 000 for a read of
+  three rounds, 64 / 3 012 µs = 21 200 for an update, 64 / 257 µs =
+  249 000 for a plain read; each within 3 % of what was measured.
+  Their CPU a call, 40 and 54 µs, follows from it: the CPU a second is
+  about what plain reads take, spread over fewer calls.
+- **With more callers an executor gives blob reads what it gives
+  plain ones, less their rounds.** 4 000-byte reads go from 57 000 at
+  64 callers to 104 000 at 256, 37 % of the plain reads' 284 000 there,
+  at 24 µs of client CPU a call against 12.5: twice a plain call,
+  where on a pipelining thread a blob read costs eight times a plain
+  one (5.2 µs against 607 ns). A caller's sleep and wake, which a call
+  pays once whatever its rounds, is most of either.
+- **Past 256 callers nothing gains.** Plain reads fall from 284 000 to
+  207 000 at 1 024 callers, blob reads stay near 100 000, and a second
+  executor adds 8 to 14 % while system time a call rises by half or
+  more. With 1 024 runnable threads the kernel's waking and preempting
+  them, 14 to 35 µs of system time a call, is the limit, not the
+  executor's thread: on this machine about 280 000 plain calls a
+  second, reached at 256 callers.
+- **Blob updates batch badly through an executor.** At 256 callers
+  they go at 28 000 a second, a quarter of the plain updates' 109 000:
+  2.4 requests a send against 27.9, nearly a socket write a call, and
+  25 000 passes of the executor's loop a second for 28 000 calls. The
+  executor's thread spends itself on passes that each carry about one
+  request; 1 024 callers bring the batching back, 67 a send, and the
+  rate to 53 000. To look at: a pass sending a request's later round
+  and its admissions in one write, and a pass with only a later round
+  to send waiting a moment for more.
+- **About four allocations an operation**. A first run against the
+  slower debug cluster counted 47 a read and 15 KB: how many there are
+  follows how the rounds fall in time, not only the operations.
+
 ## Using it
 
 Ask the model before building: set the parameter that the change would

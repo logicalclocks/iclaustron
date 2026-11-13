@@ -63,8 +63,8 @@
 //! build: `cargo run --release -p ic_bench`.
 //!
 //! The table needs a primary key of one integer column; every other
-//! integer column gets ten times the key, a binary or character column
-//! gets `--bytes` bytes, and any other column must be nullable.
+//! integer column gets ten times the key, a binary, character or blob
+//! column gets `--bytes` bytes, and any other column must be nullable.
 //!
 //! **Large rows.** To find from what size a signal is better handed to
 //! the user thread where it lies than copied (`--large-words`, see
@@ -81,6 +81,21 @@
 //! The rows are written with `--bytes` bytes, so that the reads that
 //! follow bring that much back; mind the data memory, which is keys
 //! times bytes.
+//!
+//! **Blob columns.** A TEXT or BLOB column gets `--bytes` bytes as
+//! well, its first 256 in the row and the rest in its parts, and is
+//! read back whole. A value with parts takes more rounds (doc/rust/06,
+//! phase 12): a committed read takes one round for an inline value and
+//! three for one with parts, or two with `--lock-first`; an update
+//! takes two. The report adds the blob bytes an operation wrote or
+//! read and the rounds it took after its first.
+//!
+//! ```text
+//!   CREATE TABLE ictest.ttext (id INT NOT NULL PRIMARY KEY, v INT,
+//!                              t TEXT) ENGINE=NDB;
+//!   ic_bench -d ictest ttext --keys 1000 --bytes 4000
+//!   ic_bench -d ictest ttext --keys 1000 --no-prepare --lock-first
+//! ```
 
 mod alloc_count;
 
@@ -95,6 +110,7 @@ use ic_apid::apid_global::ApidGlobal;
 use ic_apid::apid_global::GlobalOptions;
 use ic_apid::apid_global::IC_EXTRA_READS;
 use ic_apid::apid_global::IC_LARGE_SIGNAL_WORDS;
+use ic_apid::blob::BlobValues;
 use ic_apid::dict_cache::TableDef;
 use ic_apid::executor::Executor;
 use ic_apid::executor::ExecutorOptions;
@@ -146,7 +162,7 @@ static DONE_BY_CALLBACK: [AtomicUsize; IC_BENCH_MAX_SLOTS] =
 static FAILED_BY_CALLBACK: [AtomicUsize; IC_BENCH_MAX_SLOTS] =
   [const { AtomicUsize::new(0) }; IC_BENCH_MAX_SLOTS];
 
-const OPTIONS: [OptionEntry; 21] = [
+const OPTIONS: [OptionEntry; 22] = [
   OptionEntry {
     long_name: "ndb-connectstring",
     short_name: b'c',
@@ -205,7 +221,13 @@ const OPTIONS: [OptionEntry; 21] = [
     long_name: "bytes",
     short_name: 0,
     kind: OptionKind::Int,
-    help: "Bytes written into each binary or character column; default 0",
+    help: "Bytes written into each binary, character or blob column; 0",
+  },
+  OptionEntry {
+    long_name: "lock-first",
+    short_name: 0,
+    kind: OptionKind::Flag,
+    help: "Committed reads of blob values take their lock first",
   },
   OptionEntry {
     long_name: "large-words",
@@ -286,6 +308,8 @@ struct Run {
   from: i64,
   prepare: bool,
   bytes: usize,
+  /// Committed reads of blob values take their lock in the first round.
+  lock_first: bool,
   large_words: u32,
   extra_reads: u32,
   receive_threads: u32,
@@ -377,6 +401,7 @@ fn run() -> i32 {
     from: parser.get_int_or("from", 1),
     prepare: !parser.get_flag("no-prepare"),
     bytes: parser.get_int_or("bytes", 0).max(0) as usize,
+    lock_first: parser.get_flag("lock-first"),
     receive_threads: parser.get_int_or("receive-threads", 1).max(1) as u32,
     extra_reads: parser
       .get_int_or("extra-reads", IC_EXTRA_READS as i64)
@@ -461,8 +486,8 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
       return 1;
     }
   };
-  let rec = match Record::default_for(&def, None) {
-    Ok(rec) => rec,
+  let recs = match Records::for_table(&def) {
+    Ok(recs) => recs,
     Err(e) => {
       report("Could not make a record", &e);
       return 1;
@@ -473,7 +498,7 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
     return 1;
   }
   if what.prepare {
-    let queries = match make_queries(&mut conns[0], &def, &rec, what.batch) {
+    let queries = match make_queries(&mut conns[0], &def, &recs, what.batch) {
       Ok(queries) => queries,
       Err(e) => {
         report("Could not make a query", &e);
@@ -481,7 +506,7 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
       }
     };
     let start = ic_port::time::gethrtime();
-    let written = write_rows(&mut conns[0], &def, &rec, &queries, what);
+    let written = write_rows(&mut conns[0], &def, &recs, &queries, what);
     let ms = ic_port::time::millis_elapsed(start, ic_port::time::gethrtime());
     match written {
       Ok(()) => println!("Wrote {} row(s) in {} ms", what.keys, ms),
@@ -492,7 +517,7 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
     }
   }
   if what.executors > 0 {
-    return bench_executors(global, &def, &rec, what, started);
+    return bench_executors(global, &def, &recs, what, started);
   }
   println!(
     "{} by primary key, {} thread(s) each with {} in flight as {} \
@@ -512,10 +537,13 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
     what.seconds
   );
   println!(
-    "{} byte(s) in each binary or character column; signals of {} word(s) \
-     or more not copied; {} receive thread(s)",
+    "{} byte(s) in each binary, character or blob column; signals of {} \
+     word(s) or more not copied; {} receive thread(s)",
     what.bytes, what.large_words, what.receive_threads
   );
+  if what.lock_first {
+    println!("Committed reads of blob values take their lock first");
+  }
   // Each thread goes round its own share of the keys, the last taking
   // the remainder.
   let per_thread = what.keys / what.threads as i64;
@@ -538,9 +566,9 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
         end: first + span,
       };
       let def = &def;
-      let rec = &rec;
+      let recs = &recs;
       handles.push(
-        scope.spawn(move || run_thread(conn, def, rec, what, range, position)),
+        scope.spawn(move || run_thread(conn, def, recs, what, range, position)),
       );
     }
     let mut outcomes = Vec::with_capacity(handles.len());
@@ -580,11 +608,24 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
       writes * 1000 / tally.ops
     );
   }
+  if recs.attr.has_blob_fields() {
+    print_blobs(tally.blob_bytes, tally.blob_rounds, tally.ops);
+  }
   if tally.unexpected > 0 {
     println!(
       "{} signal(s) came that nothing waited for",
       tally.unexpected
     );
+    if let Some((name, node)) = &tally.last_unexpected {
+      let mut words = String::new();
+      for word in &tally.last_unexpected_words {
+        words.push_str(&format!(" {:#010x}", word));
+      }
+      println!(
+        "The last was {} from node {}, its first words{}",
+        name, node, words
+      );
+    }
   }
   if tally.failed > 0 {
     return 1;
@@ -599,11 +640,33 @@ struct KeyRange {
   end: i64,
 }
 
+/// The records the operations go by.
+struct Records {
+  /// Every column but the blob columns, which a key record may not
+  /// name: the record the tool used for both before blob columns.
+  key: Record,
+  /// Every column, the blob columns too.
+  attr: Record,
+}
+
+impl Records {
+  fn for_table(def: &Arc<TableDef>) -> Result<Records, IcError> {
+    let mut ids: Vec<u32> = Vec::with_capacity(def.info().attributes.len());
+    for attr in &def.info().attributes {
+      ids.push(attr.column_id);
+    }
+    Ok(Records {
+      key: Record::default_for(def, None)?,
+      attr: Record::default_for(def, Some(ids.as_slice()))?,
+    })
+  }
+}
+
 /// One thread's run: the pipeline over its keys until the time is up.
 fn run_thread(
   mut conn: ApidConnection,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   what: &Run,
   range: KeyRange,
   thread_index: usize,
@@ -612,13 +675,22 @@ fn run_thread(
   let first_slot = thread_index * IC_BENCH_MAX_DEPTH as usize;
   let mut slots: Vec<Slot> = Vec::with_capacity(what.depth);
   let mut slot_of: HashMap<QueryId, usize> = HashMap::new();
+  let blobs = recs.attr.has_blob_fields();
   while slots.len() < what.depth {
-    let queries = match make_queries(&mut conn, def, rec, what.batch) {
+    let queries = match make_queries(&mut conn, def, recs, what.batch) {
       Ok(queries) => queries,
       Err(e) => return Err(describe("Could not make a query", &e)),
     };
     for id in &queries {
       slot_of.insert(*id, slots.len());
+      if !what.lock_first {
+        continue;
+      }
+      if let Some(query) = conn.query_mut(*id) {
+        if let Err(e) = query.set_blob_lock_first(true) {
+          return Err(describe("Could not have reads lock first", &e));
+        }
+      }
     }
     slots.push(Slot {
       queries,
@@ -628,6 +700,8 @@ fn run_thread(
     });
   }
   let mut tally = Tally::default();
+  // The prepare ran on the first thread's connection.
+  let rounds_before = conn.blob_rounds();
   let start = ic_port::time::gethrtime();
   let end_at = start + what.seconds * 1_000_000_000;
   let mut next_key = range.start;
@@ -658,6 +732,11 @@ fn run_thread(
           i += 1;
           continue;
         }
+        if blobs {
+          let count = slots[i].sent.len();
+          let queries = &slots[i].queries;
+          tally.blob_bytes += batch_bytes(&conn, &recs.attr, queries, count);
+        }
         let failed = close_batch(&mut conn, &slots[i].sent, &slots[i].queries);
         tally.ops += slots[i].sent.len() as u64 - failed;
         tally.failed += failed;
@@ -673,7 +752,7 @@ fn run_thread(
         let defined = define_batch(
           &mut conn,
           def,
-          rec,
+          recs,
           &slots[i].queries,
           what,
           range,
@@ -729,6 +808,9 @@ fn run_thread(
     }
   }
   tally.unexpected = conn.unexpected();
+  tally.last_unexpected = conn.last_unexpected();
+  tally.last_unexpected_words = conn.last_unexpected_words().to_vec();
+  tally.blob_rounds = conn.blob_rounds() - rounds_before;
   Ok(tally)
 }
 
@@ -752,12 +834,12 @@ fn note_done(conn: &mut ApidConnection, id: QueryId, slot: usize) {
 fn make_queries(
   conn: &mut ApidConnection,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   count: usize,
 ) -> Result<Vec<QueryId>, IcError> {
   let mut queries: Vec<QueryId> = Vec::with_capacity(count);
   while queries.len() < count {
-    queries.push(conn.create_query(def, rec, rec)?);
+    queries.push(conn.create_query(def, &recs.key, &recs.attr)?);
   }
   Ok(queries)
 }
@@ -783,6 +865,15 @@ struct Tally {
   batch_nanos: Vec<u64>,
   /// Signals that came which nothing waited for.
   unexpected: u64,
+  /// The last of them: its name and the node it came from.
+  last_unexpected: Option<(String, u32)>,
+  /// Its first data words.
+  last_unexpected_words: Vec<u32>,
+  /// Bytes of blob values the operations that went through wrote or
+  /// read.
+  blob_bytes: u64,
+  /// Rounds the operations sent after their first.
+  blob_rounds: u64,
 }
 
 impl Tally {
@@ -797,6 +888,12 @@ impl Tally {
     self.batches += other.batches;
     self.batch_nanos.extend_from_slice(&other.batch_nanos);
     self.unexpected += other.unexpected;
+    if other.last_unexpected.is_some() {
+      self.last_unexpected = other.last_unexpected;
+      self.last_unexpected_words = other.last_unexpected_words;
+    }
+    self.blob_bytes += other.blob_bytes;
+    self.blob_rounds += other.blob_rounds;
   }
 
   /// The rate, and how long each `unit` took, `how` saying from when
@@ -845,8 +942,8 @@ impl Tally {
   }
 }
 
-/// Every column other than the key must be an integer, or nullable, and
-/// the key one integer column.
+/// Every column other than the key must be an integer, bytes, a blob,
+/// or nullable, and the key one integer column.
 fn check_columns(def: &Arc<TableDef>) -> Result<(), String> {
   let mut key_columns: u32 = 0;
   for attr in &def.info().attributes {
@@ -857,7 +954,11 @@ fn check_columns(def: &Arc<TableDef>) -> Result<(), String> {
       }
       continue;
     }
-    if attr.nullable || is_integer(attr.type_code) || is_bytes(attr) {
+    if attr.nullable
+      || is_integer(attr.type_code)
+      || is_bytes(attr)
+      || attr.is_blob()
+    {
       continue;
     }
     return Err(format!(
@@ -948,17 +1049,68 @@ fn put_bytes(
   Ok(())
 }
 
+/// `bytes` bytes into a blob value's buffer. As [`put_bytes`], they
+/// are written only when the length changes, so that a value used again
+/// and again is filled once, and nothing is allocated per operation.
+fn put_blob(value: &mut Vec<u8>, bytes: usize) {
+  if value.len() == bytes && (bytes == 0 || value[0] == b'x') {
+    return;
+  }
+  value.clear();
+  value.resize(bytes, b'x');
+}
+
+/// The bytes of a query's or an operation's blob values: what a write
+/// sent, or what a read brought back.
+fn value_bytes(rec: &Record, values: Option<&BlobValues>) -> u64 {
+  let values = match values {
+    Some(values) => values,
+    None => return 0,
+  };
+  let mut bytes: u64 = 0;
+  let mut position: u32 = 0;
+  while position < rec.num_fields() {
+    // A position of no blob field is refused, and counts nothing.
+    if let Ok(Some(value)) = values.blob(position) {
+      bytes += value.len() as u64;
+    }
+    position += 1;
+  }
+  bytes
+}
+
+/// The bytes of the blob values of a batch's first `count` queries,
+/// once it is done.
+fn batch_bytes(
+  conn: &ApidConnection,
+  rec: &Record,
+  queries: &[QueryId],
+  count: usize,
+) -> u64 {
+  let mut bytes: u64 = 0;
+  for id in &queries[..count.min(queries.len())] {
+    if let Some(query) = conn.query(*id) {
+      if !query.is_failed() {
+        bytes += value_bytes(rec, query.blob_values());
+      }
+    }
+  }
+  bytes
+}
+
 fn is_integer(type_code: u32) -> bool {
   let integers =
     table_props::IC_TYPE_TINYINT..=table_props::IC_TYPE_BIGUNSIGNED;
   integers.contains(&type_code)
 }
 
-/// The key, and for a write every other column, into a query's rows.
+/// The key, and for a write every other column, into a query's rows:
+/// the key row by the key record, the attribute row by the attribute
+/// record.
 fn fill_query(
   conn: &mut ApidConnection,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   id: QueryId,
   key: i64,
   values_too: bool,
@@ -968,19 +1120,31 @@ fn fill_query(
     Some(query) => query,
     None => return Err(IcError::new(ic_port::err::IC_ERROR_NO_SUCH_FIELD)),
   };
+  let rec = &recs.attr;
   for attr in &def.info().attributes {
+    // Integers go in as their bytes, so that the tool spends nothing on
+    // text: formatting and parsing each key cost 5% of what it measured.
+    if attr.primary_key {
+      if let Some(position) = recs.key.position_of(attr.column_id) {
+        put_integer(&recs.key, position, key, query.key_row_mut());
+      }
+    }
     let position = match rec.position_of(attr.column_id) {
       Some(position) => position,
       None => continue,
     };
+    if attr.is_blob() {
+      // A read leaves the value alone, for the read to fill.
+      if values_too {
+        put_blob(query.blob_buf_mut(position)?, bytes);
+      }
+      continue;
+    }
     if values_too && !attr.primary_key && is_bytes(attr) {
       put_bytes(rec, attr, position, bytes, query.attr_row_mut())?;
       continue;
     }
-    // Integers go in as their bytes, so that the tool spends nothing on
-    // text: formatting and parsing each key cost 5% of what it measured.
     if attr.primary_key {
-      put_integer(rec, position, key, query.key_row_mut());
       put_integer(rec, position, key, query.attr_row_mut());
     } else if !values_too {
       continue;
@@ -996,23 +1160,34 @@ fn fill_query(
 /// As [`fill_query`], into an executor's operation.
 fn fill_op(
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   op: &mut KeyOp,
   key: i64,
   values_too: bool,
   bytes: usize,
 ) -> Result<(), IcError> {
+  let rec = &recs.attr;
   for attr in &def.info().attributes {
+    if attr.primary_key {
+      if let Some(position) = recs.key.position_of(attr.column_id) {
+        put_integer(&recs.key, position, key, op.key_row_mut());
+      }
+    }
     let position = match rec.position_of(attr.column_id) {
       Some(position) => position,
       None => continue,
     };
+    if attr.is_blob() {
+      if values_too {
+        put_blob(op.blob_buf_mut(position)?, bytes);
+      }
+      continue;
+    }
     if values_too && !attr.primary_key && is_bytes(attr) {
       put_bytes(rec, attr, position, bytes, op.attr_row_mut())?;
       continue;
     }
     if attr.primary_key {
-      put_integer(rec, position, key, op.key_row_mut());
       put_integer(rec, position, key, op.attr_row_mut());
     } else if !values_too {
       continue;
@@ -1031,11 +1206,11 @@ fn fill_op(
 fn bench_executors(
   global: &ApidGlobal,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   what: &Run,
   started: usize,
 ) -> i32 {
-  let shape = match OpShape::new(def, rec, rec) {
+  let shape = match OpShape::new(def, &recs.key, &recs.attr) {
     Ok(shape) => shape,
     Err(e) => {
       report("Could not make the operations' shape", &e);
@@ -1073,6 +1248,9 @@ fn bench_executors(
     started,
     what.seconds
   );
+  if what.lock_first {
+    println!("Committed reads of blob values take their lock first");
+  }
   let per_client = what.keys / what.clients as i64;
   let usage_before = ic_port::time::process_usage();
   let allocs_before = alloc_count::counts();
@@ -1097,7 +1275,7 @@ fn bench_executors(
       let shape = &shape;
       handles.push(
         scope
-          .spawn(move || run_client(submitter, def, rec, shape, what, range)),
+          .spawn(move || run_client(submitter, def, recs, shape, what, range)),
       );
       client += 1;
     }
@@ -1138,6 +1316,13 @@ fn bench_executors(
       writes * 1000 / tally.ops
     );
   }
+  if recs.attr.has_blob_fields() {
+    let mut rounds: u64 = 0;
+    for executor in &executors {
+      rounds += executor.stats().blob_rounds;
+    }
+    print_blobs(tally.blob_bytes, rounds, tally.ops);
+  }
   print_executors(&executors);
   // Stopped before the global is: each finishes what it has out.
   for mut executor in executors {
@@ -1154,16 +1339,17 @@ fn bench_executors(
 fn run_client(
   mut submitter: Submitter,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   shape: &Arc<OpShape>,
   what: &Run,
   range: KeyRange,
 ) -> Result<Tally, String> {
-  let op = if what.write {
+  let mut op = if what.write {
     KeyOp::write(shape, WriteKind::Update)
   } else {
     KeyOp::read(shape, ReadKind::Committed)
   };
+  op.set_blob_lock_first(what.lock_first);
   let mut request = Request::with_op(op);
   let mut tally = Tally::default();
   let end_at = ic_port::time::gethrtime() + what.seconds * 1_000_000_000;
@@ -1175,7 +1361,7 @@ fn run_client(
     }
     let filled = fill_op(
       def,
-      rec,
+      recs,
       &mut request.ops_mut()[0],
       key,
       what.write,
@@ -1197,7 +1383,11 @@ fn run_client(
         }
         tally.failed += 1;
       }
-      None => tally.ops += 1,
+      None => {
+        tally.ops += 1;
+        tally.blob_bytes +=
+          value_bytes(&recs.attr, request.ops()[0].blob_values());
+      }
     }
     key += 1;
     if key >= range.end {
@@ -1239,7 +1429,7 @@ fn print_executors(executors: &[Executor]) {
 fn write_rows(
   conn: &mut ApidConnection,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   queries: &[QueryId],
   what: &Run,
 ) -> Result<(), IcError> {
@@ -1249,8 +1439,8 @@ fn write_rows(
     let mut sent: Vec<TransId> = Vec::new();
     let mut i: usize = 0;
     while i < queries.len() && key < end {
-      fill_query(conn, def, rec, queries[i], key, true, what.bytes)?;
-      let trans = start_for(conn, def, rec, queries[i])?;
+      fill_query(conn, def, recs, queries[i], key, true, what.bytes)?;
+      let trans = start_for(conn, def, recs, queries[i])?;
       let args = WriteKeyArgs {
         kind: WriteKind::Write,
         ..WriteKeyArgs::default()
@@ -1293,11 +1483,11 @@ fn write_rows(
 fn start_for(
   conn: &mut ApidConnection,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   id: QueryId,
 ) -> Result<TransId, IcError> {
   let hint = match conn.query(id) {
-    Some(query) => conn.hint_for_key(def, rec, query.key_row()),
+    Some(query) => conn.hint_for_key(def, &recs.key, query.key_row()),
     None => TransactionHint::Any,
   };
   conn.start_transaction(hint, Some(def))
@@ -1307,7 +1497,7 @@ fn start_for(
 fn define_batch(
   conn: &mut ApidConnection,
   def: &Arc<TableDef>,
-  rec: &Record,
+  recs: &Records,
   queries: &[QueryId],
   what: &Run,
   range: KeyRange,
@@ -1325,8 +1515,8 @@ fn define_batch(
     if key >= range.end {
       key = range.start;
     }
-    fill_query(conn, def, rec, *id, key, what.write, what.bytes)?;
-    let trans = start_for(conn, def, rec, *id)?;
+    fill_query(conn, def, recs, *id, key, what.write, what.bytes)?;
+    let trans = start_for(conn, def, recs, *id)?;
     if what.write {
       let args = WriteKeyArgs {
         kind: WriteKind::Update,
@@ -1425,6 +1615,22 @@ fn print_usage(
     voluntary * 1000 / ops,
     faults,
     faults * 1000 / ops
+  );
+}
+
+/// What the blob columns carried over the run: the bytes of their
+/// values an operation wrote or read, and the rounds it took after its
+/// first.
+fn print_blobs(bytes: u64, rounds: u64, ops: u64) {
+  if ops == 0 {
+    return;
+  }
+  println!(
+    "Blob values: {} bytes per operation; {} rounds after the first, {:.2} \
+     per operation",
+    bytes / ops,
+    rounds,
+    rounds as f64 / ops as f64
   );
 }
 

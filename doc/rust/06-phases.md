@@ -2988,6 +2988,74 @@ Done 2026-11-13, every test passing:
 `ic_bench` with a TEXT column of 200 B, 4 KB and 100 KB; chapter 12
 updated.
 
+Done 2026-11-13, every test passing:
+
+- **`ic_bench`** takes tables with blob columns: its attribute record
+  names every column, its key record every column but those, which a
+  key record may not name (it had used one record for both, and
+  measured nothing until they were two); and a TEXT or BLOB column
+  gets `--bytes` bytes as a VARCHAR does, filled in place in the
+  value's buffer, so that the tool allocates nothing per operation.
+  `--lock-first` has committed reads take their lock in the first
+  round. The report adds the blob bytes an operation wrote or read
+  and the rounds it took after its first, from `conn.blob_rounds()`,
+  or from `ExecutorStats::blob_rounds` through executors, and names
+  the last signal nothing waited for.
+- **`tools/blob_bench.sh`** runs the measurement into one log, a table
+  for each value: a VARCHAR of 200 bytes as the baseline; a TEXT of
+  200 bytes, all inline; a TEXT of 4 000, two parts; and 100 000
+  bytes; each read committed first, read with the lock first, and
+  updated, on one user thread and on eight, the 100 000 bytes also
+  with two receive threads; the baseline and the 4 000 bytes also
+  through executors, one for 64, 256 and 1 024 application threads
+  and two for 1 024; then the allocations per operation at 4 000.
+  Every table is written and read before any is updated, and the
+  updates go 30 seconds apart: on MTR's default redo log, four files
+  of 64 MB, a first run on the development cluster had 4 000-byte
+  updates fail with 410 within seconds, and the next table's rows
+  refused. The author gave the fixed-ports cluster files of 1 GB
+  (2026-11-13). Ours to choose: 100 000 bytes go in a
+  MEDIUMTEXT, the smallest type that holds them, since writes are held
+  to the MySQL type's limit and a TEXT holds 65 535; in batches of 10,
+  not 200, so that a batch is about 1 MB; and 1 000 keys a thread, 50
+  at 100 000 bytes, more than a thread has in flight, so that no
+  thread has two updates of one row out at once.
+
+Measured 2026-11-13 against the release cluster, on user threads and
+through executors with 64 to 1 024 callers; chapter 12's "Blob
+columns" is written from it. Found on the way:
+
+- **Signals nothing waited for**: 176 in the 4 000-byte updates on
+  eight threads, 2 in the inline ones, none on one thread, and no
+  operation failed; a second run had 365 and 518, the last of each
+  signal 20 from node 2, which neither chapter 05, our table of
+  signals nor the dissector names. Signal 20 is the data node's
+  heartbeat for a scan still running, which keeps the API from ending
+  it at its 6-minute reply timeout (the author, 2026-11-13). We route
+  no signal 20, so each counts as a stray and none resets a reply
+  clock: a scan running longer than `reply_wait_ms` without a batch
+  would end with 4012 while its data node reports it running. Its
+  words are our pointer and the transaction id, and the only thing to
+  do is set the timers; nothing is answered (the author). Now taken
+  as `PROGRESS_REP` (chapter 05 §6.7): routed to the transaction or
+  scan it names, whose wait for replies starts again, and dropped
+  uncounted when it names nothing live; `ic_bench` also prints the
+  first words of the last stray. Its first run still had 988 strays:
+  the signal came one word long, our pointer alone, a RonDB bug the
+  author is mending to send three words. Every `PROGRESS_REP` is now
+  taken, never unexpected: with the id it is checked, without it our
+  pointer alone names the record (the author, 2026-11-13). The next
+  run of the inline updates on eight threads had none, and neither had
+  a whole run of the script at 14:09, every round as expected and no
+  operation failing; its rates are not used, the machine running MTR
+  tests beside it and data node 2 just restarted.
+- To look at after this step, from chapter 12: what makes an inline
+  read cost 600 ns more on eight threads and 105 on one; the inline
+  update's commit alone, which keeps it from scaling; the blob path's
+  1.6 to 1.7 times its key operations' cost; blob updates through an
+  executor, whose loop at 256 callers makes a pass and nearly a write
+  for each request; and the four allocations an operation.
+
 The tests are the integration group `blob`, beside unit tests of the
 head, the arithmetic, the planner and the commit held.
 
