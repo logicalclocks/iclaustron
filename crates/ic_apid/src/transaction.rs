@@ -93,6 +93,7 @@ use ic_signals::key_ops::KeyOpConf;
 use ic_signals::key_ops::KeyOpFlags;
 use ic_signals::key_ops::KeyOpRef;
 use ic_signals::key_ops::KeyOpReq;
+use ic_signals::key_ops::ProgressRep;
 use ic_signals::key_ops::RollbackConf;
 use ic_signals::key_ops::RowDataRep;
 use ic_signals::key_ops::TakeoverConf;
@@ -222,8 +223,12 @@ pub struct Transaction {
   /// True while it is on the connection's list for the next send.
   pub(crate) queued_for_send: bool,
   /// When it last sent, by the high-resolution clock, or zero if it
-  /// never has: the wait for its replies runs from here.
+  /// never has: the wait for its replies runs from here, or from
+  /// `heard_at` if that is later.
   last_sent: u64,
+  /// When its coordinator last said it was still running
+  /// (`PROGRESS_REP`), or zero.
+  heard_at: u64,
   /// Its BLOB queries that plan a round after the one they have out: a
   /// commit asked for waits until none does (chapter 06, phase 12).
   blob_planning: u32,
@@ -367,7 +372,7 @@ impl Transaction {
       || self.state == CommitState::RollbackRequested;
     waiting
       && self.last_sent != 0
-      && now.saturating_sub(self.last_sent) >= limit
+      && now.saturating_sub(self.last_sent.max(self.heard_at)) >= limit
   }
 }
 
@@ -632,6 +637,7 @@ impl ApidConnection {
       gci: 0,
       queued_for_send: false,
       last_sent: 0,
+      heard_at: 0,
       blob_planning: 0,
       blob_runs: Vec::new(),
     };
@@ -1518,6 +1524,7 @@ impl ApidConnection {
         self.take_key_ref(signal)
       }
       numbers::IC_SIG_TRANS_ABORTED_REP => self.take_rollback_rep(signal),
+      numbers::IC_SIG_PROGRESS_REP => self.take_progress_rep(signal),
       numbers::IC_SIG_COMMIT_CONF => self.take_commit_conf(signal),
       numbers::IC_SIG_COMMIT_REF => self.take_trans_ref(signal),
       numbers::IC_SIG_ROLLBACK_CONF => self.take_rollback_conf(signal),
@@ -1552,8 +1559,7 @@ impl ApidConnection {
     trans_id_lo: u32,
     trans_id_hi: u32,
   ) -> Option<TransId> {
-    let index = crate::apid_conn::coord_index_of(api_ptr)?;
-    let id = self.active_get(index as u32)?;
+    let id = self.trans_on_record(api_ptr)?;
     if let Some(trans) = self.transactions.get(id.0) {
       let want = trans.trans_id;
       if want as u32 == trans_id_lo && (want >> 32) as u32 == trans_id_hi {
@@ -1561,6 +1567,15 @@ impl ApidConnection {
       }
     }
     None
+  }
+
+  /// The transaction on the coordinator record our pointer names,
+  /// whatever its id: for a reply that carries no id.
+  fn trans_on_record(&self, api_ptr: u32) -> Option<TransId> {
+    let index = crate::apid_conn::coord_index_of(api_ptr)?;
+    let id = self.active_get(index as u32)?;
+    self.transactions.get(id.0)?;
+    Some(id)
   }
 
   fn take_key_conf(&mut self, signal: &SignalView<'_>) -> bool {
@@ -1766,6 +1781,38 @@ impl ApidConnection {
       self.send_commit_ack(signal, conf.trans_id_lo, conf.trans_id_hi);
     }
     self.end_transaction(tid, CommitState::Committed, None, conf.gci);
+    true
+  }
+
+  /// The coordinator's word that a transaction, or a scan, it holds is
+  /// still running (`PROGRESS_REP`, chapter 05 §6.7): its wait for
+  /// replies starts again, and nothing is answered. Always taken, never
+  /// unexpected: one that names nothing live, such as a transaction
+  /// that ended while it was on its way, sets no clock.
+  ///
+  /// Without the transaction id, which RonDB leaves out until it is
+  /// mended, the transaction or scan on the record is taken to be
+  /// meant: one that came for the record's last transaction restarts
+  /// the next one's wait once, which the author holds harmless
+  /// (2026-11-13).
+  fn take_progress_rep(&mut self, signal: &SignalView<'_>) -> bool {
+    let rep = match ProgressRep::decode(signal.data) {
+      Ok(rep) => rep,
+      // No words: nothing named.
+      Err(_) => return true,
+    };
+    let now = ic_port::time::gethrtime();
+    let named = match rep.trans_id {
+      Some((lo, hi)) => self.trans_named(rep.client_ptr, lo, hi),
+      None => self.trans_on_record(rep.client_ptr),
+    };
+    if let Some(tid) = named {
+      if let Some(trans) = self.transactions.get_mut(tid.0) {
+        trans.heard_at = now;
+      }
+      return true;
+    }
+    self.scan_heard(rep.client_ptr, rep.trans_id, now);
     true
   }
 
@@ -2273,9 +2320,10 @@ impl ApidConnection {
   }
 
   /// End every transaction that has waited too long for its replies
-  /// while its link stayed up, as of `now` (chapter 06 §6.3). Run by a
-  /// poll at most once a second, after it has taken the replies that
-  /// came.
+  /// while its link stayed up, as of `now` (chapter 06 §6.3): since it
+  /// last sent, or since its coordinator last said it was still running
+  /// (`PROGRESS_REP`). Run by a poll at most once a second, after it has
+  /// taken the replies that came.
   ///
   /// Such a transaction ends rolled back with 4012, whose class says
   /// the outcome is unknown: the coordinator may yet commit it. Each of
@@ -2603,6 +2651,7 @@ mod tests {
       gci: 0,
       queued_for_send: false,
       last_sent: 0,
+      heard_at: 0,
       blob_planning: 0,
       blob_runs: Vec::new(),
     };
@@ -2631,6 +2680,7 @@ mod tests {
       gci: 0,
       queued_for_send: false,
       last_sent,
+      heard_at: 0,
       blob_planning: 0,
       blob_runs: Vec::new(),
     }
@@ -2665,6 +2715,29 @@ mod tests {
     // Never sent: nothing to wait for.
     let mut idle = sent_at(0);
     idle.state = CommitState::CommitRequested;
+    assert!(!idle.waited_too_long(AT + 10 * LIMIT, LIMIT));
+  }
+
+  #[test]
+  fn a_coordinator_that_says_it_is_running_starts_the_wait_again() {
+    const LIMIT: u64 = 1_000;
+    const AT: u64 = 50_000;
+    let mut trans = sent_at(AT);
+    trans.sent.push(QueryId(PtrId::from_u64(1)));
+    assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
+    // Heard from just before the wait ran out: it runs from there.
+    trans.heard_at = AT + LIMIT - 1;
+    assert!(!trans.waited_too_long(AT + LIMIT, LIMIT));
+    assert!(!trans.waited_too_long(AT + 2 * LIMIT - 2, LIMIT));
+    assert!(trans.waited_too_long(AT + 2 * LIMIT - 1, LIMIT));
+    // A send after it is the later of the two.
+    trans.last_sent = AT + 3 * LIMIT;
+    assert!(!trans.waited_too_long(AT + 4 * LIMIT - 1, LIMIT));
+    assert!(trans.waited_too_long(AT + 4 * LIMIT, LIMIT));
+    // Heard from, never sent: still nothing to wait for.
+    let mut idle = sent_at(0);
+    idle.state = CommitState::CommitRequested;
+    idle.heard_at = AT;
     assert!(!idle.waited_too_long(AT + 10 * LIMIT, LIMIT));
   }
 

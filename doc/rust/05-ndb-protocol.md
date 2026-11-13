@@ -37,7 +37,7 @@ Signals, by number:
 | Membership | 3 `HEARTBEAT_REQ`, 1 `HEARTBEAT_CONF`, 2 `HEARTBEAT_REF`; 26 `NODE_LOST_REP`; 27 `NODE_LOST_DONE_REP`; 163 `NODE_JOINED_REP` |
 | Coordinator records | 39 `COORD_ALLOC_REQ`, 37 `COORD_ALLOC_CONF`, 38 `COORD_ALLOC_REF`; 36 `COORD_FREE_REQ`, 34 `COORD_FREE_CONF`, 35 `COORD_FREE_REF` |
 | Key operations | 12 `KEY_OP_REQ`, 10 `KEY_OP_CONF`, 11 `KEY_OP_REF`; 519 `UNIQUE_OP_REQ`, 520 `UNIQUE_OP_CONF`, 521 `UNIQUE_OP_REF`; 5 `ROW_DATA_REP`; 6 `KEY_DATA_ORD`; 4 `COLUMN_DATA_ORD` |
-| Ending a transaction | 19 `COMMIT_REQ`, 17 `COMMIT_CONF`, 18 `COMMIT_REF`; 15 `ROLLBACK_REQ`, 13 `ROLLBACK_CONF`, 14 `ROLLBACK_REF`; 16 `TRANS_ABORTED_REP`; 469 `COMMIT_MARKER_FREE_ORD`; 8 `TAKEOVER_CONF`, 9 `TAKEOVER_REF`; 980 `DEADLOCK_FOUND_REP` |
+| Ending a transaction | 19 `COMMIT_REQ`, 17 `COMMIT_CONF`, 18 `COMMIT_REF`; 15 `ROLLBACK_REQ`, 13 `ROLLBACK_CONF`, 14 `ROLLBACK_REF`; 16 `TRANS_ABORTED_REP`; 20 `PROGRESS_REP`; 469 `COMMIT_MARKER_FREE_ORD`; 8 `TAKEOVER_CONF`, 9 `TAKEOVER_REF`; 980 `DEADLOCK_FOUND_REP` |
 | Scans | 32 `SCAN_REQ`, 29 `SCAN_CONF`, 31 `SCAN_REF`; 28 `SCAN_MORE_REQ`; 33 `SCAN_ROW_KEY_REP` |
 | Dictionary | 24 `TABLE_DESC_REQ`, 190 `TABLE_DESC_CONF`, 23 `TABLE_DESC_REF`; 193 `LIST_OBJECTS_REQ`, 194 `LIST_OBJECTS_CONF`; 606 `TABLE_CHANGED_REP`; 984 `COLLATION_DESC_REQ`, 985 `COLLATION_DESC_CONF`, 986 `COLLATION_DESC_REF` |
 
@@ -972,6 +972,26 @@ and the transaction id; `ROLLBACK_CONF` is those three back;
 `COMMIT_REF` adds the error code, and `ROLLBACK_REF` that and the
 coordinator's state.
 
+**`PROGRESS_REP` (signal 20)** `{our pointer, the transaction id's low
+and high halves}` is the coordinator's word that a transaction, or a
+scan, it holds is still running (the author, 2026-11-13). It asks for
+nothing back: the API starts its wait for that one's replies again, so
+that a scan that runs long without a batch, or a transaction kept long
+at the data nodes, does not end with 4012 while its coordinator says it
+runs (7.2, 7.3 question 15). It came, unrouted, 365 to 518 times in ten
+seconds of updates on eight threads whose transactions stay open a
+round between their first round and their commit (chapter 06, 12.9),
+none of which timed out, since a timeout takes six minutes. Seen on
+the wire then: one word long, our pointer alone, which is a RonDB bug
+the author is mending to send all three (2026-11-13). As built
+(`ic_apid::transaction`): every one is taken, never counted as
+unexpected. With the transaction id it goes to the transaction or the
+scan whose record and id it names; without, to whichever is on the
+record our pointer names, so that one that came for the record's last
+transaction restarts the next one's wait once, which the author holds
+harmless. The one named has its clock set; one naming nothing live,
+such as a transaction that ended while it was on its way, sets none.
+
 **A commit asked while an operation still executes is an abort** (the
 author, 2026-11-12): the coordinator cannot commit a transaction that is
 started with operations not yet completed, and aborts it instead, with
@@ -1605,9 +1625,10 @@ count from 0: word 0 is a signal's first.
   author, 2026-10-22; 7.3, question 15), and free its record at once
   with `COORD_FREE_REQ`, for which the coordinator closes the scan
   without telling us and frees the record. A data node that stops
-  loses its link to missed heartbeats long before; RonDB is to send
-  the API a heartbeat for a long scan as well, after which only a bug
-  leaves a scan that long unheard.
+  loses its link to missed heartbeats long before; the coordinator
+  sends the API `PROGRESS_REP` for a long scan as well (6.7), which
+  starts the wait again, so only a bug leaves a scan that long
+  unheard.
 - **Takeover**: a `KEY_OP_REQ` on the owning transaction whose key is
   the row's key from `SCAN_ROW_KEY_REP`, with flags bit 14 (scan
   takeover) and bit 2 (distribution key given), and optional words after
@@ -1865,8 +1886,11 @@ For the author, in sessions of their own (raised 2026-10-15):
 - a heartbeat from the coordinator to the API for a scan that runs long
   without a batch, as the reading threads send the coordinator, so that
   a scan's wait for its coordinator runs out only on a bug (raised
-  2026-10-22, question 15). Our side, which would take it as an answer
-  that starts the wait again, comes with it.
+  2026-10-22, question 15): in RonDB as signal 20, `PROGRESS_REP`
+  (6.7), and taken by us since 2026-11-13;
+- `PROGRESS_REP` sent one word long, our pointer without the
+  transaction id: the author is mending it to send three words
+  (2026-11-13); we take both.
 
 ### 7.4 Seen on the wire (2026-10-16)
 
@@ -3145,6 +3169,7 @@ code points into.
 - ROLLBACK_CONF is signal 13.
 - ROLLBACK_REF is signal 14.
 - TRANS_ABORTED_REP is signal 16.
+- PROGRESS_REP is signal 20.
 - COMMIT_MARKER_FREE_ORD is signal 469.
 - TAKEOVER_CONF is signal 8.
 - TAKEOVER_REF is signal 9.
@@ -3290,6 +3315,7 @@ code points into.
 - TAKEOVER_CONF (8) is three words; the low bit of our pointer asks for COMMIT_MARKER_FREE_ORD, which goes to the sender.
 - TAKEOVER_REF (9) is three words, our pointer and the transaction id.
 - TRANS_ABORTED_REP (16) is five words: our pointer, the transaction id, the transaction's error code, and more about the error.
+- PROGRESS_REP (20) is three words, our pointer and the transaction id, and is not answered; RonDB sends our pointer alone until mended, and that is taken too.
 - A column header holds the column id in bits 16-31, the partial read or write flag in bit 15, and the value's size in bytes in bits 0-14; the value takes that many bytes rounded up to words, and size zero is NULL.
 
 ### 17.12 Links, threads and signals (`ic_apid::apid_conn`, `apid_global`, `handshake`, `heartbeat`, `fragments`, `node_connect`, `node_state`, `rec_thread`, `signal_reader`, `signal_page`, `thread_conn`, `connect_thread`, `adaptive_send`, `send_pool`, `lib`)

@@ -528,6 +528,45 @@ impl RollbackConf {
   }
 }
 
+/// Words in a `PROGRESS_REP`: our pointer for the record and the
+/// transaction id. One word, our pointer alone, is taken as well: RonDB
+/// sends that until it is mended (the author, 2026-11-13). Verify:
+/// chapter 05 §17.11.
+pub const IC_PROGRESS_REP_LEN: usize = 3;
+
+/// The coordinator's word that a transaction, or a scan, it holds is
+/// still running: what it names, for that one's wait for its replies to
+/// start again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProgressRep {
+  /// Our pointer for the transaction's, or the scan's, record.
+  pub client_ptr: u32,
+  /// The transaction id, low word then high, when the signal carries
+  /// it; without it, what the record holds is taken to be meant.
+  pub trans_id: Option<(u32, u32)>,
+}
+
+impl ProgressRep {
+  /// Read a coordinator's word that something is still running: three
+  /// words, our pointer and the transaction id, or our pointer alone.
+  /// Only a signal with no words at all names nothing.
+  pub fn decode(data: &[u32]) -> Result<ProgressRep, IcError> {
+    if data.len() >= IC_PROGRESS_REP_LEN {
+      return Ok(ProgressRep {
+        client_ptr: data[0],
+        trans_id: Some((data[1], data[2])),
+      });
+    }
+    match data.first() {
+      Some(&client_ptr) => Ok(ProgressRep {
+        client_ptr,
+        trans_id: None,
+      }),
+      None => Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA)),
+    }
+  }
+}
+
 /// Words in a `TAKEOVER_CONF` and a `TAKEOVER_REF`.
 pub const IC_TAKEOVER_LEN: usize = 3;
 
@@ -894,6 +933,21 @@ mod tests {
     assert_eq!(refused.expect("read").error_code, 4350);
     let rolled = RollbackConf::decode(&[8, 0x1000, 0x2000]);
     assert_eq!(rolled.expect("read").client_ptr, 8);
+  }
+
+  #[test]
+  fn a_progress_report_names_the_record_and_maybe_the_transaction() {
+    let rep = ProgressRep::decode(&[8, 0x1000, 0x2000]).expect("read");
+    assert_eq!(rep.client_ptr, 8);
+    assert_eq!(rep.trans_id, Some((0x1000, 0x2000)));
+    // As RonDB sends it until mended: our pointer alone.
+    let alone = ProgressRep::decode(&[0x8000_0114]).expect("pointer");
+    assert_eq!(alone.client_ptr, 0x8000_0114);
+    assert_eq!(alone.trans_id, None);
+    let two = ProgressRep::decode(&[8, 0x1000]).expect("two words");
+    assert_eq!(two.trans_id, None);
+    let none = ProgressRep::decode(&[]).expect_err("no words");
+    assert_eq!(none.code, err::IC_ERROR_INCONSISTENT_DATA);
   }
 
   #[test]

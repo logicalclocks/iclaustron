@@ -2482,9 +2482,10 @@ impl ApidConnection {
   /// its link stayed up, as of `now`: for `IC_SCAN_ANSWER_WAIT_MS`, six
   /// minutes, since it last sent to the coordinator or had an answer
   /// (the author, 2026-10-22; chapter 06 §11.3). Run by a poll at most
-  /// once a second, with the transactions' check. Once the coordinator
-  /// sends the API a heartbeat for a long scan, as RonDB is to, only a
-  /// bug leaves a scan that long unheard.
+  /// once a second, with the transactions' check. The coordinator says
+  /// a long scan is still running with `PROGRESS_REP`, which starts the
+  /// wait again (chapter 05 §6.7), so only a bug leaves a scan that long
+  /// unheard.
   ///
   /// The run ends with 4012, whose class says the outcome is unknown,
   /// unless it had failed already, or been closed for its deadline. Its
@@ -2549,13 +2550,47 @@ impl ApidConnection {
   /// The scan whose run is on the record our pointer names, if the
   /// transaction id is the run's.
   fn scan_named(&self, client_ptr: u32, lo: u32, hi: u32) -> Option<ScanId> {
-    let index = coord_index_of(client_ptr)?;
-    let id = (*self.scan_of_record.get(index)?)?;
+    let id = self.scan_on_record(client_ptr)?;
     let scan = self.scans.get(id.0)?;
     if scan.trans_id as u32 == lo && (scan.trans_id >> 32) as u32 == hi {
       return Some(id);
     }
     None
+  }
+
+  /// The scan whose run is on the record our pointer names, whatever
+  /// its transaction id.
+  fn scan_on_record(&self, client_ptr: u32) -> Option<ScanId> {
+    let index = coord_index_of(client_ptr)?;
+    let id = (*self.scan_of_record.get(index)?)?;
+    Some(id)
+  }
+
+  /// The coordinator says the run on the record our pointer names is
+  /// still running (`PROGRESS_REP`): its wait for the coordinator starts
+  /// again at `now`. The transaction id, low word then high, is checked
+  /// when the signal carries it. False if it names no live run.
+  pub(crate) fn scan_heard(
+    &mut self,
+    client_ptr: u32,
+    trans_id: Option<(u32, u32)>,
+    now: u64,
+  ) -> bool {
+    let named = match trans_id {
+      Some((lo, hi)) => self.scan_named(client_ptr, lo, hi),
+      None => self.scan_on_record(client_ptr),
+    };
+    let id = match named {
+      Some(id) => id,
+      None => return false,
+    };
+    match self.scans.get_mut(id.0) {
+      Some(scan) => {
+        scan.heard_at = now;
+        true
+      }
+      None => false,
+    }
   }
 
   /// The receiver a tagged word, as a request or a row carries it,

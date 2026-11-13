@@ -59,6 +59,10 @@ pub const IC_SIG_ROLLBACK_REF: u16 = 14;
 /// The data node rolled the transaction back by itself, and says why.
 /// Verify: chapter 05 §17.5.
 pub const IC_SIG_TRANS_ABORTED_REP: u16 = 16;
+/// The coordinator says that a transaction, or a scan, it holds is still
+/// running, so that the wait for its replies starts again; nothing is
+/// answered. Verify: chapter 05 §17.5.
+pub const IC_SIG_PROGRESS_REP: u16 = 20;
 /// Tell the data node we have seen the commit, so it may forget it.
 /// Verify: chapter 05 §17.5.
 pub const IC_SIG_COMMIT_MARKER_FREE_ORD: u16 = 469;
@@ -161,6 +165,7 @@ pub fn sig_name(sig_no: u16) -> Option<&'static str> {
     IC_SIG_ROLLBACK_CONF => Some("ROLLBACK_CONF"),
     IC_SIG_ROLLBACK_REF => Some("ROLLBACK_REF"),
     IC_SIG_TRANS_ABORTED_REP => Some("TRANS_ABORTED_REP"),
+    IC_SIG_PROGRESS_REP => Some("PROGRESS_REP"),
     IC_SIG_COMMIT_MARKER_FREE_ORD => Some("COMMIT_MARKER_FREE_ORD"),
     IC_SIG_TAKEOVER_CONF => Some("TAKEOVER_CONF"),
     IC_SIG_TAKEOVER_REF => Some("TAKEOVER_REF"),
@@ -212,6 +217,7 @@ mod tests {
       IC_SIG_COMMIT_REQ,
       IC_SIG_ROLLBACK_REQ,
       IC_SIG_TRANS_ABORTED_REP,
+      IC_SIG_PROGRESS_REP,
       IC_SIG_COMMIT_MARKER_FREE_ORD,
       IC_SIG_KEY_OP_REQ,
       IC_SIG_KEY_OP_CONF,

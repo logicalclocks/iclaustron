@@ -124,6 +124,11 @@ pub const IC_COORD_ALLOC_WAIT_MS: u32 = 5_000;
 /// came cost a system call a poll, most of the user thread's writing on
 /// updates (measured 2026-09-23).
 pub const IC_REPLY_SEND_DELAY_NANOS: u64 = 1_000_000;
+
+/// How many of its first data words the last signal no request was
+/// waiting for keeps ([`ApidConnection::last_unexpected_words`]):
+/// enough for a record's pointer and a transaction's id.
+pub const IC_STRAY_WORDS: usize = 4;
 /// How often a poll looks for transactions that have waited too long
 /// for their replies (chapter 06 §6.3): a walk over the transactions in
 /// flight, so not on every poll.
@@ -617,6 +622,10 @@ pub struct ApidConnection {
   unexpected: u64,
   /// The last of those, by its number and the node it came from.
   last_unexpected: Option<(u16, u32)>,
+  /// Its first data words, as many as it had up to
+  /// [`IC_STRAY_WORDS`]: what names whatever it was meant for.
+  last_unexpected_words: [u32; IC_STRAY_WORDS],
+  last_unexpected_len: usize,
   /// Signals of scan runs that had ended when they came, dropped.
   pub(crate) late_scan_signals: u64,
   /// The tables this thread has bound, by internal name.
@@ -820,6 +829,8 @@ impl ApidConnection {
       next_request_id: 1,
       unexpected: 0,
       last_unexpected: None,
+      last_unexpected_words: [0; IC_STRAY_WORDS],
+      last_unexpected_len: 0,
       late_scan_signals: 0,
       tables: HashMap::new(),
       indexes: HashMap::new(),
@@ -940,6 +951,13 @@ impl ApidConnection {
       None => format!("signal {}", sig_no),
     };
     Some((name, node_id))
+  }
+
+  /// The first data words of the last signal no request was waiting
+  /// for, up to [`IC_STRAY_WORDS`]: for telling what it was meant for.
+  /// Empty when none has come.
+  pub fn last_unexpected_words(&self) -> &[u32] {
+    &self.last_unexpected_words[..self.last_unexpected_len]
   }
 
   /// How many rounds the BLOB queries on this connection have sent after
@@ -2401,6 +2419,9 @@ impl ApidConnection {
   fn note_stray(&mut self, signal: &SignalView<'_>) {
     self.unexpected += 1;
     self.last_unexpected = Some((signal.sig_no, signal.sender_node_id));
+    let len = signal.data.len().min(IC_STRAY_WORDS);
+    self.last_unexpected_words[..len].copy_from_slice(&signal.data[..len]);
+    self.last_unexpected_len = len;
     ic_port::debug_print!(
       IC_NDB_MESSAGE_LEVEL,
       "No request expects {} from node {} to block {:#06x}",
