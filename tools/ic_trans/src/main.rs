@@ -251,10 +251,8 @@ fn run_all(global: &ApidGlobal, plan: &Plan) -> i32 {
       return 1;
     }
   };
-  let mut ids: Vec<u32> = Vec::with_capacity(def.info().attributes.len());
-  for attr in &def.info().attributes {
-    ids.push(attr.column_id);
-  }
+  note_left_out(&def);
+  let ids = def.usable_field_ids();
   let made = (
     Record::default_for(&def, None),
     Record::default_for(&def, Some(ids.as_slice())),
@@ -334,14 +332,23 @@ struct Run<'a> {
   bytes: Option<usize>,
 }
 
+/// True for a blob column that can be used. One that cannot is left
+/// out of the rows, and so has to be nullable for a row to be made.
+fn blob_usable(def: &TableDef, column_id: u32) -> bool {
+  match def.blob_column(column_id) {
+    Some(blob) => blob.is_usable(),
+    None => false,
+  }
+}
+
 /// Every column other than the key must be an integer, or nullable, or
-/// a blob column given bytes.
+/// a blob column that can be used, given bytes.
 fn check_columns(def: &Arc<TableDef>, bytes: bool) -> Result<(), String> {
   for attr in &def.info().attributes {
     if attr.primary_key || attr.nullable || is_integer(attr.type_code) {
       continue;
     }
-    if attr.is_blob() && bytes {
+    if bytes && blob_usable(def, attr.column_id) {
       continue;
     }
     return Err(format!(
@@ -698,6 +705,21 @@ fn error_text(error: Option<IcError>) -> String {
   match error {
     Some(e) => format!(": {} ({})", e.message(), e.code),
     None => String::new(),
+  }
+}
+
+/// Say which blob columns the rows go without, and why: one that
+/// cannot be used is left out of the records, and the rest of its
+/// table used as a table without it.
+fn note_left_out(def: &TableDef) {
+  for blob in def.blob_columns() {
+    let name = match def.field(blob.column_id()) {
+      Some(attr) => attr.name.as_str(),
+      None => "?",
+    };
+    if let Some(why) = blob.refusal() {
+      println!("Column {} is left out: {}", name, why.text());
+    }
   }
 }
 

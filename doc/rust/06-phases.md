@@ -3092,8 +3092,9 @@ head, the arithmetic, the planner and the commit held.
 ### 12.10 The review of 1.1.0 (2026-11-13, open)
 
 A review of everything between 1.0.0 and 1.1.0, each finding checked
-against the code. Fifteen held. The first four are fixed on `trunk`
-(2026-11-14); 1.1.0 itself takes no changes.
+against the code. Fifteen held. The first eleven are fixed on `trunk`
+(2026-11-14), the first four and then the next seven; 1.1.0 itself
+takes no changes.
 
 1. **The unlock went with the first round of parts**, not after the
    last: in a transaction left open, a value with more part data than
@@ -3135,23 +3136,68 @@ and an update through a unique index behind two by primary key. The
 second needs a stored head the client cannot read, which nothing here
 can write: a unit test of the run's decision stands in for it.
 
+5. **A BLOB read that succeeded reported a result length of 0**,
+   which the header gives as a row that was not there: the query's
+   completion set it to 0 whatever the read brought. It is now the
+   bytes of the main row, each value's first bytes among them and not
+   its parts', and 0 only for a read that failed.
+6. **A completed read could not be freed while its unlock was out**:
+   `free_query` was refused with `IC_ERROR_TRANSACTION_ACTIVE`, though
+   the query does not wait for the unlock, and the callers that drop
+   the result kept the query for good. With the unlock in a round of
+   its own (the first fix) every such read in a transaction left open
+   would have met it. The query is now freed, and the unlock's
+   operation when its answer comes, finding its query gone.
+7. **A read sized its buffer to the stored length** before a part of
+   it had come: a head with a wild length made the read ask for that
+   much memory, and stop the program when there was none. The buffer
+   now holds the inline bytes, is given room for the length up to
+   1 MiB, and grows as the parts come, so that such a head costs what
+   its first round brings and then fails with 4267. A length whose
+   parts would be numbered past 32 bits is 4267 at once.
+8. **A synchronous helper gave up on a transaction that was alive.**
+   `wait_for_end` counted the reply timeout and a second from its own
+   start, while the transaction's wait starts again with each send
+   and with `PROGRESS_REP`: a helper returned `IC_ERROR_TIMEOUT`, and
+   the AUTO_INCREMENT one gave its connection up, for a transaction
+   its coordinator had just said was running. It now waits by the
+   transaction's own clock. The helpers' loop through BLOB rounds,
+   which did the same for sends only, is gone.
+9. **The C functions that size a blob buffer took any length**, two of
+   them, `ic_blob_values_buffer` and `ic_request_blob_buffer`, outside
+   the panic guard: a length no memory holds stopped the program. A
+   length past what a write takes is now refused with 4266 before any
+   room is made, and one there is no room for with
+   `IC_ERROR_MEM_ALLOC` (7005, a define the header gains), the field
+   as it was; all three are guarded. In Rust `blob_buf_sized` does it,
+   on a query, an operation and a holder; `blob_buf_mut` still hands
+   out the buffer itself. This changes one thing for a C program built
+   against 1.1.0: a buffer longer than the column's type holds is
+   refused when it is asked for, where it was refused when the query
+   was defined.
+10. **Three texts described 1.0**: the header's on
+    `IC_ERROR_DELETE_WITH_BLOBS`, `write_key`'s, and 4266's, which
+    spoke of columns without parts only. The user guide's table of
+    codes said the same of 7153.
+11. **`ic_bench`, `ic_trans` and `ic_read` refused a table with a blob
+    column that cannot be used**, since they named every column and no
+    record may name such a one; 1.0's read them, without their blobs.
+    They now leave such a column out, saying which and why, and take a
+    NOT NULL one for a column no row can be made without.
+    `TableDef::usable_field_ids` gives the fields a record may name.
+
+Tests for these: the blob reads of the integration tests check the
+result length, on a connection and through an executor; a read freed
+with its unlock out, and nothing of it left once the transaction has
+ended (`queries_open`, new); unit tests of the buffer that grows, of
+the longest value a column keeps, of the sized buffer and of the
+transaction's clock; the C tests ask each of the three functions for a
+buffer no column holds. The seventh has no test against a cluster, for
+want of a way to write such a head, and the eighth none of a helper
+outliving its first wait, which needs a coordinator that says it runs.
+
 Still open, in the order found:
 
-5. A BLOB read that succeeded reports a result length of 0, which the
-   header documents as a row that was not there.
-6. Freeing a completed BLOB read is refused with
-   `IC_ERROR_TRANSACTION_ACTIVE` while its unlock is still out.
-7. A stored length is not bounded before the value's buffer is sized
-   to it: a head with a wild length makes the read allocate that much.
-8. `wait_for_end` gives up after the reply timeout and a second from
-   its start, though `PROGRESS_REP` may since have started the
-   transaction's own wait again.
-9. The C functions that size a blob buffer take any length, two of
-   them outside the panic guard.
-10. Three texts describe 1.0: the header's on
-    `IC_ERROR_DELETE_WITH_BLOBS`, `write_key`'s, and 4266's.
-11. `ic_bench`, `ic_trans` and `ic_read` name every column, and so
-    refuse a table with a blob column that cannot be used.
 12. A transaction's bookkeeping of its BLOB queries is quadratic in
     their number.
 13. Each part operation's slot builds and copies a record it never

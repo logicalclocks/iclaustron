@@ -99,6 +99,13 @@ const IC_MYSQL_MEDIUM_PART: u32 = 4000;
 
 /// Bytes of the head, before the inline bytes.
 pub const IC_BLOB_HEAD_BYTES: usize = 16;
+/// The most parts a value has: a part's number is 32 bits.
+const IC_MAX_PARTS: u64 = 1 << 32;
+/// The room a value being read is given at once, when its head says
+/// it is at least that long: past it the buffer grows as the parts
+/// come, so that a head with a wild length costs no more memory than
+/// the parts that are there.
+const IC_READ_ROOM_BYTES: u64 = 1 << 20;
 /// What the head's size field counts besides the inline bytes: the
 /// head less the field itself.
 const IC_BLOB_HEAD_REST: usize = 14;
@@ -187,9 +194,13 @@ impl BlobSizes {
   }
 
   /// True when the column can keep a value of this length, whatever its
-  /// MySQL type: what a value read is held to.
+  /// MySQL type: what a value read is held to. Without parts it is the
+  /// inline size; with them, as many parts as their numbers count.
   fn keeps(self, length: u64) -> bool {
-    self.has_parts() || length <= self.inline as u64
+    if !self.has_parts() {
+      return length <= self.inline as u64;
+    }
+    self.part_count(length) <= IC_MAX_PARTS
   }
 
   /// How many of a value's bytes are kept inline.
@@ -684,6 +695,10 @@ struct BlobSlot {
   /// value is set NULL or cleared.
   value: Vec<u8>,
   null: bool,
+  /// The whole length of the value a read is bringing, as its head
+  /// gave it: `value` has its inline bytes, and grows towards it as
+  /// the parts come ([`BlobValues::part_buf`]).
+  read_length: u64,
 }
 
 /// The values of a record's blob fields, kept apart from its row: a
@@ -725,6 +740,7 @@ impl BlobValues {
         sizes,
         value: Vec::new(),
         null: true,
+        read_length: 0,
       });
     }
     BlobValues {
@@ -834,6 +850,32 @@ impl BlobValues {
     Ok(&mut slot.value)
   }
 
+  /// The buffer of the field at `position` made `len` bytes long, to
+  /// fill in place, as the C ABI hands it out (`ic_blob_values_buffer`):
+  /// what it held, as far as it reaches, then zeros. The field is no
+  /// longer NULL. Refused with 4266 when `len` is more than a write
+  /// takes, before any room is made for a value that could never be
+  /// written, and with `IC_ERROR_MEM_ALLOC` when there is no room to
+  /// be had; the field is then as it was.
+  pub fn blob_buf_sized(
+    &mut self,
+    position: u32,
+    len: usize,
+  ) -> Result<&mut [u8], IcError> {
+    let index = self.slot(position)?;
+    let slot = &mut self.slots[index];
+    if !slot.sizes.holds(len as u64) {
+      return Err(IcError::new(IC_NDB_ERROR_BLOB_TOO_LONG));
+    }
+    let more = len.saturating_sub(slot.value.len());
+    if slot.value.try_reserve(more).is_err() {
+      return Err(IcError::new(err::IC_ERROR_MEM_ALLOC));
+    }
+    slot.value.resize(len, 0);
+    slot.null = false;
+    Ok(slot.value.as_mut_slice())
+  }
+
   /// Set every value NULL, keeping each buffer's capacity.
   pub fn clear(&mut self) {
     for slot in &mut self.slots {
@@ -855,6 +897,11 @@ impl BlobValues {
   /// come from its parts ([`part_buf`](Self::part_buf)); or NULL. The
   /// buffer keeps its capacity. Damaged (4267) when the inline bytes
   /// are more than the length.
+  ///
+  /// The buffer holds the inline bytes only, and is not sized to the
+  /// length, which is a stored number no one has checked against the
+  /// parts yet: it is given room for it up to `IC_READ_ROOM_BYTES`, and
+  /// grows as the parts come.
   pub(crate) fn read_head(
     &mut self,
     position: u32,
@@ -863,13 +910,15 @@ impl BlobValues {
     let index = self.slot(position)?;
     let slot = &mut self.slots[index];
     slot.value.clear();
+    slot.read_length = 0;
     match head {
       Some((length, inline)) => {
         if (inline.len() as u64) > length {
           return Err(IcError::new(IC_NDB_ERROR_BLOB_DAMAGED));
         }
-        slot.value.resize(length as usize, 0);
-        slot.value[..inline.len()].copy_from_slice(inline);
+        slot.value.reserve(length.min(IC_READ_ROOM_BYTES) as usize);
+        slot.value.extend_from_slice(inline);
+        slot.read_length = length;
         slot.null = false;
       }
       None => slot.null = true,
@@ -877,8 +926,21 @@ impl BlobValues {
     Ok(())
   }
 
+  /// The whole length of the value a read has brought the head of, for
+  /// the `index`th blob field, in record order; `None` for NULL.
+  pub(crate) fn read_length(&self, index: usize) -> Option<u64> {
+    let slot = self.slots.get(index)?;
+    if slot.null {
+      return None;
+    }
+    Some(slot.read_length)
+  }
+
   /// Where a part read puts its bytes: `len` of the `index`th blob
-  /// field's, in record order, from `offset`; `None` past the value.
+  /// field's, in record order, from `offset`; `None` past the length
+  /// its head gave. The buffer grows to take them, the bytes of a part
+  /// yet to come zero until it does: parts of one round come in any
+  /// order.
   pub(crate) fn part_buf(
     &mut self,
     index: usize,
@@ -886,7 +948,14 @@ impl BlobValues {
     len: usize,
   ) -> Option<&mut [u8]> {
     let slot = self.slots.get_mut(index)?;
-    slot.value.get_mut(offset..offset.checked_add(len)?)
+    let end = offset.checked_add(len)?;
+    if end as u64 > slot.read_length {
+      return None;
+    }
+    if slot.value.len() < end {
+      slot.value.resize(end, 0);
+    }
+    slot.value.get_mut(offset..end)
   }
 
   /// The sizes of the blob field at `position`.
@@ -1668,6 +1737,77 @@ mod tests {
     cut[0..2].copy_from_slice(&size.to_le_bytes());
     let refused = decode_main_value(text, &cut);
     assert_eq!(refused.expect_err("cut").code, IC_NDB_ERROR_BLOB_DAMAGED);
+    // A length whose parts would be numbered past 32 bits: no column
+    // keeps it. The longest one that a column does keep is read.
+    let most = text.inline as u64 + IC_MAX_PARTS * text.part as u64;
+    let mut wild = out.clone();
+    wild[8..IC_BLOB_HEAD_BYTES].copy_from_slice(&most.to_le_bytes());
+    assert!(decode_main_value(text, &wild).is_ok(), "the longest kept");
+    wild[8..IC_BLOB_HEAD_BYTES].copy_from_slice(&(most + 1).to_le_bytes());
+    let refused = decode_main_value(text, &wild);
+    assert_eq!(refused.expect_err("wild").code, IC_NDB_ERROR_BLOB_DAMAGED);
+  }
+
+  #[test]
+  fn blob_a_buffer_is_sized_only_as_far_as_a_write_takes() {
+    let def = bound_main_table();
+    // id, t, tiny: positions 0, 1 and 2.
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let mut values = BlobValues::new(&rec);
+    values.set_blob(1, b"abc").expect("set");
+    // Longer: what it held, then zeros. Shorter: its first bytes.
+    let buf = values.blob_buf_sized(1, 5).expect("five bytes");
+    assert_eq!(&*buf, &b"abc\0\0"[..]);
+    let buf = values.blob_buf_sized(1, 2).expect("two bytes");
+    assert_eq!(&*buf, &b"ab"[..]);
+    assert!(values.blob_buf_sized(1, 0).expect("none").is_empty());
+    assert_eq!(values.blob(1).expect("t"), Some(&b""[..]));
+    // Past what a write takes: refused before any room is made, with
+    // nothing changed, a NULL field still NULL.
+    let most = values.sizes_at(2).expect("tiny").max_length() as usize;
+    let refused = values.blob_buf_sized(2, most + 1).expect_err("4266");
+    assert_eq!(refused.code, IC_NDB_ERROR_BLOB_TOO_LONG);
+    assert_eq!(values.blob(2).expect("tiny"), None);
+    let refused = values.blob_buf_sized(1, usize::MAX).expect_err("4266");
+    assert_eq!(refused.code, IC_NDB_ERROR_BLOB_TOO_LONG);
+    let buf = values.blob_buf_sized(2, most).expect("the most");
+    assert_eq!(buf.len(), most);
+    assert!(values.blob_buf_sized(0, 1).is_err(), "id is no blob field");
+  }
+
+  #[test]
+  fn blob_a_wild_length_takes_no_more_room_than_its_parts() {
+    let def = bound_main_table();
+    // id, t, tiny: positions 0, 1 and 2.
+    let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
+    let mut values = BlobValues::new(&rec);
+    let inline = value_of(256);
+    // A head that says a terabyte: the buffer holds the inline bytes,
+    // with room for a first megabyte and no more.
+    let wild: u64 = 1 << 40;
+    let head = Some((wild, inline.as_slice()));
+    values.read_head(1, head).expect("the head");
+    assert_eq!(values.read_length(0), Some(wild));
+    assert_eq!(values.blob(1).expect("t"), Some(&inline[..]));
+    let room = values.blob_buf_mut(1).expect("t's buffer").capacity();
+    assert!(room <= 2 * IC_READ_ROOM_BYTES as usize, "{} bytes", room);
+    // Its parts come in any order: the buffer grows to the last byte
+    // that came, the part before it zero until it comes too.
+    let second = values.part_buf(0, 2256, 2000).expect("part 1's place");
+    second.fill(2);
+    let got = values.blob(1).expect("t").expect("not NULL");
+    assert_eq!(got.len(), 4256);
+    assert!(got[256..2256].iter().all(|byte| *byte == 0));
+    let first = values.part_buf(0, 256, 2000).expect("part 0's place");
+    first.fill(1);
+    let got = values.blob(1).expect("t").expect("not NULL");
+    assert!(got[256..2256].iter().all(|byte| *byte == 1));
+    assert!(got[2256..].iter().all(|byte| *byte == 2));
+    // A head read again starts the value again.
+    let head = Some((300, inline.as_slice()));
+    values.read_head(1, head).expect("the head");
+    assert_eq!(values.blob(1).expect("t"), Some(&inline[..]));
+    assert_eq!(values.read_length(0), Some(300));
   }
 
   #[test]
@@ -1806,6 +1946,8 @@ mod tests {
     assert!(blob.is_usable());
     assert_eq!(blob.part_column().expect("t's parts").size, 2000);
     assert!(!def.blob_column(2).expect("b").is_usable());
+    // Every field a record may name: all of them but b.
+    assert_eq!(def.usable_field_ids(), vec![0, 1, 3]);
     // id, t, tiny: positions 0, 1 and 2.
     let rec = Record::default_for(&def, Some(&[0, 1, 3])).expect("record");
     let mut values = BlobValues::new(&rec);
@@ -2201,11 +2343,14 @@ mod tests {
     assert_eq!(used, words.len());
     let at = rec.field(0).expect("id").offset() as usize;
     assert_eq!(row[at..at + 4], 7u32.to_le_bytes());
-    // The head's length, the inline bytes, the rest to come.
+    // The head's length, and the inline bytes; the rest is to come,
+    // and the buffer grows to it as it does.
     let got = values.blob(1).expect("t").expect("not NULL");
-    assert_eq!(got.len(), 300);
-    assert_eq!(&got[..256], &text[..256]);
+    assert_eq!(got, &text[..256]);
+    assert_eq!(values.read_length(0), Some(300));
     assert_eq!(values.blob(2).expect("tiny"), None);
+    assert_eq!(values.read_length(1), None);
+    assert!(values.part_buf(0, 256, 45).is_none(), "past the length");
     let rest = values.part_buf(0, 256, 44).expect("part 0's place");
     rest.copy_from_slice(&text[256..]);
     assert_eq!(values.blob(1).expect("t"), Some(&text[..]));

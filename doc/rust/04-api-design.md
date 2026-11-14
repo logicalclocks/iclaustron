@@ -206,21 +206,23 @@ An attribute record may name blob fields (BLOB, TEXT, and a MySQL
 server's JSON and GEOMETRY), and a query over it holds their values
 beside its rows, NULL until set: `query.set_blob(position, &[u8])`,
 `set_blob_null(position)`, `blob_buf_mut(position)` to fill a value's
-buffer in place, and `blob(position)`, `None` for NULL, where a position
+buffer in place, or `blob_buf_sized(position, len)` for the buffer made
+`len` bytes long, and `blob(position)`, `None` for NULL, where a position
 is the field's in the record. In C the calls take the field's id, as
 every C record call does (ours to choose: C has no call giving a
 position): `ic_apid_query_set_blob(conn, query, field_id, value, len)`,
 `ic_apid_query_set_blob_null`, `ic_apid_query_blob_buffer(conn, query,
 field_id, len, &buffer)`, which makes the value `len` bytes long, its
-old bytes kept as far as they reach, for C to fill, and
+old bytes kept as far as they reach, for C to fill, and refuses a `len`
+past what a write takes with 4266 before any room is made for it, and
 `ic_apid_query_blob(conn, query, field_id, &value, &len)`, `value` NULL
-for NULL and never NULL for an empty value. A value too long for a
-column with no parts table (MySQL's TINYBLOB and TINYTEXT) is refused
-with 4266 (`IC_NDB_ERROR_BLOB_TOO_LONG`), when it is set or when the
-query is defined. The values cannot change while the query is defined
-or sent (`IC_ERROR_TRANSACTION_ACTIVE`), as its rounds read them as
-they go. A JSON or GEOMETRY value is MySQL's own binary form, which the
-application gives and takes as bytes.
+for NULL and never NULL for an empty value. A value longer than its
+column's MySQL type holds is refused with 4266
+(`IC_NDB_ERROR_BLOB_TOO_LONG`), when it is set, when its buffer is
+sized, or when the query is defined. The values cannot change while the
+query is defined or sent (`IC_ERROR_TRANSACTION_ACTIVE`), as its rounds
+read them as they go. A JSON or GEOMETRY value is MySQL's own binary
+form, which the application gives and takes as bytes.
 
 A value written is held to its MySQL type's limit (the author,
 2026-11-12; chapter 10), `BlobSizes::max_length`, which can be narrower

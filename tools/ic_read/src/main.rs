@@ -258,6 +258,7 @@ fn read_row(
       return 1;
     }
   };
+  note_left_out(&def);
   let mut index: Option<Arc<IndexDef>> = None;
   let mut key_names: Vec<String> = Vec::new();
   if index_name.is_empty() {
@@ -323,9 +324,10 @@ fn read_row(
 }
 
 /// The row read by its primary key through a query on a transaction of
-/// its own, every column read, the blob columns too, and printed. The
-/// key record is the default one, which leaves the blob columns out, as
-/// a key record must. False if there is no such row.
+/// its own, every column read, the blob columns too but those that
+/// cannot be used, and printed. The key record is the default one,
+/// which leaves the blob columns out, as a key record must. False if
+/// there is no such row.
 fn read_by_query(
   conn: &mut ApidConnection,
   def: &Arc<TableDef>,
@@ -333,10 +335,7 @@ fn read_by_query(
   key_row: &[u8],
   how: How,
 ) -> Result<bool, IcError> {
-  let mut ids: Vec<u32> = Vec::with_capacity(def.info().attributes.len());
-  for attr in &def.info().attributes {
-    ids.push(attr.column_id);
-  }
+  let ids = def.usable_field_ids();
   let attr_rec = Record::default_for(def, Some(ids.as_slice()))?;
   let id = conn.create_query(def, key_rec, &attr_rec)?;
   let read = read_on_query(conn, def, key_rec, &attr_rec, key_row, how, id);
@@ -592,6 +591,21 @@ fn print_row(def: &Arc<TableDef>, rec: &Record, row: &[u8]) {
       }
     }
     position += 1;
+  }
+}
+
+/// Say which blob columns the rows go without, and why: one that
+/// cannot be used is left out of the records, and the rest of its
+/// table used as a table without it.
+fn note_left_out(def: &TableDef) {
+  for blob in def.blob_columns() {
+    let name = match def.field(blob.column_id()) {
+      Some(attr) => attr.name.as_str(),
+      None => "?",
+    };
+    if let Some(why) = blob.refusal() {
+      println!("Column {} is left out: {}", name, why.text());
+    }
   }
 }
 

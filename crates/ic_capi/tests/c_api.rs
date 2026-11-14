@@ -2367,7 +2367,13 @@ fn c_api_blob_values_on_a_connection_through_an_executor_and_the_helpers() {
       doc_value.len(),
     );
     assert_eq!(ret, 0, "set: {}", message(ret));
+    // A length no column holds is refused before any room is made for
+    // it, and the pointer left alone.
     let mut buffer: *mut u8 = std::ptr::null_mut();
+    let ret =
+      ic_apid_query_blob_buffer(conn, query, data, usize::MAX, &mut buffer);
+    assert_eq!(ret, IC_NDB_ERROR_BLOB_TOO_LONG);
+    assert!(buffer.is_null());
     let ret = ic_apid_query_blob_buffer(
       conn,
       query,
@@ -2502,6 +2508,10 @@ fn c_api_blob_values_on_a_connection_through_an_executor_and_the_helpers() {
       );
       assert_eq!(ret, 0, "set: {}", message(ret));
       let mut buffer: *mut u8 = std::ptr::null_mut();
+      let ret =
+        ic_request_blob_buffer(request, op, data, usize::MAX, &mut buffer);
+      assert_eq!(ret, IC_NDB_ERROR_BLOB_TOO_LONG);
+      assert!(buffer.is_null());
       let ret = ic_request_blob_buffer(
         request,
         op,
@@ -2557,6 +2567,12 @@ fn c_api_blob_values_on_a_connection_through_an_executor_and_the_helpers() {
       ic_blob_values_set(values, doc, doc_value.as_ptr(), doc_value.len());
     assert_eq!(ret, 0, "set: {}", message(ret));
     assert_eq!(ic_blob_values_set_null(values, data), 0);
+    // A buffer of a length no column holds is refused, the field NULL
+    // as it was.
+    let mut at: *mut u8 = std::ptr::null_mut();
+    let ret = ic_blob_values_buffer(values, data, usize::MAX, &mut at);
+    assert_eq!(ret, IC_NDB_ERROR_BLOB_TOO_LONG);
+    assert!(at.is_null());
     let mut row = vec![0u8; ic_record_row_size(rec) as usize];
     put(
       rec,

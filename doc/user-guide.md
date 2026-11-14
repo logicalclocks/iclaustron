@@ -1025,10 +1025,11 @@ asked for once it has completed.
 | 7163 | a range of an index scan that cannot be sent | error |
 | 7166 | the table has no AUTO_INCREMENT column | error |
 | 7139 | too many connections in this process | error |
-| 7153, 7155 | a delete on a table with blobs; an indexed column updated through the index | error |
+| 7153, 7155 | a delete that would leave a row's blob parts behind; an indexed column updated through the index | error |
 | 7154 | the index is not online | error |
 | 7077, 7156 | the row or the key is larger than RonDB allows | error |
 | 7129 | a panic inside the library; the connection is unusable | stop |
+| 7005 | no memory for what was asked for, as a blob buffer of a length given | stop |
 
 ### When to try again
 

@@ -213,6 +213,9 @@ pub const IC_NO_NULL_BIT: u32 = 0xFFFF_FFFF;
 /// A panic inside the library; the connection it went through is
 /// unusable.
 pub const IC_ERROR_INTERNAL_PANIC: i32 = 7129;
+/// No memory for what was asked for, as a blob buffer of a length
+/// given.
+pub const IC_ERROR_MEM_ALLOC: i32 = 7005;
 /// A null handle or out pointer.
 pub const IC_ERROR_NULL_POINTER: i32 = 7157;
 /// Text that is not UTF-8, or a value given as text that does not fit.
@@ -309,8 +312,9 @@ pub const IC_ERROR_NOT_SUPPORTED: i32 = 7127;
 /// than this header's.
 pub const IC_ERROR_INCONSISTENT_DATA: i32 = 7020;
 /// A delete from a table with a blob column that would leave its parts
-/// behind: through a unique index, of a scanned row taken over, or by
-/// a synchronous helper, refused until they delete the parts too.
+/// behind: of a scanned row taken over, or from a table with a blob
+/// column that cannot be used. By primary or unique key, and by the
+/// synchronous helpers, a delete takes the parts with the row.
 pub const IC_ERROR_DELETE_WITH_BLOBS: i32 = 7153;
 /// An update through a unique index that sets an indexed column.
 pub const IC_ERROR_INDEXED_COLUMN_UPDATE: i32 = 7155;
@@ -1062,12 +1066,10 @@ unsafe fn blob_in<'a>(value: *const u8, len: usize) -> Result<&'a [u8], i32> {
   Ok(unsafe { std::slice::from_raw_parts(value, len) })
 }
 
-/// A blob value's buffer made `len` bytes long, for C to fill in place:
-/// what it held, as far as it reaches, then zeros; NULL for an empty
-/// buffer.
-fn fill_buffer(buf: &mut Vec<u8>, len: usize) -> *mut u8 {
-  buf.resize(len, 0);
-  if len == 0 {
+/// A blob value's buffer, sized for C to fill in place, as the pointer
+/// C is given: NULL for an empty buffer.
+fn buffer_out(buf: &mut [u8]) -> *mut u8 {
+  if buf.is_empty() {
     return std::ptr::null_mut();
   }
   buf.as_mut_ptr()
@@ -2681,11 +2683,12 @@ pub unsafe extern "C" fn ic_apid_query_set_blob_null(
 /// The blob field `field_id` made `len` bytes long, to fill in place:
 /// `buffer` is set to its bytes, which hold the last value set or read
 /// as far as it reaches and zeros after, NULL for an empty value, valid
-/// as `ic_apid_query_blob`'s. The field is no longer NULL. A value
-/// longer than its column's MySQL type holds fails the query's definition
-/// with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+/// as `ic_apid_query_blob`'s. The field is no longer NULL.
 ///
-/// Errors: as `ic_apid_query_set_blob`.
+/// Errors: as `ic_apid_query_set_blob`, `IC_NDB_ERROR_BLOB_TOO_LONG`
+/// for a `len` longer than its column's MySQL type holds;
+/// `IC_ERROR_MEM_ALLOC` when there is no room for `len` bytes. The
+/// field is then as it was.
 ///
 /// # Safety
 ///
@@ -2707,9 +2710,9 @@ pub unsafe extern "C" fn ic_apid_query_blob_buffer(
     on_conn(conn, |c| match c.query_mut(QueryId::from_u64(query)) {
       Some(q) => {
         let found = field_position(q.attr_record(), field_id)
-          .and_then(|position| q.blob_buf_mut(position));
+          .and_then(|position| q.blob_buf_sized(position, len));
         match found {
-          Ok(buf) => Ok(fill_buffer(buf, len)),
+          Ok(buf) => Ok(buffer_out(buf)),
           Err(e) => Err(e.code),
         }
       }
@@ -3740,7 +3743,9 @@ pub unsafe extern "C" fn ic_blob_values_set_null(
 /// as `ic_apid_query_blob_buffer` does a query's: `buffer` is set to its
 /// bytes, NULL for an empty value, valid as `ic_blob_values_get`'s.
 ///
-/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`.
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`;
+/// `IC_NDB_ERROR_BLOB_TOO_LONG` and `IC_ERROR_MEM_ALLOC` as
+/// `ic_apid_query_blob_buffer`.
 ///
 /// # Safety
 ///
@@ -3761,19 +3766,19 @@ pub unsafe extern "C" fn ic_blob_values_buffer(
   if buffer.is_null() {
     return err::IC_ERROR_NULL_POINTER;
   }
-  let position = match holder_position(holder, field_id) {
-    Ok(position) => position,
-    Err(e) => return e.code,
-  };
-  match holder.blob_buf_mut(position) {
-    Ok(buf) => {
-      let at = fill_buffer(buf, len);
-      // SAFETY: checked non-null above; the caller's promise.
-      unsafe { buffer.write(at) };
-      0
+  guarded(|| {
+    let sized = holder_position(holder, field_id)
+      .and_then(|position| holder.blob_buf_sized(position, len));
+    match sized {
+      Ok(buf) => {
+        let at = buffer_out(buf);
+        // SAFETY: checked non-null above; the caller's promise.
+        unsafe { buffer.write(at) };
+        0
+      }
+      Err(e) => e.code,
     }
-    Err(e) => e.code,
-  }
+  })
 }
 
 /// Set every value NULL, keeping each buffer's capacity.
@@ -5794,7 +5799,9 @@ pub unsafe extern "C" fn ic_request_op_error_data(
 }
 
 /// Bytes of row data operation `op`, a read, brought in the last run;
-/// 0 for a write, or a row that was not there.
+/// 0 for a write, or a row that was not there. Of a row with blob values
+/// these are its main row's, each value's first bytes among them, and
+/// not its parts'.
 ///
 /// # Safety
 ///
@@ -5932,10 +5939,11 @@ pub unsafe extern "C" fn ic_request_set_blob_null(
 /// The blob field `field_id` of operation `op` made `len` bytes long,
 /// to fill in place, as `ic_apid_query_blob_buffer` does a query's:
 /// `buffer` is set to its bytes, NULL for an empty value, valid as
-/// `ic_request_blob`'s. A value longer than its column's MySQL type holds
-/// fails the operation with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+/// `ic_request_blob`'s.
 ///
-/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`.
+/// Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`;
+/// `IC_NDB_ERROR_BLOB_TOO_LONG` and `IC_ERROR_MEM_ALLOC` as
+/// `ic_apid_query_blob_buffer`.
 ///
 /// # Safety
 ///
@@ -5957,19 +5965,19 @@ pub unsafe extern "C" fn ic_request_blob_buffer(
     Some(found) => found,
     None => return err::IC_ERROR_NO_SUCH_FIELD,
   };
-  let position = match field_position(found.shape().attr_record(), field_id) {
-    Ok(position) => position,
-    Err(e) => return e.code,
-  };
-  match found.blob_buf_mut(position) {
-    Ok(buf) => {
-      let at = fill_buffer(buf, len);
-      // SAFETY: checked non-null above; the caller's promise.
-      unsafe { buffer.write(at) };
-      0
+  guarded(|| {
+    let sized = field_position(found.shape().attr_record(), field_id)
+      .and_then(|position| found.blob_buf_sized(position, len));
+    match sized {
+      Ok(buf) => {
+        let at = buffer_out(buf);
+        // SAFETY: checked non-null above; the caller's promise.
+        unsafe { buffer.write(at) };
+        0
+      }
+      Err(e) => e.code,
     }
-    Err(e) => e.code,
-  }
+  })
 }
 
 /// Have operation `op`, a committed read, take the shared lock and its
@@ -7721,6 +7729,7 @@ mod tests {
   #[test]
   fn the_c_values_are_the_rust_ones() {
     assert_eq!(IC_ERROR_INTERNAL_PANIC, err::IC_ERROR_INTERNAL_PANIC);
+    assert_eq!(IC_ERROR_MEM_ALLOC, err::IC_ERROR_MEM_ALLOC);
     assert_eq!(IC_ERROR_NULL_POINTER, err::IC_ERROR_NULL_POINTER);
     assert_eq!(IC_ERROR_BAD_TEXT, err::IC_ERROR_BAD_TEXT);
     let pairs: [(i32, i32); 26] = [

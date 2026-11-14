@@ -583,7 +583,8 @@ impl ApidQuery {
   }
 
   /// Bytes of row data the last read brought; zero for a row that was
-  /// not there.
+  /// not there. Of a row with blob values these are its main row's,
+  /// each value's first bytes among them, and not its parts'.
   pub fn result_len(&self) -> u32 {
     self.result_len
   }
@@ -728,6 +729,21 @@ impl ApidQuery {
   ) -> Result<&mut Vec<u8>, IcError> {
     self.check_idle()?;
     self.values_mut()?.blob_buf_mut(position)
+  }
+
+  /// The buffer of the blob field at `position` made `len` bytes long,
+  /// to fill in place (`ic_apid_query_blob_buffer`): what it held, as
+  /// far as it reaches, then zeros. Refused with 4266 when `len` is
+  /// more than a write takes, and with `IC_ERROR_MEM_ALLOC` when there
+  /// is no room for it; the field is then as it was
+  /// ([`BlobValues::blob_buf_sized`]).
+  pub fn blob_buf_sized(
+    &mut self,
+    position: u32,
+    len: usize,
+  ) -> Result<&mut [u8], IcError> {
+    self.check_idle()?;
+    self.values_mut()?.blob_buf_sized(position, len)
   }
 
   /// Have a write that finds no row also delete, if there, the part

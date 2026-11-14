@@ -2865,6 +2865,16 @@ fn blob_columns_that_cannot_be_used_are_refused_by_name() {
   // The rest of the table is used as before.
   assert!(r.rec.position_of(text).is_none());
   assert!(r.rec.position_of(id).is_some());
+  // Every field a record may name leaves t out, and makes a record, as
+  // a tool that takes any table needs.
+  let usable = r.def.usable_field_ids();
+  assert!(usable.contains(&id), "{:?}", usable);
+  assert!(!usable.contains(&text), "{:?}", usable);
+  let whole = Record::default_for(&r.def, Some(usable.as_slice()));
+  assert!(whole
+    .expect("a record of the rest")
+    .position_of(id)
+    .is_some());
 }
 
 /// The CRC-32 a MySQL server's `CRC32()` gives, the IEEE one.
@@ -4358,6 +4368,17 @@ fn read_blob_row(
   conn.close_transaction(tid).expect("close");
   let query = conn.query(qid).expect("the query");
   let error = query.error();
+  // A read that found its row says how many bytes of it came, and one
+  // that did not, none.
+  let found = query.result_len() > 0;
+  assert_eq!(
+    found,
+    error.is_none(),
+    "row {} by {:?}: {:?}",
+    id,
+    kind,
+    error
+  );
   let mut values: Vec<Option<Vec<u8>>> = Vec::new();
   for position in positions {
     let value = query.blob(*position).expect("a blob field");
@@ -4687,6 +4708,61 @@ fn blob_a_read_keeps_its_lock_until_its_last_part_is_back() {
   assert_eq!(finish(&mut conn, tid), CommitState::Committed);
   conn.close_transaction(tid).expect("close");
   conn.free_query(qid).expect("free the query");
+}
+
+#[test]
+fn blob_a_read_is_freed_while_its_unlock_is_out() {
+  let cluster = match cluster() {
+    Some(cluster) => cluster,
+    None => return,
+  };
+  if setup_blob_kinds().is_none() {
+    return;
+  }
+  let mut conn = cluster.global.create_connection().expect("a connection");
+  let t = bind(&mut conn, "bl_kinds");
+  let rec = record_over(&t, &["id", "t"]);
+  let at_t = position_in(&t, &rec, "t");
+  let sizes = blob_column_of(&t, "t").sizes().expect("sizes");
+  let value = blob_value((sizes.inline + 2 * sizes.part) as usize, 23, true);
+  let (state, error) = insert_blob_row(
+    &mut conn,
+    &t,
+    &rec,
+    3200,
+    &[(at_t, Some(value.as_slice()))],
+    AbortOption::Default,
+  );
+  assert_eq!(state, CommitState::Committed, "{:?}", error);
+  let before = conn.queries_open();
+
+  // A committed read that takes its lock first, its transaction left
+  // open: it completes as its unlock goes, which it does not wait for.
+  let qid = blob_query(&mut conn, &t, &rec, 3200, &[]);
+  conn
+    .query_mut(qid)
+    .expect("the query")
+    .set_blob_lock_first(true)
+    .expect("lock first");
+  let tid = start_for_query(&mut conn, &t, qid);
+  let read = ReadKeyArgs {
+    kind: ReadKind::Committed,
+    ..ReadKeyArgs::default()
+  };
+  conn.read_key(qid, tid, &read).expect("define the read");
+  complete(&mut conn, qid);
+  let query = conn.query(qid).expect("the query");
+  assert!(query.error().is_none(), "{:?}", query.error());
+  assert!(query.blob(at_t).expect("t") == Some(value.as_slice()));
+  // Freed at once, with the unlock on its way: only the unlock's own
+  // operation is left, until its answer has come.
+  conn.free_query(qid).expect("freed with its unlock out");
+  assert!(conn.query(qid).is_none());
+  assert!(conn.queries_open() > before, "the unlock is still out");
+  conn.commit_transaction(tid).expect("ask to commit");
+  assert_eq!(finish(&mut conn, tid), CommitState::Committed);
+  conn.close_transaction(tid).expect("close");
+  assert_eq!(conn.queries_open(), before, "nothing of the query is left");
 }
 
 #[test]
@@ -5174,6 +5250,7 @@ fn blob_values_go_through_an_executor() {
     let id = index as i64 + 1;
     let (t_value, b_value) = kinds_values(&x, id, 0);
     assert!(op.error().is_none(), "row {}: {:?}", id, op.error());
+    assert!(op.result_len() > 0, "row {} brought its main row", id);
     assert!(
       op.blob(at_t).expect("t") == t_value.as_deref(),
       "row {}",

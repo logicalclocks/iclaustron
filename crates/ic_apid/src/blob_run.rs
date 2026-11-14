@@ -1349,7 +1349,8 @@ impl ApidConnection {
   }
 
   /// An operation of a run has completed, `op` itself, with `error` if
-  /// it failed and what its refusal said beyond the code.
+  /// it failed and what its refusal said beyond the code. One whose
+  /// query has been freed since is freed here.
   pub(crate) fn blob_op_done(
     &mut self,
     op: QueryId,
@@ -1367,7 +1368,12 @@ impl ApidConnection {
         }
         _ => return,
       },
-      None => return,
+      // Its query was freed while it was out, as the unlock no query
+      // waits for may be: the operation is freed too.
+      None => {
+        self.queries.remove(op.0);
+        return;
+      }
     };
     // The unlock is not waited for: the query completes with its parts.
     if role == OpRole::Unlock {
@@ -1476,9 +1482,9 @@ impl ApidConnection {
           if let (Some(values), Some(slot)) =
             (query.blob_values(), run.targets[index].slot)
           {
-            if let Some(value) = values.nth(slot).and_then(|field| field.value)
-            {
-              length = value.len() as u64;
+            // As its head gave it: the buffer has the inline bytes.
+            if let Some(read) = values.read_length(slot) {
+              length = read;
             }
           }
           run.values[index] = ValueParts::read_value(sizes, length);
@@ -1575,9 +1581,15 @@ impl ApidConnection {
           roll_back = query.execution.trans;
         }
       }
-      query.set_result_len(0);
       match error {
-        Some((e, data)) => query.refuse(e, data),
+        // A read that failed brought no row that counts, whatever an
+        // earlier read of its main row did.
+        Some((e, data)) => {
+          query.set_result_len(0);
+          query.refuse(e, data);
+        }
+        // One that succeeded keeps the length of its main row
+        // (`unpack_blob_row`); a write has none.
         None => query.set_state(QueryState::Completed),
       }
     }
@@ -1894,25 +1906,23 @@ impl ApidConnection {
     self.stage_own(qid, &request, &run.main_key, &run.main_attr)
   }
 
-  /// Free a query's operations with it. Refused while one is defined
-  /// or out (`IC_ERROR_TRANSACTION_ACTIVE`).
-  pub(crate) fn free_blob_ops(&mut self, qid: QueryId) -> Result<(), IcError> {
+  /// Free a query's operations with it, the query idle or completed.
+  /// One still defined or out is then one the query did not wait for,
+  /// the unlock of a read: it is left where it is, and is freed when it
+  /// is done, its query gone ([`blob_op_done`](Self::blob_op_done)).
+  pub(crate) fn free_blob_ops(&mut self, qid: QueryId) {
     let ops = match self.queries.get(qid.0) {
       Some(query) => match &query.run {
         Some(run) => run.op_ids(),
-        None => return Ok(()),
+        None => return,
       },
-      None => return Ok(()),
+      None => return,
     };
-    for op in &ops {
-      if self.queries.get(op.0).is_some() && !self.slot_free(*op) {
-        return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE));
+    for op in ops {
+      if self.slot_free(op) {
+        self.queries.remove(op.0);
       }
     }
-    for op in ops {
-      self.queries.remove(op.0);
-    }
-    Ok(())
   }
 }
 

@@ -72,7 +72,6 @@ use crate::node_connect::ReceivedSignal;
 use crate::query::QueryId;
 use crate::query::ReadKeyArgs;
 use crate::query::ReadKind;
-use crate::query::TransId;
 use crate::query::WriteKeyArgs;
 use crate::query::WriteKind;
 use crate::record::Record;
@@ -327,7 +326,9 @@ fn transaction_of_one(
       Err(e)
     }
   };
-  let ended = wait_through_rounds(conn, tid);
+  // To its end through every round of a BLOB query: each round sent
+  // starts the transaction's wait again, and this one with it.
+  let ended = conn.wait_for_end(tid);
   let mut why: Option<IcError> = None;
   if ended.is_some() {
     if let Some(trans) = conn.transaction(tid) {
@@ -339,25 +340,6 @@ fn transaction_of_one(
   match ended {
     Some(state) => Ok((state, why)),
     None => Err(IcError::new(err::IC_ERROR_TIMEOUT)),
-  }
-}
-
-/// Wait for a transaction's end, as long as its BLOB rounds go on: a
-/// wait lasts the reply timeout, and one in which a round went is
-/// followed by another, so that a value of many rounds is waited for
-/// to its end. `None` if a wait passed with no round and no end.
-fn wait_through_rounds(
-  conn: &mut ApidConnection,
-  tid: TransId,
-) -> Option<CommitState> {
-  loop {
-    let rounds = conn.blob_rounds();
-    if let Some(state) = conn.wait_for_end(tid) {
-      return Some(state);
-    }
-    if conn.blob_rounds() == rounds {
-      return None;
-    }
   }
 }
 

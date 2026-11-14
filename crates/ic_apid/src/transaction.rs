@@ -382,7 +382,14 @@ impl Transaction {
       || self.state == CommitState::RollbackRequested;
     waiting
       && self.last_sent != 0
-      && now.saturating_sub(self.last_sent.max(self.heard_at)) >= limit
+      && now.saturating_sub(self.wait_started()) >= limit
+  }
+
+  /// When its wait for replies last started, by the high-resolution
+  /// clock: when it last sent, or when its coordinator last said it was
+  /// still running, if that is later; zero if neither has happened.
+  pub(crate) fn wait_started(&self) -> u64 {
+    self.last_sent.max(self.heard_at)
   }
 }
 
@@ -583,7 +590,10 @@ impl ApidConnection {
   }
 
   /// Free a query that is idle or completed (`ic_apid_query_free`), and
-  /// with it, for a BLOB query, the part operations it has made.
+  /// with it, for a BLOB query, the operations it has made. A read's
+  /// unlock may still be out, since the query does not wait for it: the
+  /// query is freed all the same, and the unlock's operation when it is
+  /// done.
   pub fn free_query(&mut self, id: QueryId) -> Result<(), IcError> {
     let query = match self.query(id) {
       Some(query) => query,
@@ -594,7 +604,7 @@ impl ApidConnection {
       return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE));
     }
     let consumed = state == QueryState::Completed && query.callback().is_none();
-    self.free_blob_ops(id)?;
+    self.free_blob_ops(id);
     if consumed {
       // Do not leave a completion naming a freed query.
       self.executed.retain(|done| *done != id);
@@ -754,15 +764,31 @@ impl ApidConnection {
     self.transactions.len()
   }
 
+  /// Queries on this connection not yet freed. The operations a BLOB
+  /// query has made for its rounds are counted too: they are freed
+  /// with it, and one still out when it is freed, when that one is
+  /// done.
+  pub fn queries_open(&self) -> u32 {
+    self.queries.len()
+  }
+
   /// For a synchronous helper that started the transaction: send and
   /// poll until it has ended, and how it ended. A transaction rolled
   /// back before anything of it went ends with the send, at once; one
   /// whose coordinator does not answer is ended by the reply timeout,
-  /// which is why the wait is that long and a little more. None if it
-  /// is not there, or has not ended even then, which the reply timeout
-  /// and the loss of its link rule out; it can then not be closed.
+  /// which is why the wait is that long and a little more.
+  ///
+  /// The wait is the transaction's own, and starts again when that
+  /// does ([`Transaction::wait_started`]): with each send, as a BLOB
+  /// query's rounds are, and with its coordinator's word that it still
+  /// runs (`PROGRESS_REP`). A helper that counted from its own start
+  /// gave up on a transaction that was alive and well.
+  ///
+  /// None if it is not there, or has not ended even then, which the
+  /// reply timeout and the loss of its link rule out; it can then not
+  /// be closed.
   pub(crate) fn wait_for_end(&mut self, tid: TransId) -> Option<CommitState> {
-    let start = ic_port::time::gethrtime();
+    let mut from = ic_port::time::gethrtime();
     let limit = self.shared.reply_wait_ms as u64 + IC_END_GRACE_MS;
     loop {
       // A send that fails fails its transaction at the poll, as its
@@ -772,9 +798,9 @@ impl ApidConnection {
       if trans.is_done() {
         return Some(trans.commit_state());
       }
-      let waited =
-        ic_port::time::millis_elapsed(start, ic_port::time::gethrtime());
-      if waited >= limit {
+      from = from.max(trans.wait_started());
+      let now = ic_port::time::gethrtime();
+      if ic_port::time::millis_elapsed(from, now) >= limit {
         return None;
       }
       self.poll(IC_END_POLL_MS);
@@ -841,9 +867,11 @@ impl ApidConnection {
   /// Define a write by primary key on a transaction
   /// (`ic_apid_conn_write_key`). The query's key row holds the key and
   /// its attribute row the values; an update leaves the key columns
-  /// out, and a delete sends no values. A delete on a table with a blob
-  /// column is refused, by primary or unique key alike, with
-  /// `IC_ERROR_DELETE_WITH_BLOBS` (chapter 06 §6.2).
+  /// out, and a delete sends no values. A delete from a table with blob
+  /// columns, by primary or unique key, deletes their parts with the
+  /// row, in rounds (chapter 06, phase 12); it is refused with
+  /// `IC_ERROR_DELETE_WITH_BLOBS` only when a blob column cannot be
+  /// used, whose parts it would leave behind.
   pub fn write_key(
     &mut self,
     query_id: QueryId,
@@ -2822,13 +2850,17 @@ mod tests {
     let mut trans = sent_at(AT);
     trans.sent.push(QueryId(PtrId::from_u64(1)));
     assert!(trans.waited_too_long(AT + LIMIT, LIMIT));
-    // Heard from just before the wait ran out: it runs from there.
+    assert_eq!(trans.wait_started(), AT);
+    // Heard from just before the wait ran out: it runs from there, and
+    // so does the wait of a helper that waits for its end.
     trans.heard_at = AT + LIMIT - 1;
+    assert_eq!(trans.wait_started(), AT + LIMIT - 1);
     assert!(!trans.waited_too_long(AT + LIMIT, LIMIT));
     assert!(!trans.waited_too_long(AT + 2 * LIMIT - 2, LIMIT));
     assert!(trans.waited_too_long(AT + 2 * LIMIT - 1, LIMIT));
     // A send after it is the later of the two.
     trans.last_sent = AT + 3 * LIMIT;
+    assert_eq!(trans.wait_started(), AT + 3 * LIMIT);
     assert!(!trans.waited_too_long(AT + 4 * LIMIT - 1, LIMIT));
     assert!(trans.waited_too_long(AT + 4 * LIMIT, LIMIT));
     // Heard from, never sent: still nothing to wait for.

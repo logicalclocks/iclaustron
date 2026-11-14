@@ -219,6 +219,25 @@ impl TableDef {
     &self.blobs
   }
 
+  /// The ids of every field a record may name, in attribute order:
+  /// every column, the blob columns too, but those that cannot be used
+  /// ([`BlobColumn::is_usable`]), which no record may name. With
+  /// [`Record::default_for`](crate::record::Record::default_for) they
+  /// make a record of whole rows, for a program that takes any table.
+  pub fn usable_field_ids(&self) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::with_capacity(self.info.attributes.len());
+    for attr in &self.info.attributes {
+      let usable = match self.blob_column(attr.column_id) {
+        Some(blob) => blob.is_usable(),
+        None => true,
+      };
+      if usable {
+        ids.push(attr.column_id);
+      }
+    }
+    ids
+  }
+
   /// True if one of the table's blob columns has this version of this
   /// table as its parts table.
   fn holds_parts_table(&self, table_id: u32, table_version: u32) -> bool {

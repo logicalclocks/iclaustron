@@ -486,7 +486,7 @@ const IC_NDB_ERRORS: &[ErrorEntry] = &[
   ErrorEntry {
     code: 4266,
     class: ErrorClass::Application,
-    text: "The value is longer than a blob column without parts holds",
+    text: "The value is longer than its blob column holds",
   },
   ErrorEntry {
     code: 4267,

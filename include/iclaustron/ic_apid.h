@@ -440,6 +440,12 @@
 #define IC_ERROR_INTERNAL_PANIC 7129
 
 /*
+ No memory for what was asked for, as a blob buffer of a length
+ given.
+ */
+#define IC_ERROR_MEM_ALLOC 7005
+
+/*
  A null handle or out pointer.
  */
 #define IC_ERROR_NULL_POINTER 7157
@@ -652,8 +658,9 @@
 
 /*
  A delete from a table with a blob column that would leave its parts
- behind: through a unique index, of a scanned row taken over, or by
- a synchronous helper, refused until they delete the parts too.
+ behind: of a scanned row taken over, or from a table with a blob
+ column that cannot be used. By primary or unique key, and by the
+ synchronous helpers, a delete takes the parts with the row.
  */
 #define IC_ERROR_DELETE_WITH_BLOBS 7153
 
@@ -1966,11 +1973,12 @@ int32_t ic_apid_query_set_blob_null(IC_APID_CONNECTION *conn,
  The blob field `field_id` made `len` bytes long, to fill in place:
  `buffer` is set to its bytes, which hold the last value set or read
  as far as it reaches and zeros after, NULL for an empty value, valid
- as `ic_apid_query_blob`'s. The field is no longer NULL. A value
- longer than its column's MySQL type holds fails the query's definition
- with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+ as `ic_apid_query_blob`'s. The field is no longer NULL.
 
- Errors: as `ic_apid_query_set_blob`.
+ Errors: as `ic_apid_query_set_blob`, `IC_NDB_ERROR_BLOB_TOO_LONG`
+ for a `len` longer than its column's MySQL type holds;
+ `IC_ERROR_MEM_ALLOC` when there is no room for `len` bytes. The
+ field is then as it was.
 
  # Safety
 
@@ -2476,7 +2484,9 @@ int32_t ic_blob_values_set_null(IC_BLOB_VALUES *values, uint32_t field_id);
  as `ic_apid_query_blob_buffer` does a query's: `buffer` is set to its
  bytes, NULL for an empty value, valid as `ic_blob_values_get`'s.
 
- Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`.
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_blob_values_get`;
+ `IC_NDB_ERROR_BLOB_TOO_LONG` and `IC_ERROR_MEM_ALLOC` as
+ `ic_apid_query_blob_buffer`.
 
  # Safety
 
@@ -3322,7 +3332,9 @@ uint32_t ic_request_op_error_data(const IC_REQUEST *request, uint32_t op);
 
 /*
  Bytes of row data operation `op`, a read, brought in the last run;
- 0 for a write, or a row that was not there.
+ 0 for a write, or a row that was not there. Of a row with blob values
+ these are its main row's, each value's first bytes among them, and
+ not its parts'.
 
  # Safety
 
@@ -3387,10 +3399,11 @@ int32_t ic_request_set_blob_null(IC_REQUEST *request,
  The blob field `field_id` of operation `op` made `len` bytes long,
  to fill in place, as `ic_apid_query_blob_buffer` does a query's:
  `buffer` is set to its bytes, NULL for an empty value, valid as
- `ic_request_blob`'s. A value longer than its column's MySQL type holds
- fails the operation with `IC_NDB_ERROR_BLOB_TOO_LONG`.
+ `ic_request_blob`'s.
 
- Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`.
+ Errors: `IC_ERROR_NO_SUCH_FIELD` as `ic_request_blob`;
+ `IC_NDB_ERROR_BLOB_TOO_LONG` and `IC_ERROR_MEM_ALLOC` as
+ `ic_apid_query_blob_buffer`.
 
  # Safety
 

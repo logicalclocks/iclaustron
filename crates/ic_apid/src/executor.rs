@@ -465,7 +465,8 @@ impl KeyOp {
   }
 
   /// Bytes of row data a read brought; zero for a write, or a row that
-  /// was not there.
+  /// was not there. Of a row with blob values these are its main row's,
+  /// each value's first bytes among them, and not its parts'.
   pub fn result_len(&self) -> u32 {
     self.result_len
   }
@@ -506,6 +507,20 @@ impl KeyOp {
     position: u32,
   ) -> Result<&mut Vec<u8>, IcError> {
     self.values_mut()?.blob_buf_mut(position)
+  }
+
+  /// The buffer of the blob field at `position` made `len` bytes long,
+  /// to fill in place (`ic_request_blob_buffer`): what it held, as far
+  /// as it reaches, then zeros. Refused with 4266 when `len` is more
+  /// than a write takes, and with `IC_ERROR_MEM_ALLOC` when there is
+  /// no room for it; the field is then as it was
+  /// ([`BlobValues::blob_buf_sized`]).
+  pub fn blob_buf_sized(
+    &mut self,
+    position: u32,
+    len: usize,
+  ) -> Result<&mut [u8], IcError> {
+    self.values_mut()?.blob_buf_sized(position, len)
   }
 
   /// The values of the shape's blob fields, if its attribute record

@@ -486,6 +486,7 @@ fn bench(global: &ApidGlobal, database: &str, table: &str, what: &Run) -> i32 {
       return 1;
     }
   };
+  note_left_out(&def);
   let recs = match Records::for_table(&def) {
     Ok(recs) => recs,
     Err(e) => {
@@ -645,16 +646,14 @@ struct Records {
   /// Every column but the blob columns, which a key record may not
   /// name: the record the tool used for both before blob columns.
   key: Record,
-  /// Every column, the blob columns too.
+  /// Every column, the blob columns too but those that cannot be
+  /// used, which the rows go without.
   attr: Record,
 }
 
 impl Records {
   fn for_table(def: &Arc<TableDef>) -> Result<Records, IcError> {
-    let mut ids: Vec<u32> = Vec::with_capacity(def.info().attributes.len());
-    for attr in &def.info().attributes {
-      ids.push(attr.column_id);
-    }
+    let ids = def.usable_field_ids();
     Ok(Records {
       key: Record::default_for(def, None)?,
       attr: Record::default_for(def, Some(ids.as_slice()))?,
@@ -942,8 +941,17 @@ impl Tally {
   }
 }
 
-/// Every column other than the key must be an integer, bytes, a blob,
-/// or nullable, and the key one integer column.
+/// True for a blob column that can be used. One that cannot is left
+/// out of the rows, and so has to be nullable for a row to be made.
+fn blob_usable(def: &TableDef, column_id: u32) -> bool {
+  match def.blob_column(column_id) {
+    Some(blob) => blob.is_usable(),
+    None => false,
+  }
+}
+
+/// Every column other than the key must be an integer, bytes, a blob
+/// that can be used, or nullable, and the key one integer column.
 fn check_columns(def: &Arc<TableDef>) -> Result<(), String> {
   let mut key_columns: u32 = 0;
   for attr in &def.info().attributes {
@@ -957,7 +965,7 @@ fn check_columns(def: &Arc<TableDef>) -> Result<(), String> {
     if attr.nullable
       || is_integer(attr.type_code)
       || is_bytes(attr)
-      || attr.is_blob()
+      || blob_usable(def, attr.column_id)
     {
       continue;
     }
@@ -1686,6 +1694,21 @@ fn print_reader(
 
 fn describe(what: &str, error: &IcError) -> String {
   format!("{}: {} ({})", what, error.message(), error.code)
+}
+
+/// Say which blob columns the rows go without, and why: one that
+/// cannot be used is left out of the records, and the rest of its
+/// table used as a table without it.
+fn note_left_out(def: &TableDef) {
+  for blob in def.blob_columns() {
+    let name = match def.field(blob.column_id()) {
+      Some(attr) => attr.name.as_str(),
+      None => "?",
+    };
+    if let Some(why) = blob.refusal() {
+      println!("Column {} is left out: {}", name, why.text());
+    }
+  }
 }
 
 fn report(what: &str, error: &IcError) {
