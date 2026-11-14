@@ -2381,12 +2381,14 @@ What the plan asked, as the author answered it the same day:
 4. **A committed read reads the main row committed first**: one round
    when the whole value is inline, which is the common case. A value
    with parts takes three: the main row read again with a shared lock
-   and its lock reference, then the parts, with the unlock or the
-   commit. A flag on the query, `blob_lock_first`, takes the lock in the
-   first round instead: two rounds whatever the value. The committed
-   read first is only for a read that is its transaction's only
-   operation; in a transaction with other rows a committed read always
-   takes the lock first (the author, 2026-11-12, in 12.5).
+   and its lock reference, then the parts, with the commit; in a
+   transaction left open the unlock follows them, in a round of its
+   own that is not waited for. A flag on the query, `blob_lock_first`,
+   takes the lock in the first round instead: two rounds whatever the
+   value. The committed read first is only for a read that is its
+   transaction's only operation; in a transaction with other rows a
+   committed read always takes the lock first (the author, 2026-11-12,
+   in 12.5).
 5. **At most 1 MiB of part data per BLOB query in a round**
    (`GlobalOptions::blob_round_bytes`); a larger value goes on in
    further rounds, the commit with the last.
@@ -2413,8 +2415,8 @@ commits; *n* is the new value's number of parts, *old* the old value's.
 | Update | as a write, the head read with the update's abort option | as a write, +C | | 1–2 | 2 |
 | Delete | head read, exclusive, of every blob column | main delete, every part deleted, +C | | 2 | 2 |
 | Locked read | main read with the lock asked for | parts read, +C | | 1–2 | 2 |
-| Committed read | main read, committed, +C | main read, shared, with its lock reference | parts read; unlock, or +C | 1 or 3 | 1 or 3 |
-| Committed read, `blob_lock_first` | main read, shared, with its lock reference | parts read; unlock, or +C | | 1–2 | 2 |
+| Committed read | main read, committed, +C | main read, shared, with its lock reference | parts read, +C; else the unlock after them | 1 or 3 | 1 or 3 |
+| Committed read, `blob_lock_first` | main read, shared, with its lock reference | parts read, +C; else the unlock after them | | 1–2 | 2 |
 
 - **A part is always written with the write operation** (type 4), an
   insert's parts too, as the reference does (seen 2026-11-12; the
@@ -2449,8 +2451,14 @@ commits; *n* is the new value's number of parts, *old* the old value's.
   reads shared and upgrades with the write, and two writers that both
   hold the shared lock then deadlock.
 - **The unlock** goes only while the transaction stays open, and is not
-  waited for: the query completes with its parts. Once the commit is
-  asked for, the commit unlocks.
+  waited for: the query completes with its parts. It goes in a round
+  of its own, once the last of the parts is back: operations on
+  different rows of one batch run in no set order (item 1), so an
+  unlock sent beside part reads could let the main row go before they
+  run, and one sent with the first of several rounds of parts did let
+  it go before the later ones (12.10). A read that failed with its
+  lock taken lets it go the same way. Once the commit is asked for,
+  the commit unlocks.
 - **An insert that ignores errors** (item 6) may find its row there
   already, and then its parts must not go in: written over that row's
   own parts, they would change a value whose head still gives the old
@@ -2495,11 +2503,24 @@ at the part's offset: no row is allocated for a part.
 - Two BLOB queries on one row (one table, the same key words) in one
   transaction run one after the other, in the order they were defined;
   others run side by side, so many TEXT rows inserted in one
-  transaction still go in one round.
+  transaction still go in one round. A query with no blob value
+  defined while a BLOB query of its transaction is at its row waits
+  its turn too: that query's main row may be yet to go, as a delete's
+  is until its heads are back, and a request packed at once would
+  overtake it. Its sections are built when it is defined, and its
+  request staged when its turn comes; until then it holds the commit
+  as a BLOB query that plans a round does. A query through a unique
+  index, and a takeover of a scanned row, name a row not known by its
+  key: each waits for every query still running on its table, and
+  every later one on the table waits for it (12.10).
 - A missing part fails its query with 4267. A part operation always
   aborts on error, so a failed part write rolls the transaction back. A
   rollback drops the rounds not yet sent, and a node lost fails the
-  transaction as it fails any.
+  transaction as it fails any. A query that fails once its main row's
+  write has gone in rolls the transaction back itself, whatever end
+  was asked for: an operation that ignores errors, and a head the
+  client cannot read, do not end the transaction at the data node, and
+  the row has the new head without its parts (12.10).
 
 ### Dictionary and records
 
@@ -2796,8 +2817,10 @@ first, and a locked one, in two, the second the commit alone:
   transaction back with 626).
 - **The unlock**, operation 7 with the distribution key flag, the lock
   reference's first word as its distribution key word and its other two
-  as its key, goes last in the parts' round, or alone, and is not waited
-  for; none once a commit is asked for, which lets the lock go.
+  as its key, goes alone, once the last of the parts is back, and is
+  not waited for; none once a commit is asked for, which lets the lock
+  go. Until the review of 1.1.0 (12.10) it went last in the first
+  round of parts.
 - **A committed read reads committed first only alone** (the author,
   the same day): its first round is planned when its transaction is
   sent, and read committed only if it is the transaction's only
@@ -3065,6 +3088,76 @@ columns" is written from it. Found on the way:
 
 The tests are the integration group `blob`, beside unit tests of the
 head, the arithmetic, the planner and the commit held.
+
+### 12.10 The review of 1.1.0 (2026-11-13, open)
+
+A review of everything between 1.0.0 and 1.1.0, each finding checked
+against the code. Fifteen held. The first four are fixed on `trunk`
+(2026-11-14); 1.1.0 itself takes no changes.
+
+1. **The unlock went with the first round of parts**, not after the
+   last: in a transaction left open, a value with more part data than
+   `blob_round_bytes` had its later parts read with the main row let
+   go, and a writer between them could give a torn value or a false
+   4267. Beside the parts of its own round it was no safer, since
+   operations on different rows of one batch run in no set order (item
+   1). It now goes alone, once the last of the parts is back, and a
+   read that failed lets its lock go the same way. A read in a
+   transaction left open sends one request more; one that commits is
+   as it was.
+2. **A write that failed after its main row went in could commit.** A
+   write or an update whose old head the client could not read failed
+   its query, but its main row's write, sent beside the head read, had
+   gone in, nothing rolled the transaction back, and the commit it held
+   was let go: the row then had the new head and none of its parts.
+   Such a query now rolls its transaction back before it completes. An
+   operation that fails with its row untouched, as an update of a row
+   not there that ignores errors, leaves the transaction open as
+   before.
+3. **A query with no blob value could overtake a BLOB query on its
+   row.** A delete from a table with blob columns sends its main row's
+   delete in its second round, and only BLOB queries waited for it: a
+   write of the same row defined after it went with its first round,
+   and the delete then took the row. A BLOB query waiting for another
+   was overtaken the same way. Such a query now waits its turn ("The
+   driver").
+4. **A query through a unique index waited for one query, not all.**
+   It waited for the latest BLOB query still running on its table. Two
+   by primary key on different rows run side by side, so one of them
+   could still be writing the row the index led to. It now waits for
+   each.
+
+Tests: integration tests in the `blob` group for the first, the third
+and the fourth, each failing on 1.1.0: a row locked until a read's last
+part is back, with the unlock's round counted; a row deleted and
+written again, and one inserted and updated twice, in one transaction;
+and an update through a unique index behind two by primary key. The
+second needs a stored head the client cannot read, which nothing here
+can write: a unit test of the run's decision stands in for it.
+
+Still open, in the order found:
+
+5. A BLOB read that succeeded reports a result length of 0, which the
+   header documents as a row that was not there.
+6. Freeing a completed BLOB read is refused with
+   `IC_ERROR_TRANSACTION_ACTIVE` while its unlock is still out.
+7. A stored length is not bounded before the value's buffer is sized
+   to it: a head with a wild length makes the read allocate that much.
+8. `wait_for_end` gives up after the reply timeout and a second from
+   its start, though `PROGRESS_REP` may since have started the
+   transaction's own wait again.
+9. The C functions that size a blob buffer take any length, two of
+   them outside the panic guard.
+10. Three texts describe 1.0: the header's on
+    `IC_ERROR_DELETE_WITH_BLOBS`, `write_key`'s, and 4266's.
+11. `ic_bench`, `ic_trans` and `ic_read` name every column, and so
+    refuse a table with a blob column that cannot be used.
+12. A transaction's bookkeeping of its BLOB queries is quadratic in
+    their number.
+13. Each part operation's slot builds and copies a record it never
+    uses.
+14. `walk_packed` is a second parser of the packed row.
+15. Every send looks each query up three times more than it needs to.
 
 ### Not in this phase
 

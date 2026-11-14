@@ -359,8 +359,10 @@ rounds of its own:
   parts, and the row is unlocked, three rounds. With
   `query.set_blob_lock_first(true)`, and always in a transaction with
   other rows, the first read takes the lock and its lock reference, two
-  rounds whatever the value. A simple read goes so too. Once a commit
-  is asked for, the commit lets the lock go and no unlock is sent. A
+  rounds whatever the value. A simple read goes so too. The unlock
+  goes alone, once the last of the parts is back, and is not waited
+  for: the read completes with its parts. Once a commit is asked for,
+  the commit lets the lock go and no unlock is sent. A
   committed read alone holds the commit back from its first round: an
   inline value then commits at the client at no cost, and a value with
   parts is read again with the locking reads, which begin a new
@@ -373,7 +375,12 @@ read brings are the query's, `blob(position)`, once it completes. An
 update or a delete of a row not there fails in its first round, and
 sends nothing more.
 Two BLOB queries on one row in one transaction run one after the
-other, in the order they were defined. The query itself goes on no
+other, in the order they were defined, and a query with no blob value
+defined while a BLOB query is at its row waits its turn behind it,
+holding the commit meanwhile; one through a unique index, or taking
+over a scanned row, waits for every BLOB query still running on its
+table. A BLOB query that fails once its main row's write has gone in
+rolls its transaction back. The query itself goes on no
 wire: its run's operations carry it, and it completes once, when its
 last round is done. Each round after the first is sent by the poll that
 saw the one before it done, with whatever else is defined on the

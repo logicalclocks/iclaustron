@@ -38,9 +38,19 @@
 //!   plan a round after the one they have out, and a commit asked for
 //!   goes only on the last round of the last of them (chapter 06, item
 //!   3), or alone once none plans one.
-//! - **Two BLOB queries on one row** (one table, the same key words) in
-//!   one transaction run one after the other, in the order they were
-//!   defined; the second's first round waits for the first's end.
+//! - **The unlock goes alone**, once the last of the parts is back, and
+//!   is not waited for: operations on different rows of one batch run
+//!   in no set order (chapter 06, item 1), so an unlock sent beside the
+//!   parts could let the main row go before they are read. A read that
+//!   failed lets its lock go the same way.
+//! - **Queries on one row** (one table, the same key words) in one
+//!   transaction run one after the other, in the order they were
+//!   defined: a BLOB query's first round waits for the end of the one
+//!   before it on its row, and a query with no blob value defined while
+//!   a BLOB query is at its row waits its turn too, its request built
+//!   at once and sent when its turn comes (`BlobRun::plain`). A query
+//!   through a unique index, and a takeover of a scanned row, whose row
+//!   is not known by its key, wait for every one on the table.
 //! - **A part is written with the write operation**, aborting on error,
 //!   so that a part that fails rolls the transaction back. Its key is
 //!   the main row's key words and the part number; its columns the main
@@ -60,9 +70,10 @@
 //!   by that key. A read through an index always locks, and holds its
 //!   lock to the commit. A query whose values have no parts goes
 //!   through the index alone, in one round.
-//! - **A failure ends the run**: the query completes with it, and a
-//!   round that could not be defined rolls the transaction back, so
-//!   that a value is never committed without its parts.
+//! - **A failure ends the run**: the query completes with it. A round
+//!   that could not be defined rolls the transaction back, and so does
+//!   a failure once the main row's write has gone in, so that a value
+//!   is never committed without its parts.
 
 use std::sync::Arc;
 
@@ -74,9 +85,11 @@ use ic_signals::key_ops;
 use ic_signals::key_ops::KeyOpFlags;
 use ic_signals::key_ops::KeyOpReq;
 use ic_signals::numbers;
+use ic_util::ptr_array::PtrArray;
 
 use crate::apid_conn::ApidConnection;
 use crate::apid_conn::CoordRecord;
+use crate::apid_conn::Staged;
 use crate::blob;
 use crate::blob::BlobSizes;
 use crate::blob::BlobValues;
@@ -99,6 +112,13 @@ use crate::row_codec;
 use crate::row_codec::push_padded;
 use crate::row_codec::IC_COL_LOCK_REF;
 use crate::row_codec::IC_LOCK_REF_WORDS;
+use crate::scan::TakeoverKey;
+use crate::transaction::build_attr_section;
+use crate::transaction::build_sections;
+use crate::transaction::request_names;
+use crate::transaction::sections_fit;
+use crate::transaction::OwnRequest;
+use crate::transaction::Transaction;
 
 /// Columns a parts table has after the main key's: the part number,
 /// the part key id and the part's bytes, in that order.
@@ -175,9 +195,18 @@ struct OpReq<'a> {
 pub(crate) struct BlobRun {
   /// True from the query's definition until it completes.
   active: bool,
-  /// An earlier BLOB query on the same row, in the same transaction,
-  /// whose end the first round waits for.
-  after: Option<QueryId>,
+  /// The earlier queries of the transaction still running on the same
+  /// row, whose end the first round waits for: the latest of them, or
+  /// every one on the table when the row is not known by its key.
+  after: Vec<QueryId>,
+  /// A query with no blob value, defined while a BLOB query of its
+  /// transaction was at its row: it has no rounds, only its turn to
+  /// wait for, and then goes as it would have at first, its request
+  /// made of `main_key` and `main_attr`, built when it was defined.
+  plain: bool,
+  /// Such a query that takes over a scanned row: the scan information
+  /// word and the row's fragment its request carries.
+  takeover: Option<(u32, u32)>,
   /// True once the first round has been defined.
   started: bool,
   /// A committed read whose first round waits for its transaction's
@@ -204,6 +233,10 @@ pub(crate) struct BlobRun {
   /// but for a delete that reads heads, whose main row goes once they
   /// have come.
   main_due: bool,
+  /// The main row's write has gone in: a failure after it rolls the
+  /// transaction back, so that the row is not committed with a head
+  /// its parts do not match.
+  main_written: bool,
   /// What failed an operation, and what its refusal said beyond its
   /// code.
   error: Option<(IcError, u32)>,
@@ -211,8 +244,9 @@ pub(crate) struct BlobRun {
   main_locks: bool,
   /// The lock reference a read brought, which an unlock names.
   lock_ref: Option<[u32; IC_LOCK_REF_WORDS]>,
-  /// The next round lets the main row's lock go, as a read that locked
-  /// it does once its parts are read, while no commit is asked for.
+  /// The main row's lock is to be let go, as a read that locked it
+  /// does once its parts are read, while no commit is asked for: by an
+  /// unlock in a round of its own, after the last of the parts.
   unlock_due: bool,
   /// The main row's operation: its flags, and its column section.
   main_flags: KeyOpFlags,
@@ -274,7 +308,9 @@ impl BlobRun {
     }
     BlobRun {
       active: false,
-      after: None,
+      after: Vec::new(),
+      plain: false,
+      takeover: None,
       started: false,
       undecided: false,
       kind: RunKind::Insert,
@@ -285,6 +321,7 @@ impl BlobRun {
       holds_commit: false,
       heads_due: false,
       main_due: false,
+      main_written: false,
       error: None,
       main_locks: false,
       lock_ref: None,
@@ -348,6 +385,9 @@ impl BlobRun {
       _ => return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED)),
     };
     self.probe = query.blob_probe();
+    self.plain = false;
+    self.takeover = None;
+    self.main_written = false;
     self.values.clear();
     self.targets.clear();
     if self.kind == RunKind::Delete {
@@ -498,7 +538,7 @@ impl BlobRun {
     let waits = self.kind == RunKind::Delete || !self.key_known;
     self.main_due = !(waits && self.heads_due);
     self.error = None;
-    self.after = None;
+    self.after.clear();
     self.started = false;
     self.undecided = self.kind == RunKind::CommittedRead && has_parts;
     self.last = blob::plan_first_round(
@@ -508,6 +548,118 @@ impl BlobRun {
       &mut self.plan,
     );
     Ok(())
+  }
+
+  /// Ready the run for a query with no blob value that waits its turn
+  /// behind a BLOB query on its row (`plain`): its request's sections
+  /// built now, from its rows as they are, refusing what its definition
+  /// would, since the program may fill the rows anew before its turn
+  /// comes. A takeover's key is the scanned row's, as the scan gave it.
+  fn prepare_plain(
+    &mut self,
+    query: &ApidQuery,
+    flags: &KeyOpFlags,
+    is_read: bool,
+    takeover: Option<&TakeoverKey>,
+  ) -> Result<(), IcError> {
+    self.plain = true;
+    self.takeover = None;
+    self.probe = false;
+    self.values.clear();
+    self.targets.clear();
+    self.plan.clear();
+    self.index = query.index().cloned();
+    self.key_known = true;
+    self.pk_info.clear();
+    match takeover {
+      Some(over) => {
+        self.main_key.clear();
+        self.main_key.extend_from_slice(&over.key);
+        build_attr_section(query, flags, is_read, &mut self.main_attr)?;
+        sections_fit(&self.main_key, &self.main_attr)?;
+        self.takeover = Some((over.info, over.fragment));
+      }
+      None => build_sections(
+        query,
+        flags,
+        is_read,
+        &mut self.main_key,
+        &mut self.main_attr,
+      )?,
+    }
+    self.main_locks = false;
+    self.lock_ref = None;
+    self.unlock_due = false;
+    self.heads_due = false;
+    self.main_due = false;
+    self.main_written = false;
+    self.error = None;
+    self.after.clear();
+    self.started = false;
+    self.undecided = false;
+    self.last = true;
+    Ok(())
+  }
+
+  /// An operation of a write, an update or a delete has completed, the
+  /// one `role` names, with what it read or how it failed.
+  fn write_done(
+    &mut self,
+    role: OpRole,
+    row: &[u32],
+    error: Option<IcError>,
+    error_data: u32,
+  ) {
+    self.ops_out = self.ops_out.saturating_sub(1);
+    let missing =
+      matches!(error, Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32);
+    match (role, error) {
+      (OpRole::Main, None) => self.main_written = true,
+      (OpRole::Heads, None) => {
+        // A delete's main row goes in the next round, with the parts
+        // its heads have told of, and so does an update's through an
+        // index, by the primary key they brought.
+        if self.kind == RunKind::Delete || !self.key_known {
+          self.main_due = true;
+        }
+        self.take_heads(row);
+      }
+      // A write finds no row: it inserts one, with no old parts to
+      // delete; asked to, it probes for parts an insert racing it may
+      // have left.
+      (OpRole::Heads, Some(_)) if missing && self.kind == RunKind::Write => {
+        if self.probe {
+          for value in &mut self.values {
+            value.no_row();
+          }
+        }
+      }
+      (OpRole::Part(part), None) if part.kind == PartOpKind::Probe => {
+        self.values[part.value].probe_found(part.part);
+      }
+      // A probed part not there: the probing is over.
+      (OpRole::Part(part), Some(_))
+        if part.kind == PartOpKind::Probe && missing => {}
+      (_, Some(e)) => self.fail(e, error_data),
+      _ => {}
+    }
+  }
+
+  /// True when the run's failure is to roll its transaction back: the
+  /// main row's write has gone in, so that the row has the new value's
+  /// head, and its parts are not all there, or the old value's still
+  /// are. An operation that aborts on error has rolled the transaction
+  /// back at the data node already; one that ignores errors has not,
+  /// nor has what the client itself found wrong in what it read.
+  fn rolls_back(&self) -> bool {
+    self.error.is_some() && self.main_written
+  }
+
+  /// True when the row the run is for is not known by its key: through
+  /// a unique index, or a scanned row taken over. Such a query keeps
+  /// its order with every other on its table.
+  fn any_row(&self) -> bool {
+    self.index.is_some() || self.takeover.is_some()
   }
 
   /// Have the main row's next read take the shared lock and its lock
@@ -656,11 +808,37 @@ impl ApidConnection {
     prepared
   }
 
+  /// Ready the run of a query with no blob value that waits its turn
+  /// behind a BLOB query on its row, before the query is defined
+  /// ([`start_blob_run`](Self::start_blob_run) then finds whom it
+  /// waits for).
+  pub(crate) fn prepare_plain_run(
+    &mut self,
+    qid: QueryId,
+    flags: &KeyOpFlags,
+    is_read: bool,
+    takeover: Option<&TakeoverKey>,
+  ) -> Result<(), IcError> {
+    let query = match self.queries.get_mut(qid.0) {
+      Some(query) => query,
+      None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    };
+    let mut run = match query.run.take() {
+      Some(run) => run,
+      None => Box::new(BlobRun::new(query.table())),
+    };
+    let prepared = run.prepare_plain(query, flags, is_read, takeover);
+    query.run = Some(run);
+    prepared
+  }
+
   /// Start a BLOB query's run once the query has been defined on `tid`:
-  /// its first round defined, or, behind an earlier BLOB query on the
-  /// same row, left until that one ends; the transaction's commit held
-  /// if a round follows. On a failure the round's operations are taken
-  /// back; the query is the caller's to take back.
+  /// its first round defined, or, behind earlier queries on the same
+  /// row, left until they end; the transaction's commit held if a
+  /// round follows. A query with no blob value that waits its turn has
+  /// no round: it holds the commit until its turn comes. On a failure
+  /// the round's operations are taken back; the query is the caller's
+  /// to take back.
   pub(crate) fn start_blob_run(
     &mut self,
     qid: QueryId,
@@ -670,17 +848,17 @@ impl ApidConnection {
       Some(taken) => taken,
       None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
     };
-    let after = self.blob_predecessor(tid, &run);
+    self.blob_predecessors(tid, &mut run);
     run.active = true;
-    run.after = after;
+    let waits = !run.after.is_empty();
     let mut defined: Result<(), IcError> = Ok(());
-    if after.is_none() && !run.undecided {
+    if !waits && !run.undecided && !run.plain {
       defined = self.define_round(qid, tid, &mut run, values.as_ref());
     }
     let mut hold = false;
     match defined {
       Ok(()) => {
-        hold = after.is_some() || !run.last;
+        hold = waits || !run.last || run.plain;
         run.holds_commit = hold;
       }
       Err(_) => {
@@ -688,9 +866,13 @@ impl ApidConnection {
           self.undefine(*op, tid);
         }
         run.active = false;
-        run.after = None;
+        run.after.clear();
         run.ops_out = 0;
       }
+    }
+    // One with no one to wait for after all goes with the next poll.
+    if run.plain && !waits && defined.is_ok() {
+      self.blob_due.push(qid);
     }
     self.put_run(qid, run, values);
     if let Some(trans) = self.transactions.get_mut(tid.0) {
@@ -718,7 +900,7 @@ impl ApidConnection {
     for qid in runs {
       let waiting = match self.queries.get(qid.0) {
         Some(query) => match &query.run {
-          Some(run) => run.active && run.undecided && run.after.is_none(),
+          Some(run) => run.active && run.undecided && run.after.is_empty(),
           None => false,
         },
         None => false,
@@ -765,11 +947,20 @@ impl ApidConnection {
     }
   }
 
-  /// The latest BLOB query of `tid` still running on the row `run` is
-  /// for: one table, the same key words.
-  fn blob_predecessor(&self, tid: TransId, run: &BlobRun) -> Option<QueryId> {
-    let trans = self.transactions.get(tid.0)?;
-    let mut found: Option<QueryId> = None;
+  /// Whom `run` waits for, into its `after`: the queries of `tid` still
+  /// running on the row it is for, one table and the same key words.
+  /// The latest of them is enough, since it waited for those before it;
+  /// but a run whose row is not known by its key
+  /// ([`any_row`](BlobRun::any_row)) keeps its order with every query
+  /// on its table, and those run beside each other: it waits for each.
+  fn blob_predecessors(&self, tid: TransId, run: &mut BlobRun) {
+    run.after.clear();
+    let trans = match self.transactions.get(tid.0) {
+      Some(trans) => trans,
+      None => return,
+    };
+    let any_row = run.any_row();
+    let mut latest: Option<QueryId> = None;
     for other in trans.blob_runs() {
       let earlier = match self.queries.get(other.0) {
         Some(query) => match &query.run {
@@ -778,18 +969,20 @@ impl ApidConnection {
         },
         None => continue,
       };
-      // Through a unique index the row is not known by its primary key
-      // until the first round is back: such a query keeps its order
-      // with every other on the table.
-      let unique = earlier.index.is_some() || run.index.is_some();
-      let same_row = earlier.active
-        && earlier.main_table.table_id() == run.main_table.table_id()
-        && (unique || earlier.main_key == run.main_key);
-      if same_row {
-        found = Some(*other);
+      if !earlier.active
+        || earlier.main_table.table_id() != run.main_table.table_id()
+      {
+        continue;
+      }
+      if any_row {
+        run.after.push(*other);
+      } else if earlier.any_row() || earlier.main_key == run.main_key {
+        latest = Some(*other);
       }
     }
-    found
+    if let Some(latest) = latest {
+      run.after.push(latest);
+    }
   }
 
   /// The query's run and blob values, taken out while a round is
@@ -1005,9 +1198,10 @@ impl ApidConnection {
       run.round_ops.push((slot, OpRole::Part(op)));
       run.ops_out += 1;
     }
-    // The unlock, last, named by the lock reference: its first word the
-    // distribution key, its other two the key. Not waited for.
-    if run.unlock_due {
+    // The unlock, in a round of its own once the parts are back, named
+    // by the lock reference: its first word the distribution key, its
+    // other two the key. Not waited for.
+    if run.unlock_due && run.round_ops.is_empty() {
       run.unlock_due = false;
       if let Some(lock) = run.lock_ref {
         let slot = self.main_slot(run)?;
@@ -1227,38 +1421,7 @@ impl ApidConnection {
       },
       None => return,
     };
-    run.ops_out = run.ops_out.saturating_sub(1);
-    let missing =
-      matches!(error, Some(e) if e.code == IC_NDB_ERROR_NO_SUCH_ROW as i32);
-    match (role, error) {
-      (OpRole::Heads, None) => {
-        // A delete's main row goes in the next round, with the parts
-        // its heads have told of, and so does an update's through an
-        // index, by the primary key they brought.
-        if run.kind == RunKind::Delete || !run.key_known {
-          run.main_due = true;
-        }
-        run.take_heads(row);
-      }
-      // A write finds no row: it inserts one, with no old parts to
-      // delete; asked to, it probes for parts an insert racing it may
-      // have left.
-      (OpRole::Heads, Some(_)) if missing && run.kind == RunKind::Write => {
-        if run.probe {
-          for value in &mut run.values {
-            value.no_row();
-          }
-        }
-      }
-      (OpRole::Part(part), None) if part.kind == PartOpKind::Probe => {
-        run.values[part.value].probe_found(part.part);
-      }
-      // A probed part not there: the probing is over.
-      (OpRole::Part(part), Some(_))
-        if part.kind == PartOpKind::Probe && missing => {}
-      (_, Some(e)) => run.fail(e, error_data),
-      _ => {}
-    }
+    run.write_done(role, row, error, error_data);
   }
 
   /// A read of the main row has completed: its fields into the query's
@@ -1375,12 +1538,14 @@ impl ApidConnection {
   }
 
   /// Once a round is done: complete the query if it was the last, or if
-  /// an operation failed; otherwise leave the next round to the poll.
+  /// an operation failed; otherwise leave the next round to the poll,
+  /// as for a read that failed with its lock still to be let go.
   fn blob_round_check(&mut self, qid: QueryId) {
     let (done, finish) = match self.queries.get(qid.0) {
       Some(query) => match &query.run {
-        Some(run) if run.active && run.started && run.after.is_none() => {
-          (run.ops_out == 0, run.last || run.error.is_some())
+        Some(run) if run.active && run.started && run.after.is_empty() => {
+          let failed = run.error.is_some() && !run.unlock_due;
+          (run.ops_out == 0, run.last || failed)
         }
         _ => return,
       },
@@ -1397,18 +1562,28 @@ impl ApidConnection {
   }
 
   /// Complete a BLOB query whose rounds are over: with what failed an
-  /// operation of it, or done.
+  /// operation of it, or done. One that failed after its main row's
+  /// write went in rolls its transaction back first
+  /// ([`rolls_back`](BlobRun::rolls_back)), whatever end was asked for.
   fn complete_blob_query(&mut self, qid: QueryId) {
+    let mut roll_back: Option<TransId> = None;
     if let Some(query) = self.queries.get_mut(qid.0) {
       let mut error: Option<(IcError, u32)> = None;
       if let Some(run) = &query.run {
         error = run.error;
+        if run.rolls_back() {
+          roll_back = query.execution.trans;
+        }
       }
       query.set_result_len(0);
       match error {
         Some((e, data)) => query.refuse(e, data),
         None => query.set_state(QueryState::Completed),
       }
+    }
+    if let Some(tid) = roll_back {
+      self.force_rollback(tid);
+      self.send_due = true;
     }
     self.finish_query(qid);
   }
@@ -1424,7 +1599,7 @@ impl ApidConnection {
         match query.run.as_mut() {
           Some(run) if run.active => {
             run.active = false;
-            run.after = None;
+            run.after.clear();
             run.ops_out = 0;
             let held = run.holds_commit;
             run.holds_commit = false;
@@ -1449,8 +1624,10 @@ impl ApidConnection {
     for other in waiting {
       if let Some(query) = self.queries.get_mut(other.0) {
         if let Some(run) = query.run.as_mut() {
-          if run.after == Some(qid) {
-            run.after = None;
+          // The last it waited for: its turn has come.
+          let waited = run.after.len();
+          run.after.retain(|earlier| *earlier != qid);
+          if waited > 0 && run.after.is_empty() {
             self.blob_due.push(other);
           }
         }
@@ -1503,20 +1680,21 @@ impl ApidConnection {
   }
 
   /// The next round of a query whose round is done and was not its
-  /// last, or the first of one that waited for another on its row.
+  /// last, or the first of one that waited for another on its row; a
+  /// query with no blob value that waited its turn goes.
   fn next_blob_round(&mut self, qid: QueryId) {
-    let tid = match self.queries.get(qid.0) {
+    let (tid, plain) = match self.queries.get(qid.0) {
       Some(query) => {
         let state = query.state();
         let defined = state == QueryState::Defined || state == QueryState::Sent;
         match (&query.run, query.execution.trans) {
           (Some(run), Some(tid))
             if run.active
-              && run.after.is_none()
+              && run.after.is_empty()
               && run.ops_out == 0
               && defined =>
           {
-            tid
+            (tid, run.plain)
           }
           _ => return,
         }
@@ -1550,6 +1728,10 @@ impl ApidConnection {
       }
       return;
     }
+    if plain {
+      self.release_plain(qid, tid);
+      return;
+    }
     let (mut run, values) = match self.take_run(qid) {
       Some(taken) => taken,
       None => return,
@@ -1564,7 +1746,13 @@ impl ApidConnection {
     }
     let mut alone = false;
     if later {
-      if run.kind.is_read() && run.main_due {
+      if run.error.is_some() {
+        // A read that failed reads no more: only its lock is left, to
+        // be let go.
+        run.plan.clear();
+        run.main_due = false;
+        run.last = true;
+      } else if run.kind.is_read() && run.main_due {
         // A committed read's row read again, locked: its parts wait for
         // the lengths that read brings, and its commit with them.
         run.plan.clear();
@@ -1587,6 +1775,10 @@ impl ApidConnection {
         }
         // The unlock alone, not waited for: the query is done.
         alone = true;
+      } else if run.unlock_due {
+        // The unlock goes once this round is back, in one of its own:
+        // sent beside the parts, it could run before their reads.
+        run.last = false;
       }
     }
     let defined = self.define_round(qid, tid, &mut run, values.as_ref());
@@ -1632,6 +1824,76 @@ impl ApidConnection {
     }
   }
 
+  /// The turn of a query with no blob value has come (`BlobRun::plain`):
+  /// its request is staged from the sections kept for it, and the query
+  /// is last among its transaction's defined ones, as its request is
+  /// the last staged, to go with the next send as it would have at
+  /// first. Its run ends here, which lets a query behind it on the row
+  /// start, after it, and lets a commit held for it go with it. A
+  /// request that cannot be staged fails the query and rolls the
+  /// transaction back, which may not commit without it.
+  fn release_plain(&mut self, qid: QueryId, tid: TransId) {
+    let (run, values) = match self.take_run(qid) {
+      Some(taken) => taken,
+      None => return,
+    };
+    let staged = self.stage_plain(qid, tid, &run);
+    self.put_run(qid, run, values);
+    match staged {
+      Ok(staged) => {
+        if let Some(query) = self.queries.get_mut(qid.0) {
+          query.execution.staged = staged;
+          query.execution.shell = false;
+          query.set_state(QueryState::Defined);
+        }
+        if let Some(trans) = self.transactions.get_mut(tid.0) {
+          trans.define_last(qid);
+        }
+        self.end_blob_run(qid);
+        self.queue_for_send(tid);
+        self.send_due = true;
+      }
+      Err(e) => {
+        self.force_rollback(tid);
+        if let Some(query) = self.queries.get_mut(qid.0) {
+          query.fail(e);
+        }
+        self.finish_query(qid);
+        self.send_due = true;
+      }
+    }
+  }
+
+  /// Stage the request of a query that waited its turn, from the
+  /// sections its run kept.
+  fn stage_plain(
+    &mut self,
+    qid: QueryId,
+    tid: TransId,
+    run: &BlobRun,
+  ) -> Result<Staged, IcError> {
+    let (coord, trans_id) = match self.transactions.get(tid.0) {
+      Some(trans) => (trans.coord, trans.id()),
+      None => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
+    };
+    let request = match self.queries.get(qid.0) {
+      Some(query) => {
+        let (signal, table_id, table_version) = request_names(query);
+        OwnRequest {
+          signal,
+          table_id,
+          table_version,
+          coord,
+          trans_id,
+          flags: query.execution.flags,
+          takeover: run.takeover,
+        }
+      }
+      None => return Err(IcError::new(err::IC_ERROR_NO_SUCH_FIELD)),
+    };
+    self.stage_own(qid, &request, &run.main_key, &run.main_attr)
+  }
+
   /// Free a query's operations with it. Refused while one is defined
   /// or out (`IC_ERROR_TRANSACTION_ACTIVE`).
   pub(crate) fn free_blob_ops(&mut self, qid: QueryId) -> Result<(), IcError> {
@@ -1652,6 +1914,52 @@ impl ApidConnection {
     }
     Ok(())
   }
+}
+
+/// True if `query`, one with no blob value about to be defined on
+/// `tid`, has to wait its turn: a BLOB query of the transaction is still
+/// running on the row it names, or on its table when `any_row` says its
+/// row is not known by its key, as through a unique index and for a
+/// scanned row taken over. Only asked for a transaction with such
+/// queries running and a table with blob columns. The query's key words
+/// are built in `key` if a run has to be told from it by its row.
+pub(crate) fn row_taken(
+  transactions: &PtrArray<Transaction>,
+  queries: &PtrArray<ApidQuery>,
+  tid: TransId,
+  query: &ApidQuery,
+  any_row: bool,
+  key: &mut Vec<u32>,
+) -> Result<bool, IcError> {
+  let trans = match transactions.get(tid.0) {
+    Some(trans) => trans,
+    None => return Ok(false),
+  };
+  let table_id = query.table().table_id();
+  let mut keyed = false;
+  for other in trans.blob_runs() {
+    let earlier = match queries.get(other.0) {
+      Some(holder) => match &holder.run {
+        Some(earlier) => earlier,
+        None => continue,
+      },
+      None => continue,
+    };
+    if !earlier.active || earlier.main_table.table_id() != table_id {
+      continue;
+    }
+    if any_row || earlier.any_row() {
+      return Ok(true);
+    }
+    if !keyed {
+      row_codec::key_info_into(query.key_record(), query.key_row(), key)?;
+      keyed = true;
+    }
+    if earlier.main_key == *key {
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 /// The buffers a round's requests are built in, the connection's own,
@@ -1722,5 +2030,52 @@ fn copy_part(
       Ok(())
     }
     None => Err(failed(IcError::new(blob::IC_NDB_ERROR_BLOB_DAMAGED))),
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_write_that_fails_once_its_main_row_went_in_rolls_back() {
+    let t = crate::program::test_table();
+    let missing = IcError::new(IC_NDB_ERROR_NO_SUCH_ROW as i32);
+    // A write whose main row goes in beside a read of the old heads
+    // that brings nothing the client can read: the row has the new
+    // head and none of its parts.
+    let mut run = BlobRun::new(&t);
+    run.kind = RunKind::Write;
+    run.ops_out = 2;
+    run.write_done(OpRole::Main, &[], None, 0);
+    assert!(!run.rolls_back(), "nothing has failed yet");
+    run.write_done(OpRole::Heads, &[], None, 0);
+    assert_eq!(run.ops_out, 0);
+    let failed = run.error.map(|(e, _)| e.code);
+    assert_eq!(failed, Some(err::IC_ERROR_INCONSISTENT_DATA));
+    assert!(run.rolls_back());
+    // The same failure before the main row went, as for a delete, whose
+    // main row waits for the heads: there is nothing to take back.
+    let mut run = BlobRun::new(&t);
+    run.kind = RunKind::Delete;
+    run.write_done(OpRole::Heads, &[], None, 0);
+    assert!(run.error.is_some());
+    assert!(!run.rolls_back());
+    // An update of a row not there, ignoring errors: both operations
+    // fail, nothing went in, and the transaction goes on.
+    let mut run = BlobRun::new(&t);
+    run.kind = RunKind::Update;
+    run.write_done(OpRole::Heads, &[], Some(missing), 0);
+    run.write_done(OpRole::Main, &[], Some(missing), 0);
+    let failed = run.error.map(|(e, _)| e.code);
+    assert_eq!(failed, Some(IC_NDB_ERROR_NO_SUCH_ROW as i32));
+    assert!(!run.rolls_back());
+    // A write that finds no row inserts one: no failure at all.
+    let mut run = BlobRun::new(&t);
+    run.kind = RunKind::Write;
+    run.write_done(OpRole::Heads, &[], Some(missing), 0);
+    run.write_done(OpRole::Main, &[], None, 0);
+    assert!(run.error.is_none());
+    assert!(!run.rolls_back());
   }
 }

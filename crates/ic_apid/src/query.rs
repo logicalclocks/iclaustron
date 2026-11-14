@@ -753,11 +753,11 @@ impl ApidQuery {
   /// Have a committed read take the shared lock and its lock reference
   /// in its first round, for the executions defined from now on
   /// (`ic_apid_query_set_blob_lock_first`; chapter 06, phase 12, item
-  /// 4): two rounds, the parts read and the row unlocked in the second,
-  /// whatever the value. Without it a committed read reads the row
-  /// committed first, all of it for an inline value, and takes three
-  /// rounds for a value with parts. Refused while the query is defined
-  /// or sent (`IC_ERROR_TRANSACTION_ACTIVE`).
+  /// 4): two rounds, the parts read in the second and the row unlocked
+  /// after them, whatever the value. Without it a committed read reads
+  /// the row committed first, all of it for an inline value, and takes
+  /// three rounds for a value with parts. Refused while the query is
+  /// defined or sent (`IC_ERROR_TRANSACTION_ACTIVE`).
   pub fn set_blob_lock_first(
     &mut self,
     lock_first: bool,

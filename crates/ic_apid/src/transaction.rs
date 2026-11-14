@@ -109,6 +109,7 @@ use crate::apid_conn::CoordRecord;
 use crate::apid_conn::Staged;
 use crate::apid_global::LinkStatus;
 use crate::blob::BlobColumn;
+use crate::blob_run;
 use crate::dict_cache::IndexDef;
 use crate::dict_cache::TableDef;
 use crate::hash;
@@ -353,6 +354,15 @@ impl Transaction {
     self.blob_runs.retain(|other| *other != qid);
   }
 
+  /// A query that waited its turn behind a BLOB query on its row goes
+  /// now: off the lists, and last among the defined, where its request,
+  /// the last staged, belongs, since a batch's flags go by this order.
+  pub(crate) fn define_last(&mut self, qid: QueryId) {
+    self.sent.retain(|other| *other != qid);
+    self.defined.retain(|other| *other != qid);
+    self.defined.push(qid);
+  }
+
   /// True once a rollback has been asked for, or has happened: a scan
   /// closed on it waits no more for its takeovers (chapter 04, "Scans").
   pub(crate) fn rolls_back(&self) -> bool {
@@ -373,6 +383,39 @@ impl Transaction {
     waiting
       && self.last_sent != 0
       && now.saturating_sub(self.last_sent.max(self.heard_at)) >= limit
+  }
+}
+
+/// A query's own request, as it is staged: the signal it goes as and
+/// the table or index it names ([`request_names`]), its coordinator and
+/// its transaction's id, its flags but for its place in the batch, and
+/// for a takeover of a scanned row the scan information word and the
+/// row's fragment.
+pub(crate) struct OwnRequest {
+  pub signal: u16,
+  pub table_id: u32,
+  pub table_version: u32,
+  pub coord: CoordRecord,
+  pub trans_id: u64,
+  pub flags: KeyOpFlags,
+  pub takeover: Option<(u32, u32)>,
+}
+
+/// The signal a query's own request goes as, and the id and version it
+/// names: its table's, or through a unique index the index's own, as a
+/// `UNIQUE_OP_REQ`, by which the coordinator looks the row up.
+pub(crate) fn request_names(query: &ApidQuery) -> (u16, u32, u32) {
+  match query.index() {
+    Some(index) => (
+      numbers::IC_SIG_UNIQUE_OP_REQ,
+      index.index_id(),
+      index.index_version(),
+    ),
+    None => (
+      numbers::IC_SIG_KEY_OP_REQ,
+      query.table().table_id(),
+      query.table().table_version(),
+    ),
   }
 }
 
@@ -853,8 +896,10 @@ impl ApidConnection {
     takeover: Option<&TakeoverKey>,
   ) -> Result<(), IcError> {
     let mut flags = flags;
-    let (id, coord) = match self.transactions.get(trans_id.0) {
-      Some(trans) if trans.is_open() => (trans.trans_id, trans.coord),
+    let (id, coord, has_runs) = match self.transactions.get(trans_id.0) {
+      Some(trans) if trans.is_open() => {
+        (trans.trans_id, trans.coord, !trans.blob_runs.is_empty())
+      }
       _ => return Err(IcError::new(err::IC_ERROR_TRANSACTION_ACTIVE)),
     };
     // The field alone is borrowed, so that the scratch buffers can be
@@ -926,34 +971,54 @@ impl ApidConnection {
       }
       flags.interpreted = true;
     }
-    // A unique query names the index's own table and goes as a
-    // UNIQUE_OP_REQ; the coordinator looks the row up through the index.
-    let (signal, table_id, table_version) = match query.index() {
-      Some(index) => {
-        through_index_allows(index, &flags, query.attr_record())?;
-        (
-          numbers::IC_SIG_UNIQUE_OP_REQ,
-          index.index_id(),
-          index.index_version(),
-        )
+    if let Some(index) = query.index() {
+      through_index_allows(index, &flags, query.attr_record())?;
+    }
+    // While a BLOB query of the transaction is still at this query's
+    // row, the query waits its turn: its main row's operation may be
+    // yet to go, and this one must not overtake it (chapter 06, phase
+    // 12). Only a transaction with such queries running looks.
+    if has_runs && blob_table {
+      let any_row = query.index().is_some() || takeover.is_some();
+      let mut key = std::mem::take(&mut self.key_scratch);
+      let taken = blob_run::row_taken(
+        &self.transactions,
+        &self.queries,
+        trans_id,
+        query,
+        any_row,
+        &mut key,
+      );
+      self.key_scratch = key;
+      if taken? {
+        let waiting = Execution {
+          trans: Some(trans_id),
+          trans_id: id,
+          flags,
+          is_read,
+          reads_after,
+          takeover: takeover.map(|over| over.of),
+          shell: true,
+          ..Execution::default()
+        };
+        self.prepare_plain_run(query_id, &flags, is_read, takeover)?;
+        return self.define_shell(
+          query_id, trans_id, waiting, user_ref, callback, binding,
+        );
       }
-      None => (
-        numbers::IC_SIG_KEY_OP_REQ,
-        query.table().table_id(),
-        query.table().table_version(),
-      ),
-    };
+    }
     // The request is packed now, into the node's staged buffer, with
     // its sections built from the rows into the connection's scratch
     // buffers; the send sets its place in the batch.
-    let request = KeyOpReq {
-      coord_ptr: coord.coord_ptr,
-      query_ref: query_id.wire_word(),
+    let (signal, table_id, table_version) = request_names(query);
+    let request = OwnRequest {
+      signal,
       table_id,
-      flags_word: flags.flags_word(),
       table_version,
-      trans_id_lo: id as u32,
-      trans_id_hi: (id >> 32) as u32,
+      coord,
+      trans_id: id,
+      flags,
+      takeover: takeover.map(|over| (over.info, over.fragment)),
     };
     let mut key = std::mem::take(&mut self.key_scratch);
     let mut attr = std::mem::take(&mut self.attr_scratch);
@@ -966,30 +1031,8 @@ impl ApidConnection {
       }
       None => build_sections(query, &flags, is_read, &mut key, &mut attr),
     };
-    let header =
-      SignalHeader::new(signal, self.block_number(), coord.coord_block);
-    let eight = request.encode();
-    let ten;
-    let mut words: &[u32] = &eight;
-    if let Some(over) = takeover {
-      ten = request.encode_takeover(over.info, over.fragment);
-      words = &ten;
-    }
     let staged = match built {
-      Ok(()) => {
-        let both: [&[u32]; 2] = [&key, &attr];
-        let mut sections: &[&[u32]] = &both;
-        if attr.is_empty() {
-          sections = &both[..1];
-        }
-        self.stage_signal(
-          coord.node_id,
-          coord.generation,
-          &header,
-          words,
-          sections,
-        )
-      }
+      Ok(()) => self.stage_own(query_id, &request, &key, &attr),
       Err(e) => Err(e),
     };
     self.key_scratch = key;
@@ -1051,23 +1094,36 @@ impl ApidConnection {
     self.prepare_blob_run(query_id, &flags)?;
     let is_read = flags.operation == key_ops::IC_OP_READ
       || flags.operation == key_ops::IC_OP_READ_EXCLUSIVE;
+    let shell = Execution {
+      trans: Some(trans_id),
+      trans_id: id,
+      flags,
+      is_read,
+      shell: true,
+      ..Execution::default()
+    };
+    self.define_shell(query_id, trans_id, shell, user_ref, callback, binding)
+  }
+
+  /// Define a query that goes on no wire yet, its run made ready: a
+  /// BLOB query, whose run's operations carry it, or a query with no
+  /// blob value that waits its turn behind one on its row, whose own
+  /// request goes when the turn comes. The query is defined with
+  /// nothing packed, and its run started.
+  fn define_shell(
+    &mut self,
+    query_id: QueryId,
+    trans_id: TransId,
+    shell: Execution,
+    user_ref: usize,
+    callback: Option<QueryCallback>,
+    binding: usize,
+  ) -> Result<(), IcError> {
     if let Some(query) = self.queries.get_mut(query_id.0) {
       if query.state() == QueryState::Completed && query.callback().is_none() {
         self.executed.retain(|done| *done != query_id);
       }
-      query.begin(
-        Execution {
-          trans: Some(trans_id),
-          trans_id: id,
-          flags,
-          is_read,
-          shell: true,
-          ..Execution::default()
-        },
-        user_ref,
-        callback,
-        binding,
-      );
+      query.begin(shell, user_ref, callback, binding);
     }
     if let Some(trans) = self.transactions.get_mut(trans_id.0) {
       trans.defined.push(query_id);
@@ -1405,8 +1461,46 @@ impl ApidConnection {
     }
   }
 
+  /// Stage a query's own request, of the sections `key` and `attr`,
+  /// the second left out when empty: a takeover's carries the scan
+  /// information word and the row's fragment after its eight words.
+  pub(crate) fn stage_own(
+    &mut self,
+    query_id: QueryId,
+    request: &OwnRequest,
+    key: &[u32],
+    attr: &[u32],
+  ) -> Result<Staged, IcError> {
+    let coord = &request.coord;
+    let req = KeyOpReq {
+      coord_ptr: coord.coord_ptr,
+      query_ref: query_id.wire_word(),
+      table_id: request.table_id,
+      flags_word: request.flags.flags_word(),
+      table_version: request.table_version,
+      trans_id_lo: request.trans_id as u32,
+      trans_id_hi: (request.trans_id >> 32) as u32,
+    };
+    let header =
+      SignalHeader::new(request.signal, self.block_number(), coord.coord_block);
+    let eight = req.encode();
+    let ten;
+    let mut words: &[u32] = &eight;
+    if let Some((info, fragment)) = request.takeover {
+      ten = req.encode_takeover(info, fragment);
+      words = &ten;
+    }
+    let both: [&[u32]; 2] = [key, attr];
+    let mut sections: &[&[u32]] = &both;
+    if attr.is_empty() {
+      sections = &both[..1];
+    }
+    self.stage_signal(coord.node_id, coord.generation, &header, words, sections)
+  }
+
   /// True if the query has a request packed: false for a BLOB query,
-  /// whose run's operations carry it.
+  /// whose run's operations carry it, and for a query that waits its
+  /// turn behind one.
   fn is_packed(&self, qid: QueryId) -> bool {
     match self.queries.get(qid.0) {
       Some(query) => query.execution.staged.len > 0,
@@ -2386,7 +2480,7 @@ const IC_KEY_OP_REQ_REQUEST_INFO: usize = 4;
 /// A query's key and attribute sections from its rows, into buffers
 /// the caller keeps, cleared first: the key, then for a read what to
 /// read, for a write the values, and for a delete nothing.
-fn build_sections(
+pub(crate) fn build_sections(
   query: &ApidQuery,
   flags: &KeyOpFlags,
   is_read: bool,
@@ -2409,7 +2503,7 @@ fn build_sections(
 /// A query's attribute section from its rows, into a buffer the caller
 /// keeps, cleared first: for a read what to read, for a write the
 /// values, and for a delete nothing.
-fn build_attr_section(
+pub(crate) fn build_attr_section(
   query: &ApidQuery,
   flags: &KeyOpFlags,
   is_read: bool,
@@ -2489,7 +2583,10 @@ fn build_interpreted_section(
 
 /// Refuse what a data node would take for a malformed request rather
 /// than a large one: it is never sent.
-fn sections_fit(key: &[u32], attr_info: &[u32]) -> Result<(), IcError> {
+pub(crate) fn sections_fit(
+  key: &[u32],
+  attr_info: &[u32],
+) -> Result<(), IcError> {
   if key.len() > key_ops::IC_MAX_KEY_WORDS {
     return Err(IcError::new(err::IC_ERROR_KEY_TOO_LONG));
   }
@@ -2769,6 +2866,26 @@ mod tests {
     let mut back = sent_at(1);
     back.end_wanted = Some(CommitState::RollbackRequested);
     assert!(!back.takes_blob_rounds());
+  }
+
+  #[test]
+  fn a_query_whose_turn_has_come_is_defined_last() {
+    let one = QueryId(PtrId::from_u64(1));
+    let two = QueryId(PtrId::from_u64(2));
+    let three = QueryId(PtrId::from_u64(3));
+    let mut trans = sent_at(1);
+    trans.sent = vec![one, two];
+    trans.defined = vec![three];
+    // It went with a send, as a query that is on no wire yet: its
+    // request, staged now, goes behind what is defined.
+    trans.define_last(one);
+    assert!(trans.sent == [two]);
+    assert!(trans.defined == [three, one]);
+    // One that no send has taken yet moves last too, since requests
+    // staged after it was defined go before its own.
+    trans.define_last(three);
+    assert!(trans.sent == [two]);
+    assert!(trans.defined == [one, three]);
   }
 
   #[test]
