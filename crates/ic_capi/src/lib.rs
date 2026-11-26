@@ -46,6 +46,8 @@ use ic_apid::executor::OpShape;
 use ic_apid::executor::Request;
 use ic_apid::executor::Submitter;
 use ic_apid::index_scan::ScanRange;
+use ic_apid::instructions::InstructionBuilder;
+use ic_apid::instructions::Label;
 use ic_apid::key_op;
 use ic_apid::program::Cmp;
 use ic_apid::program::Cond;
@@ -259,6 +261,21 @@ pub const IC_NDB_ERROR_SCAN_IDLE: i32 = 296;
 /// error, which rolls the transaction back (ours, in NDB's range for
 /// programs).
 pub const IC_NDB_ERROR_CONDITION: i32 = 6000;
+/// The first of the codes a program's checks may refuse with, the
+/// application's own: `ic_program_refuse_unless` takes a code from this
+/// to `IC_NDB_ERROR_OWN_LAST`, and an operation whose row misses the
+/// check fails with it (NDB's range for programs, after ours).
+pub const IC_NDB_ERROR_OWN_FIRST: i32 = 6001;
+/// The last of the codes of the application's own.
+pub const IC_NDB_ERROR_OWN_LAST: i32 = 6999;
+/// A program compared a register that was NULL (an NDB error).
+pub const IC_NDB_ERROR_PROGRAM_NULL_REGISTER: i32 = 878;
+/// A program ran too long on a row, as a loop that does not end does,
+/// and the data node ended it (an NDB error).
+pub const IC_NDB_ERROR_PROGRAM_TOO_LONG: i32 = 886;
+/// A program shifted by a count of bits that is not 0 to 63 (an NDB
+/// error).
+pub const IC_NDB_ERROR_PROGRAM_SHIFT: i32 = 891;
 
 /// A text that is not a connectstring.
 pub const IC_ERROR_PARSE_CONNECTSTRING: i32 = 7056;
@@ -361,6 +378,9 @@ pub const IC_CMP_GT: u32 = 4;
 pub const IC_CMP_GE: u32 = 5;
 /// The inputs an operation gives its program, numbered from 0.
 pub const IC_PROGRAM_INPUTS: u32 = 16;
+/// The registers a program written an instruction at a time has,
+/// numbered from 0.
+pub const IC_PROGRAM_REGISTERS: u32 = 8;
 /// A value or condition a builder could not make, from a null builder or
 /// record or an unknown comparison; using it fails the finish with
 /// `IC_ERROR_BAD_PROGRAM`.
@@ -435,6 +455,12 @@ pub struct IcProgramBuilder {
   _private: [u8; 0],
 }
 
+/// A program being written an instruction at a time over a table, its
+/// labels named by numbers in it (`IC_INSTRUCTION_BUILDER`). Opaque.
+pub struct IcInstructionBuilder {
+  _private: [u8; 0],
+}
+
 /// A compiled program, run by any number of operations, each with its
 /// own inputs (`IC_PROGRAM`). Opaque.
 pub struct IcProgram {
@@ -446,6 +472,9 @@ pub struct IcProgram {
 pub struct IcBlobValues {
   _private: [u8; 0],
 }
+
+/// A label's number in its instruction builder (`IC_PROGRAM_LABEL`).
+pub type IcProgramLabel = u32;
 
 /// A value's id in its program builder (`IC_PROGRAM_VALUE`).
 pub type IcProgramValue = u32;
@@ -6797,6 +6826,105 @@ pub unsafe extern "C" fn ic_program_subtract(
   unsafe { on_builder(builder, |pb| pb.subtract(a, b).as_u32()) }
 }
 
+/// `a AND b`, bit by bit, NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_bit_and(
+  builder: *mut IcProgramBuilder,
+  a: IcProgramValue,
+  b: IcProgramValue,
+) -> IcProgramValue {
+  let (a, b) = (Value::from_u32(a), Value::from_u32(b));
+  // SAFETY: the caller's promise.
+  unsafe { on_builder(builder, |pb| pb.bit_and(a, b).as_u32()) }
+}
+
+/// `a OR b`, bit by bit, NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_bit_or(
+  builder: *mut IcProgramBuilder,
+  a: IcProgramValue,
+  b: IcProgramValue,
+) -> IcProgramValue {
+  let (a, b) = (Value::from_u32(a), Value::from_u32(b));
+  // SAFETY: the caller's promise.
+  unsafe { on_builder(builder, |pb| pb.bit_or(a, b).as_u32()) }
+}
+
+/// `a XOR b`, bit by bit, NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_bit_xor(
+  builder: *mut IcProgramBuilder,
+  a: IcProgramValue,
+  b: IcProgramValue,
+) -> IcProgramValue {
+  let (a, b) = (Value::from_u32(a), Value::from_u32(b));
+  // SAFETY: the caller's promise.
+  unsafe { on_builder(builder, |pb| pb.bit_xor(a, b).as_u32()) }
+}
+
+/// `a` shifted left by `count` bits, 0 to 63, NULL if either is. An
+/// integer beyond fails the finish (`IC_ERROR_BAD_PROGRAM`), a value
+/// beyond the operation (`IC_NDB_ERROR_PROGRAM_SHIFT`).
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_shift_left(
+  builder: *mut IcProgramBuilder,
+  a: IcProgramValue,
+  count: IcProgramValue,
+) -> IcProgramValue {
+  let (a, b) = (Value::from_u32(a), Value::from_u32(count));
+  // SAFETY: the caller's promise.
+  unsafe { on_builder(builder, |pb| pb.shift_left(a, b).as_u32()) }
+}
+
+/// `a` shifted right by `count` bits, 0 to 63, NULL if either is. A
+/// signed value keeps its sign; one of an unsigned column is filled with
+/// zeros.
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_shift_right(
+  builder: *mut IcProgramBuilder,
+  a: IcProgramValue,
+  count: IcProgramValue,
+) -> IcProgramValue {
+  let (a, b) = (Value::from_u32(a), Value::from_u32(count));
+  // SAFETY: the caller's promise.
+  unsafe { on_builder(builder, |pb| pb.shift_right(a, b).as_u32()) }
+}
+
+/// `a` with every bit inverted, NULL if it is.
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_bit_not(
+  builder: *mut IcProgramBuilder,
+  a: IcProgramValue,
+) -> IcProgramValue {
+  let a = Value::from_u32(a);
+  // SAFETY: the caller's promise.
+  unsafe { on_builder(builder, |pb| pb.bit_not(a).as_u32()) }
+}
+
 /// `a` compared with `b` as `cmp`, one of the `IC_CMP_*` values, says;
 /// unknown if either is NULL. `IC_PROGRAM_NONE` for another `cmp`.
 ///
@@ -6945,6 +7073,38 @@ pub unsafe extern "C" fn ic_program_assign_if(
   })
 }
 
+/// A check: unless `cond` is true the program refuses the row with
+/// `code`, a code of the application's own, `IC_NDB_ERROR_OWN_FIRST` to
+/// `IC_NDB_ERROR_OWN_LAST`, so that a failed operation says which check
+/// its row missed. Checks are made in the order given, before the
+/// program's condition and its assignments, and the first the row
+/// misses decides the code; a condition that is unknown, from a NULL,
+/// is missed. The operation fails with the code whatever its abort
+/// option, which alone decides whether its transaction is rolled back.
+/// A program with checks runs on key operations only: a scan refuses it
+/// (`IC_ERROR_NOT_SUPPORTED`). What is wrong, another code among it,
+/// comes back from the finish (`IC_ERROR_BAD_PROGRAM`).
+///
+/// # Safety
+///
+/// As `ic_program_column`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_program_refuse_unless(
+  builder: *mut IcProgramBuilder,
+  cond: IcProgramCond,
+  code: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let b = match unsafe { builder_of(builder) } {
+    Some(b) => b,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  guarded(|| {
+    b.refuse_unless(Cond::from_u32(cond), code);
+    0
+  })
+}
+
 /// The program's handle, made from a compiled program.
 fn program_out(made: Arc<Program>, program: *mut *mut IcProgram) -> i32 {
   let handle = Box::into_raw(Box::new(made)) as *mut IcProgram;
@@ -7016,6 +7176,635 @@ pub unsafe extern "C" fn ic_program_builder_finish_no_condition(
   })
 }
 
+// ---- Programs written an instruction at a time ----
+
+/// The instruction builder behind a handle.
+///
+/// # Safety
+///
+/// A non-null `builder` is an instruction builder handle not yet freed,
+/// used by one thread at a time.
+unsafe fn instructions_of<'a>(
+  builder: *mut IcInstructionBuilder,
+) -> Option<&'a mut InstructionBuilder> {
+  // SAFETY: the caller's promise.
+  unsafe { (builder as *mut InstructionBuilder).as_mut() }
+}
+
+/// Run `f` on the instruction builder a handle names: 0, or
+/// `IC_ERROR_NULL_POINTER` for a null builder.
+///
+/// # Safety
+///
+/// As [`instructions_of`].
+unsafe fn on_instructions<F: FnOnce(&mut InstructionBuilder)>(
+  builder: *mut IcInstructionBuilder,
+  f: F,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let found = match unsafe { instructions_of(builder) } {
+    Some(found) => found,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  guarded(|| {
+    f(found);
+    0
+  })
+}
+
+/// A builder of a program over a table, written an instruction at a
+/// time (chapter 04, "Instructions"): what goes into which of the
+/// `IC_PROGRAM_REGISTERS` registers, where the labels stand, and which
+/// instruction jumps to which, forwards or backwards. It is for what a
+/// condition and its assignments cannot say, a loop first of all; an
+/// `IC_PROGRAM_BUILDER` is told what must hold and lays the
+/// instructions out itself. `ic_instructions_finish` gives the program,
+/// an `IC_PROGRAM` as the other builder's, run the same way.
+///
+/// A register holds an integer of 64 bits or NULL, and nothing a
+/// program can count on before it puts something there. A comparison
+/// of a NULL register fails the program
+/// (`IC_NDB_ERROR_PROGRAM_NULL_REGISTER`). The data node ends a program
+/// that runs too long on a row (`IC_NDB_ERROR_PROGRAM_TOO_LONG`), so a
+/// loop that does not end fails its operation, or ends its scan.
+///
+/// What is wrong, a register beyond the eighth, a column the table
+/// lacks, a label that is not the builder's, is kept as the builder's
+/// error, which the finish gives; each function returns 0 unless its
+/// builder is null (`IC_ERROR_NULL_POINTER`).
+///
+/// The builder is the caller's, freed with `ic_instructions_free`; one
+/// thread uses it at a time.
+///
+/// # Safety
+///
+/// `def` is a table handle not yet freed; `builder` points to writable
+/// storage for a pointer.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_create(
+  def: *const IcTableDef,
+  builder: *mut *mut IcInstructionBuilder,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let table = match unsafe { table_of(def) } {
+    Some(table) => table,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if builder.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  guarded(|| {
+    let made = InstructionBuilder::new(&table.def);
+    let handle = Box::into_raw(Box::new(made)) as *mut IcInstructionBuilder;
+    // SAFETY: checked non-null above; the caller's promise.
+    unsafe { builder.write(handle) };
+    0
+  })
+}
+
+/// Free an instruction builder handle. The programs it finished stay.
+///
+/// # Safety
+///
+/// A non-null `builder` is an instruction builder handle not yet freed,
+/// freed here.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_free(
+  builder: *mut IcInstructionBuilder,
+) {
+  if builder.is_null() {
+    return;
+  }
+  // SAFETY: the caller's promise; the handle is the box made for it.
+  let owned = unsafe { Box::from_raw(builder as *mut InstructionBuilder) };
+  let _ = guarded(move || {
+    drop(owned);
+    0
+  });
+}
+
+/// A new label, to be placed once and jumped to from anywhere, before
+/// or after it is placed; `IC_PROGRAM_NONE` for a null builder.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_label(
+  builder: *mut IcInstructionBuilder,
+) -> IcProgramLabel {
+  // SAFETY: the caller's promise.
+  let b = match unsafe { instructions_of(builder) } {
+    Some(b) => b,
+    None => return IC_PROGRAM_NONE,
+  };
+  catch_unwind(AssertUnwindSafe(|| b.label().as_u32()))
+    .unwrap_or(IC_PROGRAM_NONE)
+}
+
+/// Place `label` before the next instruction.
+///
+/// # Safety
+///
+/// A non-null `builder` is an instruction builder handle not yet freed,
+/// used by this thread alone.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_place(
+  builder: *mut IcInstructionBuilder,
+  label: IcProgramLabel,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.place(Label::from_u32(label))) }
+}
+
+/// R`reg` = the row's value of `column`, an integer column; NULL if
+/// the column is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_read_column(
+  builder: *mut IcInstructionBuilder,
+  reg: u32,
+  column: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.read_column(reg, column)) }
+}
+
+/// `column` = R`reg`, cut to the column's size; NULL if the register
+/// is. An integer column of 32 or 64 bits; a program that writes runs
+/// only on an update.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_write_column(
+  builder: *mut IcInstructionBuilder,
+  column: u32,
+  reg: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.write_column(column, reg)) }
+}
+
+/// R`reg` = NULL.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_set_null(
+  builder: *mut IcInstructionBuilder,
+  reg: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.set_null(reg)) }
+}
+
+/// R`reg` = `value`.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_set_integer(
+  builder: *mut IcInstructionBuilder,
+  reg: u32,
+  value: i64,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.set_integer(reg, value)) }
+}
+
+/// R`reg` = input `input`, 0 to 15, which each operation sets.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_read_input(
+  builder: *mut IcInstructionBuilder,
+  reg: u32,
+  input: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.read_input(reg, input)) }
+}
+
+/// R`dest` = R`a` + R`b`; NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_add(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  b: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.add(dest, a, b)) }
+}
+
+/// R`dest` = R`a` - R`b`; NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_subtract(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  b: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.subtract(dest, a, b)) }
+}
+
+/// R`dest` = R`src` + `value`, in one instruction; NULL if R`src` is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_add_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  value: u16,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.add_integer(dest, src, value)) }
+}
+
+/// R`dest` = R`src` - `value`, in one instruction; NULL if R`src` is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_subtract_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  value: u16,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.subtract_integer(dest, src, value)) }
+}
+
+/// R`dest` = R`a` AND R`b`, bit by bit; NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_and(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  b: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_and(dest, a, b)) }
+}
+
+/// R`dest` = R`src` AND `value`, bit by bit, in one instruction; NULL
+/// if R`src` is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_and_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  value: u16,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_and_integer(dest, src, value)) }
+}
+
+/// R`dest` = R`a` OR R`b`, bit by bit; NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_or(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  b: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_or(dest, a, b)) }
+}
+
+/// R`dest` = R`src` OR `value`, bit by bit, in one instruction; NULL
+/// if R`src` is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_or_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  value: u16,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_or_integer(dest, src, value)) }
+}
+
+/// R`dest` = R`a` XOR R`b`, bit by bit; NULL if either is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_xor(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  b: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_xor(dest, a, b)) }
+}
+
+/// R`dest` = R`src` XOR `value`, bit by bit, in one instruction; NULL
+/// if R`src` is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_xor_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  value: u16,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_xor_integer(dest, src, value)) }
+}
+
+/// R`dest` = R`src` with every bit inverted; NULL if R`src` is.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_bit_not(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.bit_not(dest, src)) }
+}
+
+/// R`dest` = R`a` shifted left by R`count` bits; NULL if either is. A
+/// count that is not 0 to 63 fails the program
+/// (`IC_NDB_ERROR_PROGRAM_SHIFT`).
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_shift_left(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  count: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.shift_left(dest, a, count)) }
+}
+
+/// R`dest` = R`src` shifted left by `count` bits, 0 to 63, in one
+/// instruction; NULL if R`src` is. Another count fails the finish
+/// (`IC_ERROR_BAD_PROGRAM`).
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_shift_left_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  count: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    on_instructions(builder, |i| i.shift_left_integer(dest, src, count))
+  }
+}
+
+/// R`dest` = R`a` shifted right by R`count` bits; NULL if either is. A
+/// signed value keeps its sign, and one read from an unsigned column is
+/// filled with zeros. A count that is not 0 to 63 fails the program
+/// (`IC_NDB_ERROR_PROGRAM_SHIFT`).
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_shift_right(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  a: u32,
+  count: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |i| i.shift_right(dest, a, count)) }
+}
+
+/// R`dest` = R`src` shifted right by `count` bits, 0 to 63, in one
+/// instruction; NULL if R`src` is. Another count fails the finish
+/// (`IC_ERROR_BAD_PROGRAM`).
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_shift_right_integer(
+  builder: *mut IcInstructionBuilder,
+  dest: u32,
+  src: u32,
+  count: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    on_instructions(builder, |i| i.shift_right_integer(dest, src, count))
+  }
+}
+
+/// Jump to `to`: forwards, or backwards to a label placed before,
+/// which makes a loop.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_jump(
+  builder: *mut IcInstructionBuilder,
+  to: IcProgramLabel,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.jump(Label::from_u32(to))) }
+}
+
+/// Jump to `to` if R`reg` is NULL, else go on.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_jump_if_null(
+  builder: *mut IcInstructionBuilder,
+  reg: u32,
+  to: IcProgramLabel,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    on_instructions(builder, |b| b.jump_if_null(reg, Label::from_u32(to)))
+  }
+}
+
+/// Jump to `to` if R`reg` holds a value, else go on.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_jump_if_value(
+  builder: *mut IcInstructionBuilder,
+  reg: u32,
+  to: IcProgramLabel,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    on_instructions(builder, |b| b.jump_if_value(reg, Label::from_u32(to)))
+  }
+}
+
+/// End: the row passes, and an update's columns are written.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_accept(
+  builder: *mut IcInstructionBuilder,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.accept()) }
+}
+
+/// End: the row is refused as a missed condition is. A scan passes it
+/// over; a key operation fails with `IC_NDB_ERROR_CONDITION` where it
+/// aborts on error and with `IC_NDB_ERROR_NO_SUCH_ROW` where it ignores
+/// errors.
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_refuse(
+  builder: *mut IcInstructionBuilder,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.refuse()) }
+}
+
+/// End: the row is refused with `code`, a code of the application's
+/// own, `IC_NDB_ERROR_OWN_FIRST` to `IC_NDB_ERROR_OWN_LAST`, whatever the
+/// operation's abort option. Key operations only: a scan does not take
+/// a program that has one (`IC_ERROR_NOT_SUPPORTED`).
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_refuse_with(
+  builder: *mut IcInstructionBuilder,
+  code: u32,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe { on_instructions(builder, |b| b.refuse_with(code)) }
+}
+
+/// Jump to `to` if R`a` compares with R`b` as `cmp` says, an `IC_CMP_*`,
+/// else go on. Both must hold values: a NULL fails the program. Another
+/// `cmp` fails the finish (`IC_ERROR_BAD_PROGRAM`).
+///
+/// # Safety
+///
+/// As `ic_instructions_place`.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_jump_if(
+  builder: *mut IcInstructionBuilder,
+  cmp: u32,
+  a: u32,
+  b: u32,
+  to: IcProgramLabel,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  unsafe {
+    on_instructions(builder, |i| match cmp_from_c(cmp) {
+      Some(cmp) => i.jump_if(cmp, a, b, Label::from_u32(to)),
+      // No register is the ninth: the builder keeps the error.
+      None => i.set_null(IC_PROGRAM_REGISTERS),
+    })
+  }
+}
+
+/// The program, once every label a jump goes to is placed and the last
+/// instruction is an ending or a jump; its handle is the caller's,
+/// freed with `ic_program_free`. The builder stays and can be freed.
+///
+/// Errors: the builder's first error, `IC_ERROR_BAD_PROGRAM` for a
+/// register, input, label or code that is not one, a label used and
+/// not placed, or a last instruction a row could run past;
+/// `IC_ERROR_NO_SUCH_FIELD` for a column the table lacks;
+/// `IC_ERROR_NOT_SUPPORTED` for a column that is not an integer, or
+/// not one of 32 or 64 bits where it is written;
+/// `IC_ERROR_CONDITION_TOO_COMPLEX` for a program too long.
+///
+/// # Safety
+///
+/// A non-null `builder` is an instruction builder handle not yet freed,
+/// used by this thread alone; `program` points to writable storage for
+/// a pointer.
+#[no_mangle]
+pub unsafe extern "C" fn ic_instructions_finish(
+  builder: *mut IcInstructionBuilder,
+  program: *mut *mut IcProgram,
+) -> i32 {
+  // SAFETY: the caller's promise.
+  let b = match unsafe { instructions_of(builder) } {
+    Some(b) => b,
+    None => return err::IC_ERROR_NULL_POINTER,
+  };
+  if program.is_null() {
+    return err::IC_ERROR_NULL_POINTER;
+  }
+  guarded(|| match b.finish() {
+    Ok(made) => program_out(made, program),
+    Err(e) => e.code,
+  })
+}
+
 /// Free a program handle. The queries, scans and shapes that run it
 /// keep it.
 ///
@@ -7071,7 +7860,9 @@ pub unsafe extern "C" fn ic_program_inputs(program: *const IcProgram) -> u32 {
 /// checked as each is defined (`IC_ERROR_NOT_SUPPORTED`). A row the
 /// program refuses fails the query with `IC_NDB_ERROR_CONDITION` where it
 /// aborts on error, rolling the transaction back, and with
-/// `IC_NDB_ERROR_NO_SUCH_ROW` where it ignores errors.
+/// `IC_NDB_ERROR_NO_SUCH_ROW` where it ignores errors; a row that misses
+/// one of the program's checks fails it with the check's code in both
+/// (`ic_program_refuse_unless`).
 ///
 /// Errors: `IC_ERROR_BAD_PROGRAM` for a program of another table;
 /// `IC_ERROR_TRANSACTION_ACTIVE` while the query is defined or sent;
@@ -7189,7 +7980,8 @@ pub unsafe extern "C" fn ic_apid_query_after_row(
 /// a NULL `program`: a row it refuses is passed over at the data node.
 ///
 /// Errors: `IC_ERROR_BAD_PROGRAM` for a program of another table;
-/// `IC_ERROR_NOT_SUPPORTED` for one that assigns; `IC_ERROR_SCAN_ACTIVE`
+/// `IC_ERROR_NOT_SUPPORTED` for one that assigns, or one with checks,
+/// whose codes would end the scan; `IC_ERROR_SCAN_ACTIVE`
 /// while a run is on; `IC_ERROR_NO_SUCH_FIELD` for an id that names no
 /// scan.
 ///
@@ -7318,8 +8110,8 @@ pub unsafe extern "C" fn ic_op_shape_reading_after(
 /// a scan.
 ///
 /// Errors: `IC_ERROR_BAD_PROGRAM` for a program of another table;
-/// `IC_ERROR_NOT_SUPPORTED` for one that assigns. The new shape is the
-/// caller's, freed with `ic_scan_shape_free`.
+/// `IC_ERROR_NOT_SUPPORTED` for one that assigns, or one with checks.
+/// The new shape is the caller's, freed with `ic_scan_shape_free`.
 ///
 /// # Safety
 ///
@@ -7809,7 +8601,38 @@ mod tests {
     );
     assert!(IcError::new(IC_NDB_ERROR_CONDITION).is_ndb_error());
     assert!(!IcError::new(IC_NDB_ERROR_CONDITION).is_temporary());
+    assert_eq!(
+      IC_NDB_ERROR_OWN_FIRST as u16,
+      ic_signals::interp::IC_REFUSE_OWN_FIRST
+    );
+    assert_eq!(
+      IC_NDB_ERROR_OWN_LAST as u16,
+      ic_signals::interp::IC_REFUSE_OWN_LAST
+    );
+    assert_eq!(
+      IC_NDB_ERROR_OWN_FIRST,
+      ic_port::ndb_err::IC_NDB_ERROR_OWN_FIRST
+    );
+    assert_eq!(
+      IC_NDB_ERROR_OWN_LAST,
+      ic_port::ndb_err::IC_NDB_ERROR_OWN_LAST
+    );
+    assert!(IcError::new(IC_NDB_ERROR_OWN_FIRST).is_ndb_error());
+    assert!(!IcError::new(IC_NDB_ERROR_OWN_LAST).is_temporary());
+    for code in [
+      IC_NDB_ERROR_PROGRAM_NULL_REGISTER,
+      IC_NDB_ERROR_PROGRAM_TOO_LONG,
+      IC_NDB_ERROR_PROGRAM_SHIFT,
+    ] {
+      assert!(ic_port::ndb_err::is_known(code), "{}", code);
+      assert!(IcError::new(code).is_ndb_error());
+      assert!(!IcError::new(code).is_temporary());
+    }
     assert_eq!(IC_PROGRAM_INPUTS, ic_apid::program::IC_PROGRAM_INPUTS);
+    assert_eq!(
+      IC_PROGRAM_REGISTERS,
+      ic_apid::instructions::IC_PROGRAM_REGISTERS
+    );
     assert_eq!(cmp_from_c(IC_CMP_LE), Some(Cmp::Le));
     assert_eq!(cmp_from_c(6), None);
     let scan_errors: [(i32, i32); 4] = [

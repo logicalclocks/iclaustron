@@ -124,6 +124,7 @@ pub mod hash;
 pub mod heartbeat;
 pub mod index_order;
 pub mod index_scan;
+pub mod instructions;
 pub mod key_op;
 pub mod node_connect;
 pub mod node_state;

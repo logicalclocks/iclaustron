@@ -231,7 +231,7 @@ impl OpShape {
     if self.index.is_some() || self.attr_rec.has_blob_fields() {
       return Err(IcError::new(err::IC_ERROR_NOT_SUPPORTED));
     }
-    program::check_program(program, &self.table, true)?;
+    program::check_program(program, &self.table, true, false)?;
     let mut shape = self.copy();
     shape.program = Some(Arc::clone(program));
     Ok(Arc::new(shape))

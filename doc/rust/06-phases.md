@@ -2332,6 +2332,142 @@ the two disagreed; what followed from those places is here too.
   free records of a link gone.
 - Tests: to be run, with the fuzz targets.
 
+### 11.5 Refusal codes of the application's own (2026-11-23)
+
+Asked for by an early application: "Refusal codes of our own, and more
+than one in a program: a hot-path program of ours refuses with 6001 or
+6002 depending on which test failed." Until now a program had one
+condition, whose one `REFUSE` the library stamped with 626 or 6000 as
+the operation's abort option had it, so an application learnt only that
+the row had missed the condition. The reference's programs exit with a
+code wherever they like, any number of times, and keep 6000 to 6999
+for it (chapter 05 §9.4).
+
+- Checks on the builder: `refuse_unless(cond, code)`, any number, each
+  with a code from 6001 to 6999, made in the order given before the
+  condition and the assignments (chapter 04, "Conditions and
+  assignments"; `ic_program_refuse_unless` in C, with
+  `IC_NDB_ERROR_OWN_FIRST` and `IC_NDB_ERROR_OWN_LAST`). The compiler
+  gives each a `REFUSE` of its own after the rest of the program, whose
+  code is kept as the program goes out.
+- The operation fails with the check's code under either abort option;
+  the option alone decides whether its transaction goes with it.
+- A scan refuses a program with checks, on a connection and as a
+  shape: the code would end the scan.
+- The error table classes 6001 to 6999 as the application's program's
+  own, permanent, where they were unknown codes, classed as internal.
+- Tests. Unit: the words of two checks, a check before a condition
+  with each of the operation's codes, the codes refused, the scan's
+  refusal, the class of the range. Integration, the `refuse_` group:
+  an update that misses the first check, the second, both, and neither,
+  aborting on error and ignoring errors, beside a plain update in the
+  same transaction; a row that is not there, still 626; reads and
+  deletes; a scan's and a scan shape's refusal; four updates in one
+  request through an executor, each saying its own, and one that
+  aborts. The C API's program test does the same through the header.
+- After a review the same day: a live test of a check before a
+  condition (the check's code under either abort option, 6000 or 626
+  for the condition, the update where both hold); a program too long is
+  called too long (`IC_ERROR_CONDITION_TOO_COMPLEX`) also where one of
+  its jumps is too far, which said `IC_ERROR_RECORD_SIZE_TOO_BIG`
+  before, with a unit test at the limit; 886, the data node's limit on
+  what a program runs on a row, is in the error table and the user
+  guide (Q21).
+- The `conditional_update` example, in Rust and in C, takes an amount
+  from a row only if it is the caller's and holds enough, and is told
+  6001 or 6002.
+- Not in it: exits on any branch of a program, as the reference's
+  programs have them, and the instructions such programs use besides
+  (the operation's type, the interpreter's outputs); those stay with
+  the full interpreter, below. Three questions it raised are open
+  (chapter 10): whether 6000 is the application's too, checks on a
+  scan, a `refuse_if`, and programs that run past the data node's
+  limit.
+
+### 11.6 Programs written an instruction at a time, with loops (2026-11-24)
+
+Asked for after 11.5: the reference's programs loop, and use more of
+the data node's instructions than ours write; loops first, the
+instructions after. Not yet seen by the author (Q22).
+
+- `ProgramWriter` takes jumps backwards once told to
+  (`allow_backward`): bit 31 and the distance (chapter 05 §9.4). The
+  compiler of conditions does not tell it, and a jump backwards there
+  is still its own mistake. A jump to itself is refused for all.
+- `InstructionBuilder` (`ic_apid::instructions`; chapter 04,
+  "Instructions"): registers by number, labels, jumps either way on
+  registers, the columns read and written, the inputs, `accept`,
+  `refuse` and `refuse_with`. It gives a `Program`, so nothing changed
+  in queries, scans, shapes or the executor.
+- C: `IC_INSTRUCTION_BUILDER`, `IC_PROGRAM_LABEL`, the
+  `ic_instructions_` functions, `IC_PROGRAM_REGISTERS`,
+  `IC_NDB_ERROR_PROGRAM_NULL_REGISTER` and
+  `IC_NDB_ERROR_PROGRAM_TOO_LONG`.
+- What the data node runs on a row was measured, and the 8000 written
+  in 11.5 from the error's text put right: about 16 000, some
+  instructions for more than one (chapter 05 §9.4). 886's text of ours
+  no longer says a number.
+- Tests. Unit: a jump backwards' word, one too far back, one to
+  itself; a loop's words; the loop run on the model of the
+  interpreter, which now jumps backwards, says the code a program
+  refuses with and ends one that runs too long; what the finish
+  refuses; the length. Integration, the `loop_` group: an update that
+  multiplies by adding, with a NULL, a negative count and its code, a
+  loop that runs too long under each abort option, the count from an
+  input, 3000 turns and 5000; a scan filtered by the loop, and ended
+  by a row whose loop runs too long. The C API's program test writes a
+  loop through the header.
+- Not in it: an example, column tests in this builder, and the
+  instructions the writer does not write. The bitwise ones are next,
+  for both builders (11.7).
+
+### 11.7 Bitwise values and instructions (2026-11-24)
+
+The first of the instructions after the loops. Not yet seen by the
+author (Q22).
+
+- `ProgramWriter` writes `SHIFT_LEFT`, `SHIFT_RIGHT`, `BIT_AND`,
+  `BIT_OR`, `BIT_XOR` and `BIT_NOT`, and the five that take the field
+  for their second value (`BitOp`, `bits`, `bits_imm`, `bit_not`;
+  chapter 05 §9.2).
+- `ProgramBuilder`: the values `bit_and`, `bit_or`, `bit_xor`,
+  `bit_not`, `shift_left` and `shift_right`, compiled as sums are.
+- `InstructionBuilder`: the same on registers, each two-valued one
+  with an `_integer` form.
+- C: `ic_program_bit_and` and the like, `ic_instructions_bit_and` and
+  the like, `IC_NDB_ERROR_PROGRAM_SHIFT` (891), which is in the error
+  table.
+- Tests. Unit: the words of each; each value and each instruction on
+  the model of the interpreter, which runs them now; a loop that
+  counts the bits set; a count of bits that is none, at the finish and
+  as the model's 891. Integration, the `bits_` group: each value
+  assigned for a positive and a negative row and a NULL, with
+  integers in the instructions, an unsigned column shifted right, a
+  count of 64 from a row (891), a scan filtered by a mask from an
+  input; the loop that counts bits, and every instruction on
+  registers in one program. The C API's program test builds both kinds
+  through the header.
+- Not in it: multiply, divide and remainder, which are as near and
+  not asked for; an example.
+- After a review the same day:
+  - a shift is worked out also where its answer is known without it
+    (`is_not_null` of a value never NULL, a comparison with a NULL
+    constant), so a count that is none fails the finish or the
+    operation there too; before, the shift and its input were left
+    out;
+  - a label carries its builder's mark, so another builder's label of
+    the same number is refused, where it was taken for ours;
+  - the user guide says that the count's sign decides a shift right
+    as the value's does, seen live;
+  - the test of 11.5 for a program too long with a jump too far did
+    not tell the two orders apart, since 11 000 checks are found too
+    long while they are compiled; it is now 8000 checks known to hold
+    and 8300 comparisons, which says `IC_ERROR_RECORD_SIZE_TOO_BIG`
+    with the old order;
+  - chapter 08's `cargo test` line for the integration tests has
+    `--test-threads=1`, as the xtask runs them: tests share their
+    tables.
+
 ## Phase 12 — BLOB, TEXT and JSON (about 7 weeks)
 
 Planned with the author on 2026-11-11, from the author's model of how

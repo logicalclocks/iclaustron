@@ -51,7 +51,9 @@ source code. Captures come from running the reference API's own example
 programs (simple key operations, the same through a unique index, the
 asynchronous interface, later a scan) against a local 26.10 cluster.
 
-### 3. Integration tests (`cargo xtask test-integration` = `IC_TEST_CONNECTSTRING=... cargo test -p ic_apid --features integration`)
+### 3. Integration tests (`cargo xtask test-integration` = `IC_TEST_CONNECTSTRING=... cargo test -p ic_apid --features integration -- --test-threads=1`)
+
+One at a time: the tests of a group make and fill the same tables.
 
 Need a live cluster. Two ways to get one:
 

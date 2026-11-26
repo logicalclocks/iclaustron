@@ -2471,17 +2471,20 @@ basic interpreter of phase 9.1 needs these:
 | 25 | `JUMP_IF_COLUMN_VALUE` | jump if it is not NULL |
 | 26 | `TEST_COLUMN_PARAM` | as 23, against a parameter |
 | 27 | `TEST_COLUMN_COLUMN` | as 23, against another column of the row |
+| 28, 29 | `SHIFT_LEFT`, `SHIFT_RIGHT` | R3 = R1 shifted by R2 bits (phase 11.7) |
+| 32, 33, 34 | `BIT_AND`, `BIT_OR`, `BIT_XOR` | R3 = R1 with R2, bit by bit (phase 11.7) |
+| 36 | `BIT_NOT` | R3 = R1 with every bit inverted (phase 11.7) |
 | 71 | `ADD_IMM` | R3 = R1 + the field |
 | 72 | `SUBTRACT_IMM` | R3 = R1 − the field |
+| 92, 93 | `SHIFT_LEFT_IMM`, `SHIFT_RIGHT_IMM` | R3 = R1 shifted by the field's bits (phase 11.7) |
+| 96, 97, 98 | `BIT_AND_IMM`, `BIT_OR_IMM`, `BIT_XOR_IMM` | R3 = R1 with the field (phase 11.7) |
 | 121 | `READ_INPUT` | R1 = the input in the field, one of 16 opaque 8-byte values (§9.5) |
 
 Described, for later:
 
 | # | Our name | What it does |
 |---|---|---|
-| 28, 29 | `SHIFT_LEFT`, `SHIFT_RIGHT` | R3 = R1 shifted by R2 bits |
-| 30–35 | `MULTIPLY`, `DIVIDE`, `BIT_AND`, `BIT_OR`, `BIT_XOR`, `REMAINDER` | R3 = R1 with R2 |
-| 36 | `BIT_NOT` | R3 = R1 inverted |
+| 30, 31, 35 | `MULTIPLY`, `DIVIDE`, `REMAINDER` | R3 = R1 with R2 |
 | 45 | `SET_DOUBLE` | R1 = the double in the next two words |
 | 48 | `READ_COLUMN_TO_MEMORY` | a column into memory |
 | 49–52 | `LOAD_8`, `LOAD_16`, `LOAD_32`, `LOAD_64` | R1 = memory at the field: unsigned 8, 16 or 32 bits, or signed 64 |
@@ -2491,7 +2494,7 @@ Described, for later:
 | 59 | `COPY_TO_MEMORY` | bytes from the program to memory at R1 |
 | 62 | `STORE_REGISTER` | 8 bytes of memory at the field = R1 |
 | 76–81 | `JUMP_IF_EQ_IMM`, `_NE_IMM`, `_LT_IMM`, `_LE_IMM`, `_GT_IMM`, `_GE_IMM` | jump if R1, unsigned, compares so with bits 9–14 (0 to 63) |
-| 92–99 | `SHIFT_LEFT_IMM`, `SHIFT_RIGHT_IMM`, `MULTIPLY_IMM`, `DIVIDE_IMM`, `BIT_AND_IMM`, `BIT_OR_IMM`, `BIT_XOR_IMM`, `REMAINDER_IMM` | R3 = R1 with the field (a shift below 64) |
+| 94, 95, 99 | `MULTIPLY_IMM`, `DIVIDE_IMM`, `REMAINDER_IMM` | R3 = R1 with the field |
 | 113–116 | `LOAD_8_AT` … `LOAD_64_AT` | R2 = memory at R1 |
 | 117–120 | `STORE_8_AT` … `STORE_64_AT` | memory at R2 = R1 |
 | 123 | `WRITE_OUTPUT` | the output in the field, one of 16, = R1 |
@@ -2523,6 +2526,19 @@ node is a released, stable 26.10 or later, none older (the author,
 its tree at d3ba310b593, 2026-10-20). For later: the code reads
 `ZERO_MEMORY`'s offset from R1 and its size from R2, the other way round
 from the account.
+
+The bitwise instructions, as read in the code and then seen on a
+26.10 cluster (2026-11-24, phase 11.7): their result is in R3, bits
+12–14, where `ADD` and `SUBTRACT` have theirs in R4; with the field in
+place of R2 the number is 64 more, and the field is unsigned. A NULL
+in R1 or R2 gives NULL. A shift's count is 0 to 63, and another, from
+a register or the field, is error 891. They go by the registers'
+types: `SHIFT_RIGHT` of a signed value keeps its sign (−12 by 2 is −3)
+and of an unsigned one fills with zeros (a BIGINT UNSIGNED column of
+0xF000000000000000 by 60 is 15). A result is unsigned where either
+value is, the count included: −12 shifted right by an unsigned
+column's 1 is 0x7FFFFFFFFFFFFFFA. Read in the code and not tried: a
+double in a register is refused (878).
 
 ### 9.3 Column tests (23, 26, 27)
 
@@ -2563,7 +2579,20 @@ Seen: comparisons 1, 2, 4 and 5 with rules 0 and 2 (§9.6).
 
 - **A jump's distance** is in words, counted from the jump's first word.
   The account gives it bits 16–31; the code reads bits 16–30 as the
-  distance and bit 31 as a jump backwards. Every jump seen goes forward.
+  distance and bit 31 as a jump backwards. Every jump MySQL's programs
+  made goes forward. Ours go backwards too since phase 11.6: seen on a
+  26.10 cluster (2026-11-24), a jump with bit 31 and a distance of 3
+  goes to the word 3 before the jump's own, in a key update's program
+  and in a scan's filter, and a loop made of it runs.
+- **A program that runs too long** is ended with 886, in a key
+  operation, which fails as with any error, alone where it ignores
+  errors, and in a scan, which ends with it. The error's own text says
+  more than 8000 instructions; what was seen is a count to about
+  16 000 in which some instructions weigh more than one. A loop of
+  four register instructions a turn, with nine around it and one of
+  them a column written, ran 3996 turns and not 3997; of tests of a
+  column against a value, all passing, 2600 ran and 2700 did not, about
+  six each.
 - **`ACCEPT`**: a scan returns the row; a key operation goes on to its
   final updates and reads (§9.5).
 - **`REFUSE`** ends with the code in the field. In a scan, 626 and 899
@@ -2586,6 +2615,19 @@ Seen: comparisons 1, 2, 4 and 5 with rules 0 and 2 (§9.6).
   raised, permanent: "The row did not meet the operation's condition".
   The rest of the range, 6001–6999, is left to applications' own
   exits.
+- **The application's** (phase 11.5, 2026-11-23): a program may hold
+  several `REFUSE` words, each with a code of 6001–6999 the application
+  chose, one for each of its checks (chapter 04, "Conditions and
+  assignments"). A check is compiled as a condition is, its jump going
+  to a `REFUSE` of its own; these stand after the rest of the program,
+  in the order of the checks, so that every jump goes forward. Their
+  codes are fixed when the program is compiled and are not among those
+  rewritten as it goes out, so a key operation fails with the check's
+  code under either abort option. A scan would end on such a code, as
+  on any but 626 and 899, so a program with checks is refused there.
+  Seen on a 26.10 cluster: a key update, read and delete fail with 6001
+  or 6002 as the program says, alone where they ignore errors and with
+  their transaction where they abort on error.
 - **`ACCEPT_LAST`**: as `ACCEPT`, and the fragment's scan ends after
   the row.
 

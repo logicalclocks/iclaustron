@@ -36,8 +36,9 @@ after_includes = """
  * Handles. IC_APID_GLOBAL, IC_APID_CONNECTION, IC_TABLE_DEF,
  * IC_INDEX_DEF, IC_RECORD, IC_APID_EXECUTOR, IC_APID_SUBMITTER,
  * IC_OP_SHAPE, IC_REQUEST, IC_SCAN_SHAPE, IC_SCAN_READER,
- * IC_PROGRAM_BUILDER, IC_PROGRAM and IC_BLOB_VALUES are made by one
- * function and given back to their _free; the caller owns each until
+ * IC_PROGRAM_BUILDER, IC_INSTRUCTION_BUILDER, IC_PROGRAM and
+ * IC_BLOB_VALUES are made by one function and given back to their
+ * _free; the caller owns each until
  * then. A connection, and an executor, is freed before its global; a
  * table, index or record handle may outlive the connection that made
  * it, a query or scan keeps what it needs of its records, a request or
@@ -52,7 +53,8 @@ after_includes = """
  * back, is refused with an error or passed over, never taken for
  * another: a later query, transaction, scan or batch always has an id
  * of its own. A program's values (IC_PROGRAM_VALUE) and conditions
- * (IC_PROGRAM_COND) are ids in their builder.
+ * (IC_PROGRAM_COND) are ids in their builder, and its labels
+ * (IC_PROGRAM_LABEL) numbers in theirs.
  *
  * Rows. A query owns its rows: ic_apid_query_key_row() and
  * ic_apid_query_attr_row() give pointers valid until the query is
@@ -204,6 +206,8 @@ include = ["IcApidCallback", "IcScanCallback"]
 "IcScanReader" = "IC_SCAN_READER"
 "IcTakeoverArgs" = "IC_TAKEOVER_ARGS"
 "IcProgramBuilder" = "IC_PROGRAM_BUILDER"
+"IcInstructionBuilder" = "IC_INSTRUCTION_BUILDER"
+"IcProgramLabel" = "IC_PROGRAM_LABEL"
 "IcProgram" = "IC_PROGRAM"
 "IcProgramValue" = "IC_PROGRAM_VALUE"
 "IcProgramCond" = "IC_PROGRAM_COND"

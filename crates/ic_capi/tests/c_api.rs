@@ -1802,6 +1802,258 @@ fn c_api_programs_filter_scans_guard_updates_and_count() {
       assert_eq!(seen_sql, Some(after.to_string()), "below {}", limit);
     }
 
+    // Checks, with codes of the application's own: unless val < input 0
+    // refuse with 6001, unless val > input 1 with 6002; val = val + 1.
+    assert_eq!(ic_program_builder_create(table, &mut builder), 0);
+    let column = ic_program_column(builder, val);
+    let high = ic_program_input(builder, 0);
+    let low = ic_program_input(builder, 1);
+    let below = ic_program_compare(builder, IC_CMP_LT, column, high);
+    let above = ic_program_compare(builder, IC_CMP_GT, column, low);
+    assert_eq!(
+      ic_program_refuse_unless(builder, below, IC_NDB_ERROR_OWN_FIRST as u32),
+      0
+    );
+    assert_eq!(ic_program_refuse_unless(builder, above, 6002), 0);
+    let one = ic_program_integer(builder, 1);
+    let sum = ic_program_add(builder, column, one);
+    assert_eq!(ic_program_assign(builder, val, sum), 0);
+    let mut checks: *mut IcProgram = std::ptr::null_mut();
+    let ret = ic_program_builder_finish_no_condition(builder, &mut checks);
+    assert_eq!(ret, 0, "finish: {}", message(ret));
+    // A code that is not the application's fails the finish, and a null
+    // builder takes no check.
+    assert_eq!(
+      ic_program_refuse_unless(builder, below, IC_NDB_ERROR_CONDITION as u32),
+      0
+    );
+    let ret = ic_program_builder_finish_no_condition(builder, &mut refused);
+    assert_eq!(ret, IC_ERROR_BAD_PROGRAM);
+    assert_eq!(
+      ic_program_refuse_unless(std::ptr::null_mut(), below, 6001),
+      IC_ERROR_NULL_POINTER
+    );
+    ic_program_builder_free(builder);
+    // A scan refuses the program, and keeps its filter.
+    assert_eq!(
+      ic_apid_conn_set_scan_program(conn, scan, checks),
+      IC_ERROR_NOT_SUPPORTED
+    );
+    assert_eq!(ic_apid_query_set_program(conn, query, checks), 0);
+    // Row 3's val is 31. Where the update aborts on error its
+    // transaction rolls back and says the code of the first check
+    // missed; where it ignores errors it fails alone with that code.
+    for (high, low, ignore, error, state, after) in [
+      (20, 0, false, 6001, IC_COMMIT_STATE_ROLLED_BACK, "31"),
+      (40, 35, false, 6002, IC_COMMIT_STATE_ROLLED_BACK, "31"),
+      (20, 35, false, 6001, IC_COMMIT_STATE_ROLLED_BACK, "31"),
+      (20, 0, true, 6001, IC_COMMIT_STATE_COMMITTED, "31"),
+      (40, 35, true, 6002, IC_COMMIT_STATE_COMMITTED, "31"),
+      (40, 0, false, 0, IC_COMMIT_STATE_COMMITTED, "32"),
+    ] {
+      let what = format!("below {}, above {}, ignore {}", high, low, ignore);
+      assert_eq!(ic_apid_query_set_input(conn, query, 0, high), 0);
+      assert_eq!(ic_apid_query_set_input(conn, query, 1, low), 0);
+      write.abort_option = if ignore {
+        IC_IGNORE_ERROR
+      } else {
+        IC_ABORT_DEFAULT
+      };
+      let hint = ic_apid_conn_hint_for_key(conn, table, key_rec, key, len);
+      let mut trans: IcTransId = 0;
+      assert_eq!(
+        ic_apid_conn_start_transaction(conn, hint, table, &mut trans),
+        0
+      );
+      let ret = ic_apid_conn_write_key(conn, query, trans, &write);
+      assert_eq!(ret, 0, "define: {}", message(ret));
+      assert_eq!(ic_apid_conn_commit_transaction(conn, trans), 0);
+      assert_eq!(finish(conn, trans), state, "{}", what);
+      let query_error = ic_apid_query_error(conn, query);
+      let seen = [query_error, ic_apid_transaction_error(conn, trans)];
+      assert!(seen.contains(&error), "{}: {:?}", what, seen);
+      if ignore {
+        assert_eq!(query_error, error, "{}", what);
+      }
+      let mut done: IcQueryId = 0;
+      while ic_apid_conn_get_next_executed_query(conn, &mut done) {}
+      assert_eq!(ic_apid_conn_close_transaction(conn, trans), 0);
+      let seen_sql = mysql(&format!(
+        "SELECT val FROM {}.capi_prog WHERE id = 3",
+        IC_IT_DB
+      ));
+      assert_eq!(seen_sql, Some(after.to_string()), "{}", what);
+    }
+    // A program written an instruction at a time, with a loop: val is
+    // added 1 to input 0 times, and a negative count refused with 6001.
+    let mut steps: *mut IcInstructionBuilder = std::ptr::null_mut();
+    assert_eq!(ic_instructions_create(table, &mut steps), 0);
+    let again = ic_instructions_label(steps);
+    let done = ic_instructions_label(steps);
+    let negative = ic_instructions_label(steps);
+    assert_eq!(ic_instructions_read_column(steps, 0, val), 0);
+    assert_eq!(ic_instructions_read_input(steps, 1, 0), 0);
+    assert_eq!(ic_instructions_set_integer(steps, 2, 0), 0);
+    assert_eq!(ic_instructions_jump_if(steps, IC_CMP_LT, 1, 2, negative), 0);
+    assert_eq!(ic_instructions_place(steps, again), 0);
+    assert_eq!(ic_instructions_jump_if(steps, IC_CMP_GE, 2, 1, done), 0);
+    assert_eq!(ic_instructions_add_integer(steps, 0, 0, 1), 0);
+    assert_eq!(ic_instructions_add_integer(steps, 2, 2, 1), 0);
+    assert_eq!(ic_instructions_jump(steps, again), 0);
+    assert_eq!(ic_instructions_place(steps, done), 0);
+    assert_eq!(ic_instructions_write_column(steps, val, 0), 0);
+    assert_eq!(ic_instructions_accept(steps), 0);
+    assert_eq!(ic_instructions_place(steps, negative), 0);
+    assert_eq!(ic_instructions_refuse_with(steps, 6001), 0);
+    let mut looped: *mut IcProgram = std::ptr::null_mut();
+    let ret = ic_instructions_finish(steps, &mut looped);
+    assert_eq!(ret, 0, "finish: {}", message(ret));
+    assert!(ic_program_writes(looped));
+    assert_eq!(ic_program_inputs(looped), 1);
+    // An unknown comparison fails the finish; a null builder takes
+    // nothing and gives no label.
+    assert_eq!(ic_instructions_jump_if(steps, 99, 1, 2, done), 0);
+    let ret = ic_instructions_finish(steps, &mut refused);
+    assert_eq!(ret, IC_ERROR_BAD_PROGRAM);
+    ic_instructions_free(steps);
+    let none: *mut IcInstructionBuilder = std::ptr::null_mut();
+    assert_eq!(ic_instructions_accept(none), IC_ERROR_NULL_POINTER);
+    assert_eq!(ic_instructions_label(none), IC_PROGRAM_NONE);
+    assert_eq!(
+      ic_instructions_finish(none, &mut refused),
+      IC_ERROR_NULL_POINTER
+    );
+    ic_instructions_free(none);
+    // It has a code of its own: a scan refuses it.
+    assert_eq!(
+      ic_apid_conn_set_scan_program(conn, scan, looped),
+      IC_ERROR_NOT_SUPPORTED
+    );
+    assert_eq!(ic_apid_query_set_program(conn, query, looped), 0);
+    // Row 3's val is 32: five turns make it 37, a negative count is
+    // refused with the program's code, and a hundred thousand turns
+    // are more than the data node runs.
+    write.abort_option = IC_ABORT_DEFAULT;
+    for (turns, error, state, after) in [
+      (5, 0, IC_COMMIT_STATE_COMMITTED, "37"),
+      (-1, 6001, IC_COMMIT_STATE_ROLLED_BACK, "37"),
+      (
+        100_000,
+        IC_NDB_ERROR_PROGRAM_TOO_LONG,
+        IC_COMMIT_STATE_ROLLED_BACK,
+        "37",
+      ),
+      (0, 0, IC_COMMIT_STATE_COMMITTED, "37"),
+    ] {
+      assert_eq!(ic_apid_query_set_input(conn, query, 0, turns), 0);
+      let hint = ic_apid_conn_hint_for_key(conn, table, key_rec, key, len);
+      let mut trans: IcTransId = 0;
+      assert_eq!(
+        ic_apid_conn_start_transaction(conn, hint, table, &mut trans),
+        0
+      );
+      let ret = ic_apid_conn_write_key(conn, query, trans, &write);
+      assert_eq!(ret, 0, "define: {}", message(ret));
+      assert_eq!(ic_apid_conn_commit_transaction(conn, trans), 0);
+      assert_eq!(finish(conn, trans), state, "{} turns", turns);
+      let seen = [
+        ic_apid_query_error(conn, query),
+        ic_apid_transaction_error(conn, trans),
+      ];
+      assert!(seen.contains(&error), "{} turns: {:?}", turns, seen);
+      let mut done: IcQueryId = 0;
+      while ic_apid_conn_get_next_executed_query(conn, &mut done) {}
+      assert_eq!(ic_apid_conn_close_transaction(conn, trans), 0);
+      let seen_sql = mysql(&format!(
+        "SELECT val FROM {}.capi_prog WHERE id = 3",
+        IC_IT_DB
+      ));
+      assert_eq!(seen_sql, Some(after.to_string()), "{} turns", turns);
+    }
+    // Bitwise values: val = ((val XOR input 0) AND 0xFF) OR (1 << 9),
+    // with every bit inverted twice over. Row 3's val is 37.
+    assert_eq!(ic_program_builder_create(table, &mut builder), 0);
+    let column = ic_program_column(builder, val);
+    let with = ic_program_input(builder, 0);
+    let mixed = ic_program_bit_xor(builder, column, with);
+    let byte = ic_program_integer(builder, 0xFF);
+    let low = ic_program_bit_and(builder, mixed, byte);
+    let one = ic_program_integer(builder, 1);
+    let nine = ic_program_integer(builder, 9);
+    let high = ic_program_shift_left(builder, one, nine);
+    let both = ic_program_bit_or(builder, low, high);
+    let inverted = ic_program_bit_not(builder, both);
+    let back = ic_program_bit_not(builder, inverted);
+    let two = ic_program_integer(builder, 2);
+    let halved = ic_program_shift_right(builder, back, two);
+    assert_ne!(halved, IC_PROGRAM_NONE);
+    assert_eq!(ic_program_assign(builder, val, halved), 0);
+    let mut bits: *mut IcProgram = std::ptr::null_mut();
+    let ret = ic_program_builder_finish_no_condition(builder, &mut bits);
+    assert_eq!(ret, 0, "finish: {}", message(ret));
+    assert_eq!(
+      ic_program_bit_and(std::ptr::null_mut(), column, with),
+      IC_PROGRAM_NONE
+    );
+    ic_program_builder_free(builder);
+    // The same with instructions, on registers: val = (val AND 0xF0)
+    // shifted right by 4, XOR 1, OR input 0 shifted left by 8.
+    let mut steps: *mut IcInstructionBuilder = std::ptr::null_mut();
+    assert_eq!(ic_instructions_create(table, &mut steps), 0);
+    assert_eq!(ic_instructions_read_column(steps, 0, val), 0);
+    assert_eq!(ic_instructions_bit_and_integer(steps, 0, 0, 0xF0), 0);
+    assert_eq!(ic_instructions_shift_right_integer(steps, 0, 0, 4), 0);
+    assert_eq!(ic_instructions_bit_xor_integer(steps, 0, 0, 1), 0);
+    assert_eq!(ic_instructions_read_input(steps, 1, 0), 0);
+    assert_eq!(ic_instructions_set_integer(steps, 2, 8), 0);
+    assert_eq!(ic_instructions_shift_left(steps, 1, 1, 2), 0);
+    assert_eq!(ic_instructions_bit_or(steps, 0, 0, 1), 0);
+    assert_eq!(ic_instructions_bit_not(steps, 3, 0), 0);
+    assert_eq!(ic_instructions_bit_not(steps, 3, 3), 0);
+    assert_eq!(ic_instructions_bit_and(steps, 0, 0, 3), 0);
+    assert_eq!(ic_instructions_bit_xor(steps, 3, 3, 3), 0);
+    assert_eq!(ic_instructions_bit_or_integer(steps, 3, 3, 0), 0);
+    assert_eq!(ic_instructions_shift_left_integer(steps, 3, 3, 1), 0);
+    assert_eq!(ic_instructions_shift_right(steps, 3, 3, 2), 0);
+    assert_eq!(ic_instructions_write_column(steps, val, 0), 0);
+    assert_eq!(ic_instructions_accept(steps), 0);
+    let mut bit_steps: *mut IcProgram = std::ptr::null_mut();
+    let ret = ic_instructions_finish(steps, &mut bit_steps);
+    assert_eq!(ret, 0, "finish: {}", message(ret));
+    // A shift by 64 bits fails the finish.
+    assert_eq!(ic_instructions_shift_left_integer(steps, 0, 0, 64), 0);
+    let ret = ic_instructions_finish(steps, &mut refused);
+    assert_eq!(ret, IC_ERROR_BAD_PROGRAM);
+    ic_instructions_free(steps);
+    // 37 XOR 6 is 35, with bit 9 it is 547, and shifted right 136;
+    // then 0x80 of 136 shifted is 8, XOR 1 is 9, with 3 << 8 it is 777.
+    for (program, with, after) in [(bits, 6, "136"), (bit_steps, 3, "777")] {
+      assert_eq!(ic_apid_query_set_program(conn, query, program), 0);
+      assert_eq!(ic_apid_query_set_input(conn, query, 0, with), 0);
+      let hint = ic_apid_conn_hint_for_key(conn, table, key_rec, key, len);
+      let mut trans: IcTransId = 0;
+      assert_eq!(
+        ic_apid_conn_start_transaction(conn, hint, table, &mut trans),
+        0
+      );
+      let ret = ic_apid_conn_write_key(conn, query, trans, &write);
+      assert_eq!(ret, 0, "define: {}", message(ret));
+      assert_eq!(ic_apid_conn_commit_transaction(conn, trans), 0);
+      assert_eq!(finish(conn, trans), IC_COMMIT_STATE_COMMITTED);
+      let mut done: IcQueryId = 0;
+      while ic_apid_conn_get_next_executed_query(conn, &mut done) {}
+      assert_eq!(ic_apid_conn_close_transaction(conn, trans), 0);
+      let seen_sql = mysql(&format!(
+        "SELECT val FROM {}.capi_prog WHERE id = 3",
+        IC_IT_DB
+      ));
+      assert_eq!(seen_sql, Some(after.to_string()));
+    }
+    assert_eq!(ic_apid_query_set_program(conn, query, checks), 0);
+    ic_program_free(bit_steps);
+    ic_program_free(bits);
+    ic_program_free(looped);
+
     // cnt = cnt + input 0 through an executor, cnt read back after.
     assert_eq!(ic_program_builder_create(table, &mut builder), 0);
     let column = ic_program_column(builder, cnt);
@@ -1884,6 +2136,7 @@ fn c_api_programs_filter_scans_guard_updates_and_count() {
     ic_apid_submitter_free(submitter);
     ic_apid_executor_free(executor);
     ic_program_free(counter);
+    ic_program_free(checks);
     ic_program_free(guard);
     ic_program_free(filter);
     assert_eq!(ic_apid_query_free(conn, query), 0);

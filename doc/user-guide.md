@@ -598,14 +598,19 @@ bottom-up, each giving an id, and compiles them into a program:
 
 - values: a column, `column(id)`; a constant, `constant(&rec, row, id)`,
   the value column `id` has in a row laid out by `rec`; an integer,
-  `integer(n)`; an input, `input(n)`; and `add(a, b)` and
-  `subtract(a, b)`;
+  `integer(n)`; an input, `input(n)`; `add(a, b)` and
+  `subtract(a, b)`; and the bitwise ones, `bit_and(a, b)`,
+  `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`, `shift_left(a, count)`
+  and `shift_right(a, count)` ("Bitwise values" below);
 - conditions: `compare(cmp, a, b)` with `Cmp::Eq`, `Ne`, `Lt`, `Le`,
   `Gt` and `Ge` (`IC_CMP_EQ` and so on), `is_null(a)` and
   `is_not_null(a)`, joined by `and(x, y)`, `or(x, y)` and `not(x)`;
 - assignments, for an update: `assign(column, value)`, and
   `assign_if(column, value, cond)` for one that happens only where its
   own condition holds;
+- checks, for a key operation: `refuse_unless(cond, code)`, a condition
+  the row must meet and the code of your own the operation fails with
+  when it does not ("Checks" below);
 - then `finish(Some(top))`, or `finish(None)` for a program that only
   assigns (`ic_program_builder_finish`,
   `ic_program_builder_finish_no_condition`).
@@ -679,6 +684,202 @@ a condition that is true lets the row through. A conditional update is
 a program with a condition only, the new values in the attribute row
 as for any update.
 
+**Checks: codes of your own.** A program's one condition says only
+that the row missed it. A check is a condition with a code of the
+application's own, 6001 to 6999 (`IC_NDB_ERROR_OWN_FIRST` to
+`IC_NDB_ERROR_OWN_LAST`), and a program may have several:
+`b.refuse_unless(cond, code)` (`ic_program_refuse_unless`). They are
+made in the order given, before the program's condition and its
+assignments, and the operation fails with the code of the first its row
+misses, so the application knows which without reading the row. A
+check that is unknown, from a NULL, is missed.
+
+```rust
+// Take input 1 from val, if the row's code is input 0 and val is enough.
+let mut b = ProgramBuilder::new(&table);
+let code = b.column(code_id);
+let caller = b.input(0);
+let ours = b.compare(Cmp::Eq, code, caller);
+let val = b.column(val_id);
+let amount = b.input(1);
+let enough = b.compare(Cmp::Ge, val, amount);
+b.refuse_unless(ours, 6001);
+b.refuse_unless(enough, 6002);
+let left = b.subtract(val, amount);
+b.assign(val_id, left);
+let take = b.finish(None)?;
+```
+
+```c
+ret = ic_program_refuse_unless(
+    b, ic_program_compare(b, IC_CMP_EQ, ic_program_column(b, code_id),
+                          ic_program_input(b, 0)), 6001);
+ret = ic_program_refuse_unless(
+    b, ic_program_compare(b, IC_CMP_GE, ic_program_column(b, val_id),
+                          ic_program_input(b, 1)), 6002);
+ret = ic_program_assign(
+    b, val_id, ic_program_subtract(b, ic_program_column(b, val_id),
+                                   ic_program_input(b, 1)));
+ret = ic_program_builder_finish_no_condition(b, &take);
+```
+
+A check's code is the operation's error whatever its abort option, and
+the option alone decides what becomes of the transaction: where the
+operation aborts on error the transaction rolls back and says the code,
+where it ignores errors the operation fails alone with it. A row that
+is not there is still 626. The library knows nothing of what a code
+means: every one is a user error, permanent. A code outside the range
+fails the finish (`IC_ERROR_BAD_PROGRAM`); 6000 is the library's, for
+the program's condition. Checks are for reads, updates and deletes by
+primary key, as every program on a key operation is: a scan would end
+on such a code, so it refuses a program that has them
+(`IC_ERROR_NOT_SUPPORTED`).
+
+Where the transaction rolls back, every operation of it still waiting
+fails with the code too, as with any error that rolls a transaction
+back. The transaction's error says why it rolled back; the code on
+another operation does not say that operation's own check was missed.
+
+The data node ends a program that runs too long on a row and fails the
+operation with 886, whatever the program would have said. It counts
+what a program runs, a test of a column for more than an instruction on
+registers, up to about 16 000. The builder limits a program's length,
+not what it runs, so it takes programs that come to it: of checks of a
+column against a constant that all pass, 2600 ran and 2700 did not
+(RonDB 26.10.1, 2026-11-23).
+
+**Bitwise values.** `bit_and`, `bit_or`, `bit_xor`, `bit_not`,
+`shift_left` and `shift_right` work on integers of 64 bits, as the sums
+do, and stand wherever a value does: compared in a condition, or
+assigned to an integer column of 32 or 64 bits. A NULL in gives a NULL
+out. The rows whose `flags` have every bit of input 0:
+
+```rust
+let flags = b.column(flags_id);
+let mask = b.input(0);
+let masked = b.bit_and(flags, mask);
+let all_set = b.compare(Cmp::Eq, masked, mask);
+let filter = b.finish(Some(all_set))?;
+```
+
+```c
+IC_PROGRAM_VALUE flags = ic_program_column(b, flags_id);
+IC_PROGRAM_VALUE mask = ic_program_input(b, 0);
+IC_PROGRAM_VALUE masked = ic_program_bit_and(b, flags, mask);
+ret = ic_program_builder_finish(
+    b, ic_program_compare(b, IC_CMP_EQ, masked, mask), &filter);
+```
+
+- A shift's count is 0 to 63. An integer that is not fails the finish
+  (`IC_ERROR_BAD_PROGRAM`); a count a row or an input gives that is not
+  fails the operation with 891.
+- A shift right keeps the sign of a signed value, so -12 shifted by 2
+  is -3. A value of an unsigned column is unsigned, and is filled with
+  zeros. The count's sign counts as the value's does: a signed value
+  shifted by a count from an unsigned column is taken as unsigned and
+  filled with zeros too, so -12 shifted by such a 2 is
+  0x3FFFFFFFFFFFFFFD. Integers and inputs are signed.
+- A shift is made even where its answer is not needed: `is_not_null` of
+  a shift by a count that is none fails as any other use of it does.
+- `bit_not` inverts all 64 bits: of 12 it gives -13.
+
+**Instructions: programs with loops.** What a condition and its
+assignments cannot say, a loop first of all, is written an instruction
+at a time with an `InstructionBuilder` (`ic_instructions_create`). You
+say what goes into which of eight registers, numbered 0 to 7, where the
+labels stand, and which instruction jumps to which. Its `finish` gives
+a program as the other builder's, set on a query, a scan or a shape the
+same way, with the same inputs.
+
+- registers: `read_column(reg, column)` for an integer column,
+  `read_input(reg, n)`, `set_integer(reg, value)`, `set_null(reg)`;
+  `add(dest, a, b)`, `subtract(dest, a, b)`, and
+  `add_integer(dest, src, k)` and `subtract_integer(dest, src, k)` for
+  a constant up to 65535 in one instruction;
+- bits: `bit_and`, `bit_or`, `bit_xor` (`dest, a, b`), each with an
+  `_integer` form as the sums have, `bit_not(dest, src)`, and
+  `shift_left` and `shift_right` by a register's count or, as
+  `shift_left_integer` and `shift_right_integer`, by a count of 0 to
+  63;
+- `write_column(column, reg)` into an integer column of 32 or 64 bits,
+  on an update only;
+- labels: `label()` makes one, `place(label)` puts it before the next
+  instruction, once. A label is good in the builder that made it and
+  refused in another;
+- jumps: `jump(label)`, `jump_if(cmp, a, b, label)` on two registers,
+  `jump_if_null(reg, label)` and `jump_if_value(reg, label)`. A jump to
+  a label placed before it goes backwards, which is a loop;
+- endings: `accept()`; `refuse()`, as a missed condition, 6000 or 626
+  by the abort option and a row passed over in a scan; and
+  `refuse_with(code)` with a code of your own, 6001 to 6999, on key
+  operations only.
+
+This one sets `w` to `val` times `n` by adding, and refuses a negative
+`n` with 6001:
+
+```rust
+let mut b = InstructionBuilder::new(&table);
+let (again, done, negative) = (b.label(), b.label(), b.label());
+b.read_column(0, val_id);      // r0 = val
+b.read_column(1, n_id);        // r1 = n
+b.set_integer(2, 0);           // r2 = the sum
+b.set_integer(3, 0);           // r3 = the turns done
+b.jump_if(Cmp::Lt, 1, 3, negative);
+b.place(again);
+b.jump_if(Cmp::Ge, 3, 1, done);
+b.add(2, 2, 0);
+b.add_integer(3, 3, 1);
+b.jump(again);                 // backwards
+b.place(done);
+b.write_column(w_id, 2);
+b.accept();
+b.place(negative);
+b.refuse_with(6001);
+let program = b.finish()?;
+```
+
+```c
+IC_INSTRUCTION_BUILDER *b;
+ret = ic_instructions_create(table, &b);
+IC_PROGRAM_LABEL again = ic_instructions_label(b);
+IC_PROGRAM_LABEL done = ic_instructions_label(b);
+IC_PROGRAM_LABEL negative = ic_instructions_label(b);
+ic_instructions_read_column(b, 0, val_id);
+ic_instructions_read_column(b, 1, n_id);
+ic_instructions_set_integer(b, 2, 0);
+ic_instructions_set_integer(b, 3, 0);
+ic_instructions_jump_if(b, IC_CMP_LT, 1, 3, negative);
+ic_instructions_place(b, again);
+ic_instructions_jump_if(b, IC_CMP_GE, 3, 1, done);
+ic_instructions_add(b, 2, 2, 0);
+ic_instructions_add_integer(b, 3, 3, 1);
+ic_instructions_jump(b, again);
+ic_instructions_place(b, done);
+ic_instructions_write_column(b, w_id, 2);
+ic_instructions_accept(b);
+ic_instructions_place(b, negative);
+ic_instructions_refuse_with(b, 6001);
+ret = ic_instructions_finish(b, &program);
+ic_instructions_free(b);
+```
+
+The library checks what it can when the program is finished: registers,
+inputs, columns and codes that are what they must be, every label a
+jump goes to placed, and a last instruction that is an ending or a
+jump (`IC_ERROR_BAD_PROGRAM`, `IC_ERROR_NO_SUCH_FIELD`,
+`IC_ERROR_NOT_SUPPORTED`, and `IC_ERROR_CONDITION_TOO_COMPLEX` for one
+too long). The rest is the program's own to get right, and the data
+node says so where it is not:
+
+- a register holds nothing to count on before the program puts
+  something there, and a column read into one may be NULL. Comparing a
+  NULL register fails the operation with 878: test it first with
+  `jump_if_null`;
+- a loop that does not end, or runs too long, fails the operation with
+  886, and a scan ends with it. Each turn of the loop above is four
+  instructions: 3996 turns ran and 3997 did not (RonDB 26.10.1,
+  2026-11-24).
+
 **Reading after an update.** An update can read columns back after its
 program has run, into a row of their own laid out by a record of their
 own: `query.set_reads_after(Some(&rec))` and `query.after_row()`
@@ -703,7 +904,8 @@ operations (`IC_ERROR_BAD_PROGRAM`).
 
 The `conditional_update` example runs an optimistic update, once
 committed and once refused with 6000, a counter read back after its
-update, and a scan with a filter.
+update, a scan with a filter, and an update with two checks, refused
+with 6001 and with 6002 and then committed.
 
 ## 7. AUTO_INCREMENT and tables without a primary key
 
@@ -1008,7 +1210,11 @@ asked for once it has completed.
 | 626 | no row with that key; or a program's condition did not hold, on an operation that ignores errors | user |
 | 630 | a row with that key is there already | user |
 | 893 | the row would break a unique index; the error data names it | user |
+| 878 | a program compared a register that was NULL | user |
+| 886 | a program ran too long on a row and the data node ended it | user |
+| 891 | a program shifted by a count of bits that is not 0 to 63 | user |
 | 6000 | a program's condition did not hold, on an operation that aborts on error | user |
+| 6001–6999 | the row missed a check of a program, which refused it with this code of the application's own | user |
 | 241, 283, 284, 709, 710, 723 | the table or index changed or went since it was bound | user: bind again |
 | 266 | a lock wait timed out, probably a deadlock | temporary |
 | 274, 296 | a scan waited too long for a lock; a scan's batch was kept too long | temporary |

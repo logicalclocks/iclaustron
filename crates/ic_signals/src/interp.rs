@@ -18,7 +18,10 @@
 //! **A jump's distance is in words, from the jump's first word**, and
 //! is known only once the place it goes to is: [`ProgramWriter`] hands
 //! out labels, and puts the distances in when the program is finished.
-//! Every jump goes forward, as every jump seen on the wire does.
+//! A jump goes forward unless the writer is told that its program may
+//! jump backwards ([`ProgramWriter::allow_backward`]): bit 31 then says
+//! the distance is backwards, and a program can loop. The data node
+//! ends a program that runs too long on a row (886).
 //!
 //! **A column test compares the value in the program, or another
 //! column, with the column, the value first**: `Lt` jumps when the
@@ -32,7 +35,9 @@
 //! code: a scan skips the row on 626, and a key operation fails with
 //! the code. Ours refuse with 626 where a missed condition is not to
 //! abort and with 6000 where it is ([`IC_REFUSE_NO_ROW`],
-//! [`IC_REFUSE_CONDITION`]).
+//! [`IC_REFUSE_CONDITION`]). A program may also refuse with codes of the
+//! application's own, 6001 to 6999, one for each of its checks
+//! ([`IC_REFUSE_OWN_FIRST`], [`IC_REFUSE_OWN_LAST`]).
 //!
 //! **The column section of an interpreted operation** begins with five
 //! sizes: the reads before the program, the program, the updates after
@@ -92,6 +97,26 @@ pub const IC_INSN_JUMP_IF_COLUMN_NULL: u32 = 24;
 pub const IC_INSN_JUMP_IF_COLUMN_VALUE: u32 = 25;
 /// Jump on the column in word 2 compared with another column.
 pub const IC_INSN_TEST_COLUMN_COLUMN: u32 = 27;
+/// R3 = R1 shifted left by R2 bits, 0 to 63; NULL if either is. Its
+/// number plus 64 shifts by the field (see [`BitOp`]).
+pub const IC_INSN_SHIFT_LEFT: u32 = 28;
+/// R3 = R1 shifted right by R2 bits, 0 to 63, the sign kept for a
+/// signed value; NULL if either is.
+pub const IC_INSN_SHIFT_RIGHT: u32 = 29;
+/// R3 = R1 AND R2, bit by bit; NULL if either is.
+pub const IC_INSN_BIT_AND: u32 = 32;
+/// R3 = R1 OR R2, bit by bit; NULL if either is.
+pub const IC_INSN_BIT_OR: u32 = 33;
+/// R3 = R1 XOR R2, bit by bit; NULL if either is.
+pub const IC_INSN_BIT_XOR: u32 = 34;
+/// R3 = R1 with every bit inverted; NULL if R1 is.
+pub const IC_INSN_BIT_NOT: u32 = 36;
+/// What an instruction's number gains when the field stands for its
+/// second register: 28, 29 and 32 to 34 become 92, 93 and 96 to 98, as 7
+/// and 8 become 71 and 72.
+pub const IC_INSN_IMM: u32 = 64;
+/// The most bits a shift shifts by; more fails the program with 891.
+pub const IC_MAX_SHIFT: u32 = 63;
 /// R3 = R1 + the field, unsigned; NULL if R1 is.
 pub const IC_INSN_ADD_IMM: u32 = 71;
 /// R3 = R1 − the field, unsigned; NULL if R1 is.
@@ -120,10 +145,18 @@ pub const IC_REFUSE_NO_ROW: u16 = 626;
 /// that the condition failed. Ours, the first of the range NDB keeps
 /// for programs' own codes. Verify: chapter 05 §9.4, §9.8.
 pub const IC_REFUSE_CONDITION: u16 = 6000;
+/// The first of the codes an application's program may refuse with by
+/// its own choice: the rest of the range NDB keeps for programs, 6000
+/// being ours. A key operation fails with the code whatever its abort
+/// option; a scan would end with it. Verify: chapter 05 §9.4.
+pub const IC_REFUSE_OWN_FIRST: u16 = 6001;
+/// The last of the codes of an application's own.
+pub const IC_REFUSE_OWN_LAST: u16 = 6999;
 
-/// The longest jump, in words: bits 16–30 hold it. Bit 31 would make it
-/// a jump backwards, which no program of ours makes.
+/// The longest jump, in words: bits 16–30 hold it.
 const IC_MAX_JUMP: u32 = 0x7FFF;
+/// The bit of a jump's word that makes its distance one backwards.
+const IC_JUMP_BACKWARD: u32 = 1 << 31;
 /// The largest column id, value length or constant the field holds.
 const IC_MAX_FIELD: u32 = 0xFFFF;
 /// A label not yet placed.
@@ -184,10 +217,50 @@ pub enum RegCmp {
   Ge = 5,
 }
 
+/// What a bitwise instruction does with R1 and R2, or with R1 and the
+/// field: its instruction's number. A value read from an unsigned
+/// column is unsigned, and so is a result with such a value in it; a
+/// shift right of an unsigned value fills with zeros, of a signed one
+/// with its sign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum BitOp {
+  /// R1 shifted left by the second.
+  ShiftLeft = IC_INSN_SHIFT_LEFT,
+  /// R1 shifted right by the second.
+  ShiftRight = IC_INSN_SHIFT_RIGHT,
+  /// R1 AND the second.
+  And = IC_INSN_BIT_AND,
+  /// R1 OR the second.
+  Or = IC_INSN_BIT_OR,
+  /// R1 XOR the second.
+  Xor = IC_INSN_BIT_XOR,
+}
+
+impl BitOp {
+  /// True for the two shifts.
+  pub fn is_shift(self) -> bool {
+    matches!(self, BitOp::ShiftLeft | BitOp::ShiftRight)
+  }
+}
+
 /// A place in a program that jumps go to, handed out before it is
 /// placed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Label(u32);
+
+impl Label {
+  /// The label a number names, as the C API passes one. One its writer
+  /// did not hand out is refused where it is used.
+  pub fn from_u32(number: u32) -> Label {
+    Label(number)
+  }
+
+  /// The label's number in its writer.
+  pub fn as_u32(self) -> u32 {
+    self.0
+  }
+}
 
 /// A jump waiting for its label's place.
 #[derive(Clone, Copy, Debug)]
@@ -241,6 +314,8 @@ pub struct ProgramWriter {
   /// Where each label is placed, as a word index.
   labels: Vec<u32>,
   jumps: Vec<Jump>,
+  /// Jumps may go backwards.
+  backward: bool,
   error: Option<IcError>,
 }
 
@@ -270,7 +345,16 @@ impl ProgramWriter {
     self.words.clear();
     self.labels.clear();
     self.jumps.clear();
+    self.backward = false;
     self.error = None;
+  }
+
+  /// Let the program's jumps go backwards as well as forwards, to a
+  /// label placed before them: a loop. Without it a jump backwards is
+  /// the caller's mistake, since a program compiled from a condition
+  /// has none.
+  pub fn allow_backward(&mut self) {
+    self.backward = true;
   }
 
   /// The words written so far; the jumps have their distances only
@@ -295,6 +379,20 @@ impl ProgramWriter {
     Label(self.labels.len() as u32 - 1)
   }
 
+  /// The labels handed out.
+  pub fn label_count(&self) -> u32 {
+    self.labels.len() as u32
+  }
+
+  /// The word `label` is placed at, once it is; `None` also for a
+  /// label that is not this writer's.
+  pub fn place_of(&self, label: Label) -> Option<u32> {
+    match self.labels.get(label.0 as usize) {
+      Some(&at) if at != IC_LABEL_UNPLACED => Some(at),
+      _ => None,
+    }
+  }
+
   /// Place `label` at the next instruction.
   pub fn place(&mut self, label: Label) {
     let index = label.0 as usize;
@@ -314,14 +412,22 @@ impl ProgramWriter {
     for jump in &self.jumps {
       let label = jump.label.0 as usize;
       let to = self.labels.get(label).copied().unwrap_or(IC_LABEL_UNPLACED);
-      if to == IC_LABEL_UNPLACED || to <= jump.at {
+      // A jump to itself would only use the row's instructions up.
+      if to == IC_LABEL_UNPLACED || to == jump.at {
         return Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA));
       }
-      let distance = to - jump.at;
+      if to < jump.at && !self.backward {
+        return Err(IcError::new(err::IC_ERROR_INCONSISTENT_DATA));
+      }
+      let distance = to.abs_diff(jump.at);
       if distance > IC_MAX_JUMP {
         return Err(IcError::new(err::IC_ERROR_RECORD_SIZE_TOO_BIG));
       }
-      self.words[jump.at as usize] |= distance << 16;
+      let mut word = distance << 16;
+      if to < jump.at {
+        word |= IC_JUMP_BACKWARD;
+      }
+      self.words[jump.at as usize] |= word;
     }
     self.jumps.clear();
     Ok(())
@@ -396,6 +502,30 @@ impl ProgramWriter {
   /// R`dest` = R`src` − `value`.
   pub fn subtract_imm(&mut self, dest: u32, src: u32, value: u16) {
     self.arith_imm(IC_INSN_SUBTRACT_IMM, dest, src, value);
+  }
+
+  /// R`dest` = R`a` `op` R`b`.
+  pub fn bits(&mut self, op: BitOp, dest: u32, a: u32, b: u32) {
+    self.check_reg(dest);
+    self.check_reg(a);
+    self.check_reg(b);
+    self.push(insn_word(op as u32) | r1(a) | r2(b) | r3(dest));
+  }
+
+  /// R`dest` = R`src` `op` `value`, unsigned; a shift's `value` is 0 to
+  /// 63.
+  pub fn bits_imm(&mut self, op: BitOp, dest: u32, src: u32, value: u16) {
+    if op.is_shift() && u32::from(value) > IC_MAX_SHIFT {
+      self.fail(err::IC_ERROR_BAD_PROGRAM);
+    }
+    self.arith_imm(op as u32 + IC_INSN_IMM, dest, src, value);
+  }
+
+  /// R`dest` = R`src` with every bit inverted.
+  pub fn bit_not(&mut self, dest: u32, src: u32) {
+    self.check_reg(dest);
+    self.check_reg(src);
+    self.push(insn_word(IC_INSN_BIT_NOT) | r1(src) | r3(dest));
   }
 
   /// Jump to `to`.
@@ -1014,6 +1144,77 @@ mod tests {
   }
 
   #[test]
+  fn bitwise_instructions_have_their_result_in_the_third_register() {
+    let mut w = ProgramWriter::new();
+    // r3 = r1 AND r2, where a sum's result is in bits 16-18.
+    w.bits(BitOp::And, 3, 1, 2);
+    w.bits(BitOp::Or, 0, 7, 6);
+    w.bits(BitOp::Xor, 5, 5, 4);
+    w.bits(BitOp::ShiftLeft, 2, 2, 1);
+    w.bits(BitOp::ShiftRight, 2, 2, 1);
+    w.bit_not(4, 3);
+    // With the field: 64 more, which sets bit 15.
+    w.bits_imm(BitOp::And, 3, 1, 0xFF00);
+    w.bits_imm(BitOp::Or, 3, 1, 1);
+    w.bits_imm(BitOp::Xor, 3, 1, 0xFFFF);
+    w.bits_imm(BitOp::ShiftLeft, 3, 1, 63);
+    w.bits_imm(BitOp::ShiftRight, 3, 1, 0);
+    w.accept();
+    w.finish().expect("finish");
+    assert_eq!(
+      w.words()[..11],
+      [
+        32 | (1 << 6) | (2 << 9) | (3 << 12),
+        33 | (7 << 6) | (6 << 9),
+        34 | (5 << 6) | (4 << 9) | (5 << 12),
+        28 | (2 << 6) | (1 << 9) | (2 << 12),
+        29 | (2 << 6) | (1 << 9) | (2 << 12),
+        36 | (3 << 6) | (4 << 12),
+        0xFF00_8000 | 32 | (1 << 6) | (3 << 12),
+        0x0001_8000 | 33 | (1 << 6) | (3 << 12),
+        0xFFFF_8000 | 34 | (1 << 6) | (3 << 12),
+        0x003F_8000 | 28 | (1 << 6) | (3 << 12),
+        0x0000_8000 | 29 | (1 << 6) | (3 << 12),
+      ]
+    );
+    // A shift by more than 63 bits, and a ninth register.
+    w.clear();
+    w.bits_imm(BitOp::ShiftLeft, 0, 0, 64);
+    w.accept();
+    let e = w.finish().expect_err("shift");
+    assert_eq!(e.code, err::IC_ERROR_BAD_PROGRAM);
+    w.clear();
+    w.bit_not(8, 0);
+    w.accept();
+    let e = w.finish().expect_err("register");
+    assert_eq!(e.code, err::IC_ERROR_CONDITION_TOO_COMPLEX);
+  }
+
+  #[test]
+  fn a_jump_backwards_has_bit_31_and_its_distance() {
+    // A loop: r1 = r1 + 1 until r1 >= r2, then accept. The jump at
+    // word 2 goes forward 2 words, the one at word 3 back 2.
+    let mut w = ProgramWriter::new();
+    w.allow_backward();
+    let again = w.new_label();
+    let done = w.new_label();
+    w.set_16(1, 0);
+    w.place(again);
+    assert_eq!(w.place_of(again), Some(1));
+    assert_eq!(w.place_of(done), None);
+    assert_eq!(w.label_count(), 2);
+    w.add_imm(1, 1, 1);
+    w.jump_if(RegCmp::Ge, 1, 2, done);
+    w.jump(again);
+    w.place(done);
+    w.accept();
+    w.finish().expect("finish");
+    assert_eq!(w.words()[2], (2 << 16) | 17 | (1 << 6) | (2 << 9));
+    assert_eq!(w.words()[3], (1 << 31) | (2 << 16) | 9);
+    assert_eq!(w.words()[4], 18);
+  }
+
+  #[test]
   fn what_cannot_be_encoded_is_refused_at_the_finish() {
     let mut w = ProgramWriter::new();
     w.read_column(8, 1);
@@ -1044,13 +1245,33 @@ mod tests {
     w.place(to);
     let e = w.finish().expect_err("placed twice");
     assert_eq!(e.code, err::IC_ERROR_INCONSISTENT_DATA);
-    // A jump backwards, which no program of ours makes.
+    // A jump backwards, which a program is to allow first, and a jump
+    // to itself, which none may make.
     w.clear();
     let to = w.new_label();
     w.place(to);
+    w.accept();
     w.jump(to);
     let e = w.finish().expect_err("backwards");
     assert_eq!(e.code, err::IC_ERROR_INCONSISTENT_DATA);
+    w.clear();
+    w.allow_backward();
+    let to = w.new_label();
+    w.place(to);
+    w.jump(to);
+    let e = w.finish().expect_err("to itself");
+    assert_eq!(e.code, err::IC_ERROR_INCONSISTENT_DATA);
+    // A jump backwards further than bits 16-30 reach.
+    w.clear();
+    w.allow_backward();
+    let to = w.new_label();
+    w.place(to);
+    for _ in 0..0x8000 {
+      w.accept();
+    }
+    w.jump(to);
+    let e = w.finish().expect_err("far back");
+    assert_eq!(e.code, err::IC_ERROR_RECORD_SIZE_TOO_BIG);
     // A jump further than bits 16-30 reach.
     w.clear();
     let to = w.new_label();

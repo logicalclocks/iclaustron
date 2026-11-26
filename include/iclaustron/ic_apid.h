@@ -35,8 +35,9 @@
  * Handles. IC_APID_GLOBAL, IC_APID_CONNECTION, IC_TABLE_DEF,
  * IC_INDEX_DEF, IC_RECORD, IC_APID_EXECUTOR, IC_APID_SUBMITTER,
  * IC_OP_SHAPE, IC_REQUEST, IC_SCAN_SHAPE, IC_SCAN_READER,
- * IC_PROGRAM_BUILDER, IC_PROGRAM and IC_BLOB_VALUES are made by one
- * function and given back to their _free; the caller owns each until
+ * IC_PROGRAM_BUILDER, IC_INSTRUCTION_BUILDER, IC_PROGRAM and
+ * IC_BLOB_VALUES are made by one function and given back to their
+ * _free; the caller owns each until
  * then. A connection, and an executor, is freed before its global; a
  * table, index or record handle may outlive the connection that made
  * it, a query or scan keeps what it needs of its records, a request or
@@ -51,7 +52,8 @@
  * back, is refused with an error or passed over, never taken for
  * another: a later query, transaction, scan or batch always has an id
  * of its own. A program's values (IC_PROGRAM_VALUE) and conditions
- * (IC_PROGRAM_COND) are ids in their builder.
+ * (IC_PROGRAM_COND) are ids in their builder, and its labels
+ * (IC_PROGRAM_LABEL) numbers in theirs.
  *
  * Rows. A query owns its rows: ic_apid_query_key_row() and
  * ic_apid_query_attr_row() give pointers valid until the query is
@@ -537,6 +539,36 @@
 #define IC_NDB_ERROR_CONDITION 6000
 
 /*
+ The first of the codes a program's checks may refuse with, the
+ application's own: `ic_program_refuse_unless` takes a code from this
+ to `IC_NDB_ERROR_OWN_LAST`, and an operation whose row misses the
+ check fails with it (NDB's range for programs, after ours).
+ */
+#define IC_NDB_ERROR_OWN_FIRST 6001
+
+/*
+ The last of the codes of the application's own.
+ */
+#define IC_NDB_ERROR_OWN_LAST 6999
+
+/*
+ A program compared a register that was NULL (an NDB error).
+ */
+#define IC_NDB_ERROR_PROGRAM_NULL_REGISTER 878
+
+/*
+ A program ran too long on a row, as a loop that does not end does,
+ and the data node ended it (an NDB error).
+ */
+#define IC_NDB_ERROR_PROGRAM_TOO_LONG 886
+
+/*
+ A program shifted by a count of bits that is not 0 to 63 (an NDB
+ error).
+ */
+#define IC_NDB_ERROR_PROGRAM_SHIFT 891
+
+/*
  A text that is not a connectstring.
  */
 #define IC_ERROR_PARSE_CONNECTSTRING 7056
@@ -766,6 +798,12 @@
 #define IC_PROGRAM_INPUTS 16
 
 /*
+ The registers a program written an instruction at a time has,
+ numbered from 0.
+ */
+#define IC_PROGRAM_REGISTERS 8
+
+/*
  A value or condition a builder could not make, from a null builder or
  record or an unknown comparison; using it fails the finish with
  `IC_ERROR_BAD_PROGRAM`.
@@ -804,6 +842,12 @@ typedef struct IC_BLOB_VALUES IC_BLOB_VALUES;
  A unique index's description (`IC_INDEX_DEF`). Opaque.
  */
 typedef struct IC_INDEX_DEF IC_INDEX_DEF;
+
+/*
+ A program being written an instruction at a time over a table, its
+ labels named by numbers in it (`IC_INSTRUCTION_BUILDER`). Opaque.
+ */
+typedef struct IC_INSTRUCTION_BUILDER IC_INSTRUCTION_BUILDER;
 
 /*
  The shape of a key operation: a table, or a unique index of it, and
@@ -1303,6 +1347,11 @@ typedef uint32_t IC_PROGRAM_VALUE;
  A condition's id in its program builder (`IC_PROGRAM_COND`).
  */
 typedef uint32_t IC_PROGRAM_COND;
+
+/*
+ A label's number in its instruction builder (`IC_PROGRAM_LABEL`).
+ */
+typedef uint32_t IC_PROGRAM_LABEL;
 
 /*
  What is called when a query completes (`IC_APID_CALLBACK`): on the
@@ -3832,6 +3881,75 @@ IC_PROGRAM_VALUE ic_program_subtract(IC_PROGRAM_BUILDER *builder,
                                      IC_PROGRAM_VALUE b);
 
 /*
+ `a AND b`, bit by bit, NULL if either is.
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+IC_PROGRAM_VALUE ic_program_bit_and(IC_PROGRAM_BUILDER *builder,
+                                    IC_PROGRAM_VALUE a,
+                                    IC_PROGRAM_VALUE b);
+
+/*
+ `a OR b`, bit by bit, NULL if either is.
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+IC_PROGRAM_VALUE ic_program_bit_or(IC_PROGRAM_BUILDER *builder,
+                                   IC_PROGRAM_VALUE a,
+                                   IC_PROGRAM_VALUE b);
+
+/*
+ `a XOR b`, bit by bit, NULL if either is.
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+IC_PROGRAM_VALUE ic_program_bit_xor(IC_PROGRAM_BUILDER *builder,
+                                    IC_PROGRAM_VALUE a,
+                                    IC_PROGRAM_VALUE b);
+
+/*
+ `a` shifted left by `count` bits, 0 to 63, NULL if either is. An
+ integer beyond fails the finish (`IC_ERROR_BAD_PROGRAM`), a value
+ beyond the operation (`IC_NDB_ERROR_PROGRAM_SHIFT`).
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+IC_PROGRAM_VALUE ic_program_shift_left(IC_PROGRAM_BUILDER *builder,
+                                       IC_PROGRAM_VALUE a,
+                                       IC_PROGRAM_VALUE count);
+
+/*
+ `a` shifted right by `count` bits, 0 to 63, NULL if either is. A
+ signed value keeps its sign; one of an unsigned column is filled with
+ zeros.
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+IC_PROGRAM_VALUE ic_program_shift_right(IC_PROGRAM_BUILDER *builder,
+                                        IC_PROGRAM_VALUE a,
+                                        IC_PROGRAM_VALUE count);
+
+/*
+ `a` with every bit inverted, NULL if it is.
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+IC_PROGRAM_VALUE ic_program_bit_not(IC_PROGRAM_BUILDER *builder,
+                                    IC_PROGRAM_VALUE a);
+
+/*
  `a` compared with `b` as `cmp`, one of the `IC_CMP_*` values, says;
  unknown if either is NULL. `IC_PROGRAM_NONE` for another `cmp`.
 
@@ -3923,6 +4041,27 @@ int32_t ic_program_assign_if(IC_PROGRAM_BUILDER *builder,
                              IC_PROGRAM_COND cond);
 
 /*
+ A check: unless `cond` is true the program refuses the row with
+ `code`, a code of the application's own, `IC_NDB_ERROR_OWN_FIRST` to
+ `IC_NDB_ERROR_OWN_LAST`, so that a failed operation says which check
+ its row missed. Checks are made in the order given, before the
+ program's condition and its assignments, and the first the row
+ misses decides the code; a condition that is unknown, from a NULL,
+ is missed. The operation fails with the code whatever its abort
+ option, which alone decides whether its transaction is rolled back.
+ A program with checks runs on key operations only: a scan refuses it
+ (`IC_ERROR_NOT_SUPPORTED`). What is wrong, another code among it,
+ comes back from the finish (`IC_ERROR_BAD_PROGRAM`).
+
+ # Safety
+
+ As `ic_program_column`.
+ */
+int32_t ic_program_refuse_unless(IC_PROGRAM_BUILDER *builder,
+                                 IC_PROGRAM_COND cond,
+                                 uint32_t code);
+
+/*
  Compile the condition `top` with the builder's assignments into a
  program, which any number of operations may run, each with its own
  inputs. The builder stays, and may finish another.
@@ -3956,6 +4095,421 @@ int32_t ic_program_builder_finish(IC_PROGRAM_BUILDER *builder,
  */
 int32_t ic_program_builder_finish_no_condition(IC_PROGRAM_BUILDER *builder,
                                                IC_PROGRAM **program);
+
+/*
+ A builder of a program over a table, written an instruction at a
+ time (chapter 04, "Instructions"): what goes into which of the
+ `IC_PROGRAM_REGISTERS` registers, where the labels stand, and which
+ instruction jumps to which, forwards or backwards. It is for what a
+ condition and its assignments cannot say, a loop first of all; an
+ `IC_PROGRAM_BUILDER` is told what must hold and lays the
+ instructions out itself. `ic_instructions_finish` gives the program,
+ an `IC_PROGRAM` as the other builder's, run the same way.
+
+ A register holds an integer of 64 bits or NULL, and nothing a
+ program can count on before it puts something there. A comparison
+ of a NULL register fails the program
+ (`IC_NDB_ERROR_PROGRAM_NULL_REGISTER`). The data node ends a program
+ that runs too long on a row (`IC_NDB_ERROR_PROGRAM_TOO_LONG`), so a
+ loop that does not end fails its operation, or ends its scan.
+
+ What is wrong, a register beyond the eighth, a column the table
+ lacks, a label that is not the builder's, is kept as the builder's
+ error, which the finish gives; each function returns 0 unless its
+ builder is null (`IC_ERROR_NULL_POINTER`).
+
+ The builder is the caller's, freed with `ic_instructions_free`; one
+ thread uses it at a time.
+
+ # Safety
+
+ `def` is a table handle not yet freed; `builder` points to writable
+ storage for a pointer.
+ */
+int32_t ic_instructions_create(const IC_TABLE_DEF *def,
+                               IC_INSTRUCTION_BUILDER **builder);
+
+/*
+ Free an instruction builder handle. The programs it finished stay.
+
+ # Safety
+
+ A non-null `builder` is an instruction builder handle not yet freed,
+ freed here.
+ */
+void ic_instructions_free(IC_INSTRUCTION_BUILDER *builder);
+
+/*
+ A new label, to be placed once and jumped to from anywhere, before
+ or after it is placed; `IC_PROGRAM_NONE` for a null builder.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+IC_PROGRAM_LABEL ic_instructions_label(IC_INSTRUCTION_BUILDER *builder);
+
+/*
+ Place `label` before the next instruction.
+
+ # Safety
+
+ A non-null `builder` is an instruction builder handle not yet freed,
+ used by this thread alone.
+ */
+int32_t ic_instructions_place(IC_INSTRUCTION_BUILDER *builder,
+                              IC_PROGRAM_LABEL label);
+
+/*
+ R`reg` = the row's value of `column`, an integer column; NULL if
+ the column is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_read_column(IC_INSTRUCTION_BUILDER *builder,
+                                    uint32_t reg,
+                                    uint32_t column);
+
+/*
+ `column` = R`reg`, cut to the column's size; NULL if the register
+ is. An integer column of 32 or 64 bits; a program that writes runs
+ only on an update.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_write_column(IC_INSTRUCTION_BUILDER *builder,
+                                     uint32_t column,
+                                     uint32_t reg);
+
+/*
+ R`reg` = NULL.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_set_null(IC_INSTRUCTION_BUILDER *builder, uint32_t reg);
+
+/*
+ R`reg` = `value`.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_set_integer(IC_INSTRUCTION_BUILDER *builder,
+                                    uint32_t reg,
+                                    int64_t value);
+
+/*
+ R`reg` = input `input`, 0 to 15, which each operation sets.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_read_input(IC_INSTRUCTION_BUILDER *builder,
+                                   uint32_t reg,
+                                   uint32_t input);
+
+/*
+ R`dest` = R`a` + R`b`; NULL if either is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_add(IC_INSTRUCTION_BUILDER *builder,
+                            uint32_t dest,
+                            uint32_t a,
+                            uint32_t b);
+
+/*
+ R`dest` = R`a` - R`b`; NULL if either is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_subtract(IC_INSTRUCTION_BUILDER *builder,
+                                 uint32_t dest,
+                                 uint32_t a,
+                                 uint32_t b);
+
+/*
+ R`dest` = R`src` + `value`, in one instruction; NULL if R`src` is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_add_integer(IC_INSTRUCTION_BUILDER *builder,
+                                    uint32_t dest,
+                                    uint32_t src,
+                                    uint16_t value);
+
+/*
+ R`dest` = R`src` - `value`, in one instruction; NULL if R`src` is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_subtract_integer(IC_INSTRUCTION_BUILDER *builder,
+                                         uint32_t dest,
+                                         uint32_t src,
+                                         uint16_t value);
+
+/*
+ R`dest` = R`a` AND R`b`, bit by bit; NULL if either is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_and(IC_INSTRUCTION_BUILDER *builder,
+                                uint32_t dest,
+                                uint32_t a,
+                                uint32_t b);
+
+/*
+ R`dest` = R`src` AND `value`, bit by bit, in one instruction; NULL
+ if R`src` is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_and_integer(IC_INSTRUCTION_BUILDER *builder,
+                                        uint32_t dest,
+                                        uint32_t src,
+                                        uint16_t value);
+
+/*
+ R`dest` = R`a` OR R`b`, bit by bit; NULL if either is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_or(IC_INSTRUCTION_BUILDER *builder,
+                               uint32_t dest,
+                               uint32_t a,
+                               uint32_t b);
+
+/*
+ R`dest` = R`src` OR `value`, bit by bit, in one instruction; NULL
+ if R`src` is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_or_integer(IC_INSTRUCTION_BUILDER *builder,
+                                       uint32_t dest,
+                                       uint32_t src,
+                                       uint16_t value);
+
+/*
+ R`dest` = R`a` XOR R`b`, bit by bit; NULL if either is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_xor(IC_INSTRUCTION_BUILDER *builder,
+                                uint32_t dest,
+                                uint32_t a,
+                                uint32_t b);
+
+/*
+ R`dest` = R`src` XOR `value`, bit by bit, in one instruction; NULL
+ if R`src` is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_xor_integer(IC_INSTRUCTION_BUILDER *builder,
+                                        uint32_t dest,
+                                        uint32_t src,
+                                        uint16_t value);
+
+/*
+ R`dest` = R`src` with every bit inverted; NULL if R`src` is.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_bit_not(IC_INSTRUCTION_BUILDER *builder,
+                                uint32_t dest,
+                                uint32_t src);
+
+/*
+ R`dest` = R`a` shifted left by R`count` bits; NULL if either is. A
+ count that is not 0 to 63 fails the program
+ (`IC_NDB_ERROR_PROGRAM_SHIFT`).
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_shift_left(IC_INSTRUCTION_BUILDER *builder,
+                                   uint32_t dest,
+                                   uint32_t a,
+                                   uint32_t count);
+
+/*
+ R`dest` = R`src` shifted left by `count` bits, 0 to 63, in one
+ instruction; NULL if R`src` is. Another count fails the finish
+ (`IC_ERROR_BAD_PROGRAM`).
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_shift_left_integer(IC_INSTRUCTION_BUILDER *builder,
+                                           uint32_t dest,
+                                           uint32_t src,
+                                           uint32_t count);
+
+/*
+ R`dest` = R`a` shifted right by R`count` bits; NULL if either is. A
+ signed value keeps its sign, and one read from an unsigned column is
+ filled with zeros. A count that is not 0 to 63 fails the program
+ (`IC_NDB_ERROR_PROGRAM_SHIFT`).
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_shift_right(IC_INSTRUCTION_BUILDER *builder,
+                                    uint32_t dest,
+                                    uint32_t a,
+                                    uint32_t count);
+
+/*
+ R`dest` = R`src` shifted right by `count` bits, 0 to 63, in one
+ instruction; NULL if R`src` is. Another count fails the finish
+ (`IC_ERROR_BAD_PROGRAM`).
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_shift_right_integer(IC_INSTRUCTION_BUILDER *builder,
+                                            uint32_t dest,
+                                            uint32_t src,
+                                            uint32_t count);
+
+/*
+ Jump to `to`: forwards, or backwards to a label placed before,
+ which makes a loop.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_jump(IC_INSTRUCTION_BUILDER *builder,
+                             IC_PROGRAM_LABEL to);
+
+/*
+ Jump to `to` if R`reg` is NULL, else go on.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_jump_if_null(IC_INSTRUCTION_BUILDER *builder,
+                                     uint32_t reg,
+                                     IC_PROGRAM_LABEL to);
+
+/*
+ Jump to `to` if R`reg` holds a value, else go on.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_jump_if_value(IC_INSTRUCTION_BUILDER *builder,
+                                      uint32_t reg,
+                                      IC_PROGRAM_LABEL to);
+
+/*
+ End: the row passes, and an update's columns are written.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_accept(IC_INSTRUCTION_BUILDER *builder);
+
+/*
+ End: the row is refused as a missed condition is. A scan passes it
+ over; a key operation fails with `IC_NDB_ERROR_CONDITION` where it
+ aborts on error and with `IC_NDB_ERROR_NO_SUCH_ROW` where it ignores
+ errors.
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_refuse(IC_INSTRUCTION_BUILDER *builder);
+
+/*
+ End: the row is refused with `code`, a code of the application's
+ own, `IC_NDB_ERROR_OWN_FIRST` to `IC_NDB_ERROR_OWN_LAST`, whatever the
+ operation's abort option. Key operations only: a scan does not take
+ a program that has one (`IC_ERROR_NOT_SUPPORTED`).
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_refuse_with(IC_INSTRUCTION_BUILDER *builder,
+                                    uint32_t code);
+
+/*
+ Jump to `to` if R`a` compares with R`b` as `cmp` says, an `IC_CMP_*`,
+ else go on. Both must hold values: a NULL fails the program. Another
+ `cmp` fails the finish (`IC_ERROR_BAD_PROGRAM`).
+
+ # Safety
+
+ As `ic_instructions_place`.
+ */
+int32_t ic_instructions_jump_if(IC_INSTRUCTION_BUILDER *builder,
+                                uint32_t cmp,
+                                uint32_t a,
+                                uint32_t b,
+                                IC_PROGRAM_LABEL to);
+
+/*
+ The program, once every label a jump goes to is placed and the last
+ instruction is an ending or a jump; its handle is the caller's,
+ freed with `ic_program_free`. The builder stays and can be freed.
+
+ Errors: the builder's first error, `IC_ERROR_BAD_PROGRAM` for a
+ register, input, label or code that is not one, a label used and
+ not placed, or a last instruction a row could run past;
+ `IC_ERROR_NO_SUCH_FIELD` for a column the table lacks;
+ `IC_ERROR_NOT_SUPPORTED` for a column that is not an integer, or
+ not one of 32 or 64 bits where it is written;
+ `IC_ERROR_CONDITION_TOO_COMPLEX` for a program too long.
+
+ # Safety
+
+ A non-null `builder` is an instruction builder handle not yet freed,
+ used by this thread alone; `program` points to writable storage for
+ a pointer.
+ */
+int32_t ic_instructions_finish(IC_INSTRUCTION_BUILDER *builder,
+                               IC_PROGRAM **program);
 
 /*
  Free a program handle. The queries, scans and shapes that run it
@@ -3994,7 +4548,9 @@ uint32_t ic_program_inputs(const IC_PROGRAM *program);
  checked as each is defined (`IC_ERROR_NOT_SUPPORTED`). A row the
  program refuses fails the query with `IC_NDB_ERROR_CONDITION` where it
  aborts on error, rolling the transaction back, and with
- `IC_NDB_ERROR_NO_SUCH_ROW` where it ignores errors.
+ `IC_NDB_ERROR_NO_SUCH_ROW` where it ignores errors; a row that misses
+ one of the program's checks fails it with the check's code in both
+ (`ic_program_refuse_unless`).
 
  Errors: `IC_ERROR_BAD_PROGRAM` for a program of another table;
  `IC_ERROR_TRANSACTION_ACTIVE` while the query is defined or sent;
@@ -4064,7 +4620,8 @@ const uint8_t *ic_apid_query_after_row(IC_APID_CONNECTION *conn,
  a NULL `program`: a row it refuses is passed over at the data node.
 
  Errors: `IC_ERROR_BAD_PROGRAM` for a program of another table;
- `IC_ERROR_NOT_SUPPORTED` for one that assigns; `IC_ERROR_SCAN_ACTIVE`
+ `IC_ERROR_NOT_SUPPORTED` for one that assigns, or one with checks,
+ whose codes would end the scan; `IC_ERROR_SCAN_ACTIVE`
  while a run is on; `IC_ERROR_NO_SUCH_FIELD` for an id that names no
  scan.
 
@@ -4136,8 +4693,8 @@ int32_t ic_op_shape_reading_after(const IC_OP_SHAPE *shape,
  a scan.
 
  Errors: `IC_ERROR_BAD_PROGRAM` for a program of another table;
- `IC_ERROR_NOT_SUPPORTED` for one that assigns. The new shape is the
- caller's, freed with `ic_scan_shape_free`.
+ `IC_ERROR_NOT_SUPPORTED` for one that assigns, or one with checks.
+ The new shape is the caller's, freed with `ic_scan_shape_free`.
 
  # Safety
 
